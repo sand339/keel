@@ -1,0 +1,59 @@
+#!/bin/sh
+set -eu
+
+BB=/bin/busybox
+export PATH=/opt/keel/harness/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+"$BB" mkdir -p /proc /sys /dev /run /tmp /workspace
+"$BB" mount -t proc proc /proc 2>/dev/null || true
+"$BB" mount -t sysfs sysfs /sys 2>/dev/null || true
+"$BB" mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+
+for module in virtio virtio_ring vsock vmw_vsock_virtio_transport_common \
+    vmw_vsock_virtio_transport; do
+    "$BB" modprobe "$module" 2>/dev/null || true
+done
+
+/usr/local/libexec/keel-boot-preflight
+
+case $("$BB" cat /proc/cmdline) in
+    *keel.workspace=virtiofs*)
+        "$BB" mount -t virtiofs keel-workspace /workspace
+        ;;
+esac
+case $("$BB" cat /proc/cmdline) in
+    *keel.control=virtiofs*)
+        "$BB" mkdir -p /run/keel-control
+        "$BB" mount -t virtiofs keel-control /run/keel-control
+        ;;
+esac
+
+"$BB" ip link set lo up
+"$BB" ip addr add 10.0.0.1/32 dev lo
+printf 'nameserver 127.0.0.1\noptions attempts:1 timeout:1\n' > /etc/resolv.conf
+
+/usr/local/libexec/keel-dns &
+/usr/local/libexec/keel-egress-http &
+/usr/local/libexec/keel-egress-https &
+/usr/local/libexec/keel-git-http &
+
+export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+export CURL_CA_BUNDLE="$SSL_CERT_FILE"
+export GIT_SSL_CAINFO="$SSL_CERT_FILE"
+export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/keel-ca.pem
+export CARGO_HTTP_CAINFO="$SSL_CERT_FILE"
+export HTTPS_PROXY=http://10.0.0.1:80
+
+if [ -d /workspace/.git ] && command -v git >/dev/null 2>&1; then
+    git -C /workspace remote set-url origin http://10.0.0.1:9418/origin
+fi
+
+echo "[keel-init] guest services ready"
+if [ -x /run/keel-control/launch ]; then
+    /run/keel-control/launch
+else
+    /usr/local/bin/keel-launch keel-harness
+fi
+status=$?
+"$BB" poweroff -f
+exit "$status"

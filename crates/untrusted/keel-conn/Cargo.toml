@@ -1,0 +1,18 @@
+[package]
+name = "keel-conn"
+description = "Untrusted connection acceptor for Keel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+keel-kernel = { version = "=0.0.1", path = "../../trusted/keel-kernel" }
+keel-secrets = { version = "=0.0.1", path = "../../trusted/keel-secrets" }
+
+[dev-dependencies]
+rustls.workspace = true
+
+[lints]
+workspace = true

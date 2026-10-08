@@ -1,0 +1,45 @@
+entity Vertex;
+entity Target;
+entity SourceRef {
+    kind: String,
+    host: String,
+    path: String,
+    author: String,
+    server: String,
+    tool: String,
+    command: String,
+};
+entity FloorObservation {
+    rank: Long,
+    source: SourceRef,
+    timestamp_ms: Long,
+};
+
+action read, write, push, run, commit, egress, pull_request, publish, delete, lift_floor appliesTo {
+    principal: Vertex,
+    resource: Target,
+    context: {
+        files_created_by_this_vertex: Set<String>,
+        files_written_by_this_vertex: Set<String>,
+        hosts_contacted: Set<String>,
+        registries_contacted: Bool,
+        writes_last_60s: Long,
+        denied_actions: Long,
+        recent_behavioral_denials_in_scope: Long,
+        escalated_actions: Long,
+        distinct_files_written_60s: Long,
+        floor: Long,
+        floor_history: Set<FloorObservation>,
+        own_domains: Set<String>,
+        source_hosts: Set<String>,
+        sources_read: Set<SourceRef>,
+        intent: {
+            allow_push_branch: Bool,
+            allow_pr_create: Bool,
+            deny_force_push: Bool,
+            allowed_egress_hosts: Set<String>,
+        },
+        target_is_force_push: Bool,
+        target_created_by_vertex: Bool,
+    },
+};

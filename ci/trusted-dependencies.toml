@@ -1,0 +1,36 @@
+# Direct third-party dependencies admitted into each trusted crate.
+# Every addition is a review event. Transitive review is tracked by cargo-deny
+# now and will gain a cargo-vet audit set before Phase 1.
+#
+# keel-input/nix: SIGWINCH is blocked and then waited for on a dedicated thread so
+# terminal resizes reach the guest pty. That needs pthread_sigmask and sigwait,
+# which are raw libc calls, and I2 forbids unsafe in trusted crates — so the safe
+# wrapper is the only way a trusted crate can do signal work at all. Moving it out
+# is not available either: the forwarder reads the operator tty, which I9 reserves
+# to keel-input exclusively. Pinned at =0.30.1 in the workspace manifest.
+#
+# keel-kernel/nix: the broker polls the already-connected Unix relay descriptor
+# for hangup while a trusted approval is pending. Safe `poll(2)` access lets a
+# disconnected caller cancel its exact action without consuming guest bytes or
+# adding unsafe libc calls to the kernel. This is the same pinned nix release
+# already reviewed for keel-input.
+#
+# keel-secrets/ring: SigV4 signs with an HMAC-SHA256 key chain over a SHA-256
+# payload hash (D17). Both primitives are already in the trusted set — keel-audit
+# and keel-kernel use this same pinned version for the audit chain — so this
+# admits no new code into the reviewable surface, only a second caller. The
+# alternative was hand-rolling HMAC inside keel-secrets, which spends budget to
+# re-derive a primitive the tree has already reviewed.
+#
+# keel-kernel/serde_json: D31 binds a trusted pull-request action to the exact
+# JSON bytes whose SHA-256 digest the credential-bearing request presents. The
+# crate was already admitted elsewhere in the trusted set and is used here only
+# for that closed action shape.
+
+[allow]
+keel-audit = ["ring", "serde", "serde_json"]
+keel-input = ["nix", "ring", "serde", "serde_json"]
+keel-kernel = ["nix", "ring", "serde_json"]
+keel-policy = ["cedar-policy", "ring", "serde", "serde_json"]
+keel-provenance = ["serde", "serde_json"]
+keel-secrets = ["rcgen", "ring", "rustls", "serde_json", "webpki-roots", "zeroize"]

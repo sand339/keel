@@ -1,0 +1,21 @@
+[package]
+name = "keel-cli"
+description = "Untrusted command-line launcher for Keel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+keel-audit = { version = "=0.0.1", path = "../../trusted/keel-audit" }
+keel-compile = { version = "=0.0.1", path = "../keel-compile" }
+keel-provenance = { version = "=0.0.1", path = "../../trusted/keel-provenance" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+keel-input = { version = "=0.0.1", path = "../../trusted/keel-input" }
+
+[lints]
+workspace = true

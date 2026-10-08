@@ -1,0 +1,18 @@
+[package]
+name = "keel-compile"
+description = "Untrusted natural-language policy compiler for Keel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+cedar-policy.workspace = true
+regorus.workspace = true
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

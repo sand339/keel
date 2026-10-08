@@ -1,0 +1,22 @@
+[package]
+name = "keel-kernel"
+description = "Trusted authorization kernel for Keel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+keel-provenance = { version = "=0.0.1", path = "../keel-provenance" }
+nix.workspace = true
+ring.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+# SessionFacts is re-exported through the kernel's API but owned by provenance,
+# so an integration test that constructs one needs the crate by name.
+keel-provenance = { version = "=0.0.1", path = "../keel-provenance" }
+
+[lints]
+workspace = true

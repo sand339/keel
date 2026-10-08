@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+if [ -d /workspace/.git ] && command -v git >/dev/null 2>&1; then
+    git -C /workspace remote set-url origin http://10.0.0.1:9418/origin
+fi
+
+if [ "$#" -eq 0 ]; then
+    exec /bin/sh
+fi
+exec "$@"

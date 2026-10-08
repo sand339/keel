@@ -1,0 +1,21 @@
+[package]
+name = "keel-secrets"
+description = "Trusted credential and TLS custody for Keel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+keel-audit = { version = "=0.0.1", path = "../keel-audit" }
+keel-kernel = { version = "=0.0.1", path = "../keel-kernel" }
+rcgen.workspace = true
+ring.workspace = true
+rustls.workspace = true
+serde_json.workspace = true
+webpki-roots.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

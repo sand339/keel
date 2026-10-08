@@ -1,0 +1,54 @@
+[workspace]
+members = [
+    "crates/trusted/keel-audit",
+    "crates/trusted/keel-input",
+    "crates/trusted/keel-kernel",
+    "crates/trusted/keel-policy",
+    "crates/trusted/keel-provenance",
+    "crates/trusted/keel-secrets",
+    "crates/untrusted/keel-cli",
+    "crates/untrusted/keel-compile",
+    "crates/untrusted/keel-conn",
+    "crates/untrusted/keel-gitd",
+    "crates/untrusted/keel-isolate",
+    "crates/untrusted/keel-mcp",
+    "crates/untrusted/keel-render",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.97.1"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+cedar-policy = { version = "=4.13.0", default-features = false }
+libc = "=0.2.189"
+nix = { version = "=0.30.1", features = ["fs", "poll", "process", "signal", "socket", "term"] }
+pem = "=4.0.0"
+rcgen = { version = "=0.14.10", default-features = false, features = ["pem", "ring"] }
+rmcp = { version = "=3.4.0", default-features = false, features = ["client", "macros", "server", "transport-async-rw"] }
+ring = "=0.17.14"
+regorus = { version = "=0.5.0", default-features = false, features = ["std"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+tokio = { version = "=1.47.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+unicode-width = "=0.2.2"
+webpki-roots = "=1.0.9"
+zeroize = "=1.9.0"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = "symbols"

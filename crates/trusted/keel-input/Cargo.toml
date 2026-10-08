@@ -1,0 +1,22 @@
+[package]
+name = "keel-input"
+description = "Trusted operator-input path for Keel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+keel-audit = { version = "=0.0.1", path = "../keel-audit" }
+keel-kernel = { version = "=0.0.1", path = "../keel-kernel" }
+keel-policy = { version = "=0.0.1", path = "../keel-policy" }
+keel-provenance = { version = "=0.0.1", path = "../keel-provenance" }
+keel-secrets = { version = "=0.0.1", path = "../keel-secrets" }
+nix.workspace = true
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

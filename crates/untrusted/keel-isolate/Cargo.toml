@@ -1,0 +1,96 @@
+[package]
+name = "keel-isolate"
+description = "Untrusted microVM backend driver for Keel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+keel-cli = { version = "=0.0.1", path = "../keel-cli", optional = true }
+keel-conn = { version = "=0.0.1", path = "../keel-conn", optional = true }
+keel-gitd = { version = "=0.0.1", path = "../keel-gitd", optional = true }
+pem = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+default = []
+libkrun-backend = ["dep:keel-mcp", "dep:libc", "dep:serde_json", "dep:tokio"]
+vz-backend = [
+    "dep:block2",
+    "dep:dispatch2",
+    "dep:keel-cli",
+    "dep:keel-conn",
+    "dep:keel-gitd",
+    "dep:keel-mcp",
+    "dep:libc",
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-virtualization",
+    "dep:pem",
+    "dep:rustls",
+    "dep:serde_json",
+    "dep:tokio",
+]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = { version = "=0.6.2", optional = true }
+dispatch2 = { version = "=0.3.1", optional = true }
+keel-mcp = { version = "=0.0.1", path = "../keel-mcp", optional = true }
+libc = { workspace = true, optional = true }
+objc2 = { version = "=0.6.4", optional = true }
+objc2-foundation = { version = "=0.3.2", features = ["NSArray", "NSError", "NSFileHandle", "NSString", "NSURL"], optional = true }
+objc2-virtualization = { version = "=0.3.2", features = [
+    "VZBootLoader",
+    "VZDirectoryShare",
+    "VZDiskImageStorageDeviceAttachment",
+    "VZDirectorySharingDeviceConfiguration",
+    "VZEntropyDeviceConfiguration",
+    "VZFileHandleSerialPortAttachment",
+    "VZLinuxBootLoader",
+    "VZSerialPortAttachment",
+    "VZSerialPortConfiguration",
+    "VZSharedDirectory",
+    "VZSingleDirectoryShare",
+    "VZSocketDevice",
+    "VZSocketDeviceConfiguration",
+    "VZStorageDeviceAttachment",
+    "VZStorageDeviceConfiguration",
+    "VZVirtioBlockDeviceConfiguration",
+    "VZVirtioConsoleDeviceSerialPortConfiguration",
+    "VZVirtioEntropyDeviceConfiguration",
+    "VZVirtioFileSystemDeviceConfiguration",
+    "VZVirtioSocketConnection",
+    "VZVirtioSocketDevice",
+    "VZVirtioSocketDeviceConfiguration",
+    "VZVirtioSocketListener",
+    "VZVirtualMachine",
+    "VZVirtualMachineConfiguration",
+    "block2",
+    "dispatch2",
+], optional = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+keel-kernel = { version = "=0.0.1", path = "../../trusted/keel-kernel" }
+keel-secrets = { version = "=0.0.1", path = "../../trusted/keel-secrets" }
+
+[[bin]]
+name = "keel-libkrun-spike"
+path = "src/bin/keel-libkrun-spike.rs"
+required-features = ["libkrun-backend"]
+
+[[bin]]
+name = "keel-vz-spike"
+path = "src/bin/keel-vz-spike.rs"
+required-features = ["vz-backend"]
+
+[[bin]]
+name = "keel-runtime"
+path = "src/bin/keel-runtime.rs"
+required-features = ["vz-backend"]
+
+[lints]
+workspace = true

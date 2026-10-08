@@ -1,0 +1,25 @@
+[package]
+name = "keel-gitd"
+description = "Untrusted mediated Git endpoint for Keel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+keel-conn = { version = "=0.0.1", path = "../keel-conn" }
+keel-kernel = { version = "=0.0.1", path = "../../trusted/keel-kernel" }
+pem.workspace = true
+rustls.workspace = true
+ring.workspace = true
+
+[dev-dependencies]
+keel-audit = { version = "=0.0.1", path = "../../trusted/keel-audit" }
+keel-mcp = { version = "=0.0.1", path = "../keel-mcp" }
+keel-policy = { version = "=0.0.1", path = "../../trusted/keel-policy" }
+keel-secrets = { version = "=0.0.1", path = "../../trusted/keel-secrets" }
+tokio.workspace = true
+
+[lints]
+workspace = true

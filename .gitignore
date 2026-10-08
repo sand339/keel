@@ -1,0 +1,7 @@
+.DS_Store
+/target/
+/.phase0/
+/.phase1/
+*.log
+/.keel/
+__pycache__/

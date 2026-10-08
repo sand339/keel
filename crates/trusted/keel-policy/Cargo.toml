@@ -1,0 +1,22 @@
+[package]
+name = "keel-policy"
+description = "Trusted Cedar policy evaluator for Keel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+cedar-policy.workspace = true
+keel-kernel = { version = "=0.0.1", path = "../keel-kernel" }
+keel-provenance = { version = "=0.0.1", path = "../keel-provenance" }
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+keel-audit = { version = "=0.0.1", path = "../keel-audit" }
+
+[lints]
+workspace = true
