@@ -38,23 +38,48 @@ Docker is a build tool here, not the runtime isolation boundary.
   licenses, and sources.
 - **The Rust toolchain** is pinned by `rust-toolchain.toml` (1.97.1).
 
-## Not pinned: guest packages
+## Locked guest packages
 
-The guest root filesystem is built with `apk add` from Alpine 3.23 `main` and
-`community`. The pinned base image fixes the starting point, but the packages
-themselves are not pinned, so their versions follow Alpine's repository on the
-day setup runs:
-- Chromium, Node, Python, git, tmux;
-- the build toolchains: gcc, make, npm, pip, Rust, and Go.
+Every Alpine package the image build installs is pinned in
+[`spikes/guest-packages.lock`](../spikes/guest-packages.lock): repository,
+name, exact version, and SHA-256, dependencies included. Two sets are locked:
 
-**The guest image is therefore not reproducible.** Each build records the
-SHA-256 of every file in the root filesystem in `.phase1/rootfs.sha256`. Each
-run records the digests of the kernel, initramfs, root disk, and components in
-its admission manifest (`kernel.run-admitted`), so a run always says which
-image it used, even though a later build may differ.
+- `rootfs`: the guest root filesystem, from Alpine 3.23 `main` and `community`
+  (Chromium, Node, Python, git, tmux, and the gcc, make, npm, pip, Rust, and Go
+  toolchains);
+- `tools`: what the build adds to the pinned base image to make the squashfs
+  disk, the stage-1 busybox, and the zstd initramfs.
 
-Pinning the package set, for example with a lockfile of exact apk versions or
-a snapshot repository, is future work.
+`spikes/build-phase1-image.sh` downloads each locked file into
+`.phase1/apk-cache/`, refuses one whose digest differs, and installs the files
+offline, so nothing is resolved against Alpine's live index. apk still checks
+each package's Alpine signature. The build then fails unless the installed set
+equals the `rootfs` set exactly.
+
+**The guest image is reproducible.** Timestamps in the root disk and the
+initramfs are fixed, the font caches are regenerated against fixed directory
+times, and the initramfs is written in sorted order with fixed inode numbers.
+Three builds of the same checkout on one machine produced byte-identical
+`keel-phase1-rootfs.squashfs` and `keel-phase1-initramfs.cpio.zst`.
+Limits:
+
+- **The guest bridge.** `keel-mcp-guest` is compiled from this checkout in the
+  pinned Rust image and reused while its sources are unchanged. Byte-identical
+  output across different machines is expected but not yet verified.
+- **Updates are deliberate.** Chromium and every other guest package stay at
+  their locked versions until the lock is refreshed, so security fixes no
+  longer arrive with each setup.
+- **Alpine prunes old versions.** The CDN keeps only the current version in a
+  branch. A cached file keeps working; a fresh checkout whose lock names a
+  pruned version fails to download, and the fix is to refresh the lock.
+
+Each build still records the SHA-256 of every root filesystem file in
+`.phase1/rootfs.sha256`, and each run records the image digests in its
+admission manifest (`kernel.run-admitted`).
+
+To refresh the lock, run `spikes/lock-guest-packages.sh`, review the diff of
+`spikes/guest-packages.lock` (Chromium's version especially), then follow the
+steps below from step 3.
 
 ## Updating a pin
 

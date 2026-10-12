@@ -161,24 +161,23 @@ asks a model to decide policy or approve an action.
 
 ### TCB budget
 
-Keel has a 16,000-line hard ceiling for first-party trusted Rust. Current crate
-allocations are 15,331 lines, with 669 held as unallocated reserve:
+CI holds each trusted crate's first-party Rust to a line ratchet. The ratchets
+currently sum to 15,352 lines:
 
 | Crate | Budget |
 |---|---:|
 | `keel-kernel` | 5,266 |
 | `keel-policy` | 852 |
-| `keel-provenance` | 1,321 |
+| `keel-provenance` | 1,330 |
 | `keel-audit` | 1,228 |
 | `keel-secrets` | 3,338 |
-| `keel-input` | 3,326 |
-| **Allocated crate budgets** | **15,331** |
-| **Unallocated reserve** | **669** |
-| **Hard ceiling** | **16,000** |
+| `keel-input` | 3,338 |
+| **Total** | **15,352** |
 
-The cap is a design constraint, not proof of correctness. It forces trusted
-growth to justify its review cost. [PLAN.md](PLAN.md) records the budget history
-and reallocation rules.
+The ratchet is a design constraint, not proof of correctness. Growing a crate
+fails CI until its number is raised with a stated reason, so trusted growth is
+always a visible choice. Until D65 the ratchets also summed against a
+16,000-line aggregate ceiling; [PLAN.md](PLAN.md) records that history.
 
 CI also checks:
 
@@ -807,15 +806,31 @@ without putting the manager in the trusted base.
 provenance, grants, or connection state. Persistence is not a security reset;
 all session facts and budgets remain active.
 
-`keel stop` sends a shutdown control through the owned runtime PTY, waits for
-the broker to close and write the terminal audit seal, and returns nonzero if it
-must fall back to terminating the process group. A clean shell return therefore
-means more than “the PID disappeared.”
+`keel stop` sends a shutdown control through the owned runtime PTY and holds
+its connection. The supervisor waits for the run to seal its audit chain, ends
+whatever is left of the runtime's process group, removes and checks its socket,
+pid, and request files, and writes a teardown receipt signed by a key the
+sealed chain names. Only then does `keel stop` return, nonzero if any check is
+unmet or it had to fall back to terminating the group. A clean shell return
+therefore means more than “the PID disappeared.”
+
+If the trusted runtime itself is killed, nothing is left to run that teardown.
+Each run therefore records the resources it creates (scratch and broker
+directories, the backend's process group) in its authenticated chain, and
+`keel recover SESSION` releases exactly those, refusing any process group or
+path that is not the run's own.
+
+**Why anchor the receipt in the chain:** the chain's private key never leaves
+the run, and the receipt describes facts settled after the seal. A second key
+whose public half the chain records gives those facts the chain's
+authentication without reopening it.
 
 Implementation:
 
 - [persistent orchestration](../crates/untrusted/keel-cli/src/lib.rs);
-- [supervisor and attach protocol](../crates/trusted/keel-input/src/bin/keel-input-runtime/session.rs).
+- [supervisor and attach protocol](../crates/trusted/keel-input/src/bin/keel-input-runtime/session.rs);
+- [teardown receipt](../crates/trusted/keel-input/src/bin/keel-input-runtime/receipt.rs) and
+  [crash recovery](../crates/trusted/keel-input/src/bin/keel-input-runtime/recover.rs).
 
 ## 17. Egress without a guest NIC
 
@@ -1275,7 +1290,7 @@ and terminal-generated replies.
 
 | Invariant | Purpose |
 |---|---|
-| I1 | trusted first-party LOC stays within the 16,000 hard ceiling and each crate's assigned budget |
+| I1 | each trusted crate's first-party LOC stays within its ratchet; the total is reported |
 | I2 | trusted crates forbid unsafe Rust |
 | I3 | trusted crates do not depend on untrusted crates |
 | I4 | trusted dependencies and dynamic behavior stay constrained |

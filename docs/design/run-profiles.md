@@ -1,7 +1,9 @@
 # Run profiles
 
-**Status: proposed.** `--profile triage` (D58) is the only profile today, and
-it is hardcoded in the CLI and in trusted admission. This note describes how
+**Status: proposed.** `--profile scoped` (D58, renamed from `triage` in D67)
+is the only profile today, and it is hardcoded in the CLI and in trusted
+admission. It already serves two workflows, report reproduction and offline
+code validation, through its authority alone. This note describes how
 profiles generalize.
 
 ## 1. Decision
@@ -34,7 +36,7 @@ time:
 - **Unattributable results.** Shadow reports and evidence can only be compared
   across runs if the runs were configured the same way, and the manifest can
   only say so if the configuration has a name and a digest.
-- **Hardcoded workflow logic.** The triage profile proves that a workflow
+- **Hardcoded workflow logic.** The scoped profile proves that a workflow
   needs more than authority flags, such as guest tooling and output locations.
   That logic is currently hardcoded.
 
@@ -118,15 +120,16 @@ the check, as it already is for scope rules and an OpenRouter price snapshot.
 
 The planned blocks are generic: once built, any profile may use them.
 
-## 6. Worked example: triage
+## 6. Worked example: scoped
 
-The triage profile as built (D58, D60) maps onto the structure above.
+The scoped profile as built (D58, D60, D67) maps onto the structure above. A
+`triage` or `code-validation` preset would add workflow packaging to it.
 
 | Today | As a profile |
 |---|---|
-| `--profile triage` hardcoded in the CLI and `keel-input` | `triage.yaml`, a built-in profile |
+| `--profile scoped` hardcoded in the CLI and `keel-input` | `scoped.yaml`, a built-in profile |
 | Scope required, admission forced | `authority.scope: required`, `authority.admission: required` |
-| `KEEL_TRIAGE_PROVIDERS`, default `anthropic,bedrock` | `authority.providers` |
+| `KEEL_SCOPED_PROVIDERS`, default `anthropic,bedrock` | `authority.providers` |
 | Browser and `.keel-browser/` output | `workflow.tools`, `workflow.outputs` |
 
 Behavior does not change. The difference is that the constraints are data,
@@ -135,8 +138,8 @@ and the next workflow needs no code.
 ## 7. Migration
 
 1. **Generalize admission.** Trusted admission accepts a profile's
-   `authority` section instead of the hardcoded `triage` name. `triage`
-   becomes the first built-in profile file. `KEEL_TRIAGE_PROVIDERS` becomes
+   `authority` section instead of the hardcoded `scoped` name. `scoped`
+   becomes the first built-in profile file. `KEEL_SCOPED_PROVIDERS` becomes
    the file's `providers`, and an operator can override it with a stricter
    profile.
 2. **Pass workflow packaging.** The untrusted runtime passes `workflow` to
@@ -150,10 +153,10 @@ by two workflows rather than guessed from one.
 
 ## 8. Budget
 
-Generalizing admission replaces the hardcoded triage parsing. The estimate is
+Generalizing admission replaces the hardcoded scoped-profile parsing. The estimate is
 about 60 trusted lines net:
 
-- profile file parsing and digest, offset by removing triage-specific code;
+- profile file parsing and digest, offset by removing profile-specific code;
 - the unknown-field refusal.
 
 Workflow packaging is untrusted. Each new building block in §5 is costed in

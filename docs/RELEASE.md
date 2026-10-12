@@ -45,7 +45,8 @@ The [end-to-end acceptance](E2E.md) page has both parts: the headless suite
   - a Claude session for each configured provider;
   - one browser task;
   - one build that fetches dependencies;
-  - one triage run with a declared scope, showing an out-of-scope refusal.
+  - one scoped run with a declared scope, showing an out-of-scope refusal.
+- [ ] **Lifecycle faults:** `python3 ci/faults.py` passes every case.
 - [ ] **Audit evidence.** Each run's audit verifies with
   `keel audit verify AUDIT KEY` (`VERIFIED AND SEALED`). Its admission
   manifest names the expected kernel, root disk, provider, and model.
@@ -56,6 +57,9 @@ The [end-to-end acceptance](E2E.md) page has both parts: the headless suite
 
 - [ ] **README is current.** It describes current behavior only, and every
   security property it lists links to evidence.
+- [ ] **Security claims link to evidence.** The THREAT-MODEL control map and
+  the ARCHITECTURE implemented list name a test or invariant for every row, and
+  each named test still exists.
 - [ ] **Known limitations** in the README are up to date.
 - [ ] **No historical plan reads as current behavior.** ROADMAP holds future
   work only; PLAN and DECISIONS are logs.
@@ -121,7 +125,8 @@ The first public research release. Apple silicon macOS only.
 **Workflows**
 - A guest browser driven by `agent-browser`, for the agent and the operator.
 - Build toolchains in the guest: gcc, make, npm, pip, Rust, and Go.
-- A triage profile that confines a run to a declared scope.
+- A scoped profile that confines a run to a declared scope, or to no outside
+  host with `--scope none`.
 
 **Evidence**
 - An authenticated, hash-chained audit chain with a terminal seal.

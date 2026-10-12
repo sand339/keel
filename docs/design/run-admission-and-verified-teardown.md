@@ -4,8 +4,15 @@
 declared task capabilities, egress hosts, and elevated model token/cost
 ceilings before workload execution. The [v1 slice](#v1-slice-admission-manifest-and-session-status),
 an audited admission manifest and session status, is implemented (D57); the
-byte-bound staging of boot artifacts and the verified teardown receipt follow
-with R2.
+byte-bound staging of boot artifacts, automatic reconciliation, and fault
+injection are the rest of roadmap R1. The [v2 slice](#v2-slice-in-chain-teardown-for-one-run),
+an in-chain teardown record, is implemented (D73), and the
+[v3 slice](#v3-slice-supervisor-receipt-and-two-stage-stop), a signed
+post-seal receipt behind a two-stage `keel stop`, is implemented (D74), and
+the [v4 slice](#v4-slice-in-chain-resources-and-crash-recovery), crash
+recovery from resources the chain records, is implemented (D75). The
+[v5 slice](#v5-slice-idle-timeout-and-recovery-on-use) adds an idle timeout
+for abandoned sessions and recovery on use (D76).
 
 This hardening phase gives every VM boot a complete, immutable identity and
 makes `keel stop` return only after Keel has checked the observable teardown
@@ -55,7 +62,8 @@ hardware-backed guest attestation and is a separate research project.
 
 The first increment builds only the admission manifest and an untrusted
 session status. The teardown receipt, two-stage stop, resource registry,
-crash-recovery cleanup, and private staging of boot artifacts wait for R2.
+crash-recovery cleanup, and private staging of boot artifacts follow in later
+slices.
 
 **Why first.** The shadow reports (`keel report --axes` and `--context`) are
 the evidence for promoting verdicts to enforcement. Without a manifest, an
@@ -99,7 +107,8 @@ dumps, and any guest state.
 
 - `keel status SESSION` reports `closed` (sealed), `active` (unsealed, its
   trusted runtime alive), or `interrupted` (unsealed, runtime gone), with a
-  manifest summary.
+  manifest summary. The v4 slice splits `interrupted` into `stale`,
+  `recovered`, and `recovered-unclean`.
 - `keel report --axes` and `--context` print the manifest summary (harness,
   model, provider, kernel release, policy bundle) for each session; totals
   are not yet split by group.
@@ -120,9 +129,281 @@ dumps, and any guest state.
 tariff source), kernel 20, and audit 11. Status and report summaries are
 untrusted.
 
+## v2 slice: in-chain teardown for one run
+
+The second increment makes one runtime process clean up everything it created,
+verify each postcondition, and record the result as `kernel.run-teardown`
+inside the authenticated chain, immediately before the seal. The serve-side
+two-stage stop, crash recovery, and the fault-injection suite follow as later
+slices.
+
+### Defects it closes
+
+- The untrusted backend runs in its own process group (`process_group(0)` in
+  `keel-input-runtime`), so a forced stop that signals only the trusted
+  runtime's group leaves `keel-runtime`, the VMM or `deno`, and Git running.
+  The graceful path sends `SIGTERM` to the backend group but never escalates.
+- An error between creating the run scratch directory and spawning the
+  backend, including a refused admission, leaves the directory behind; an
+  error after the spawn also leaves the backend running, because dropping a
+  `Child` does not kill it.
+- `floor.json` is saved after the seal, so the chain cannot attest it.
+
+### Resource registry
+
+One trusted guard, created at the start of `spawn_runtime`, registers each
+resource as it is created: the backend process group, the renderer, the run
+scratch directory (which contains the VM or V8 control directory, `ca.pem`,
+`launch`, and the Git mirror), the kernel broker directory and socket, and the
+V8 proxy listener. It is the only cleanup path. On the normal path and on drop
+it signals the backend group with `SIGTERM`, escalates to `SIGKILL` after a
+bounded deadline, reaps, removes paths, and checks:
+
+- no group member remains (`killpg(pgid, 0)` reports `ESRCH`);
+- each removed path is absent (`symlink_metadata` reports `NotFound`);
+- the listener is closed.
+
+### Event
+
+`kernel.run-teardown` is written by the broker loop after the shutdown
+enforcement state and before `audit.sealed`, carried in through
+`shutdown_with_teardown` beside the Git-control boundary. It carries
+`admission_sha256`; `stop_reason` (`exited`, `shutdown`, or `error`); whether
+escalation was needed; one `check.N.KIND` field per resource, `ok` or the
+unmet postcondition followed by a secret-free identifier; and an overall `ok`.
+The broker adds a check for its own socket and directory, which it removes once
+no client can connect. The run exits nonzero, naming the postcondition, when a
+runtime-side check fails (PLAN D71–D73).
+
+`floor.json` is still saved after the seal: moving it would mean reading
+session facts before the broker has closed its pushes and reservations.
+
+### Consumers
+
+- `keel status` prints a `teardown:` line and adds `closed-unclean`: sealed,
+  with a teardown `ok` of false. A chain without the record, such as one sealed
+  by an early-error exit, reports `not recorded`; verification does not reject
+  it, because that exit is not tampering.
+- `keel report` prints the teardown outcome beside the manifest summary.
+
+### Limits
+
+- Facts established after the seal, including all serve-side cleanup (attach
+  socket, pid file, request file, `attach.exit`), are outside this event. The
+  [v3 slice](#v3-slice-supervisor-receipt-and-two-stage-stop) adds a receipt
+  bound to the sealed chain tip.
+- Virtualization.framework may host the guest in a launchd-managed XPC service
+  outside every Keel process group. Until a spike confirms otherwise, the event
+  reports the VM as stopped through the framework API, not as an absent
+  process.
+
+### Tests
+
+- Normal VZ and V8 runs end with a passing teardown event that checks every
+  registered resource.
+- A backend that ignores `SIGTERM` records escalation and leaves no group
+  member.
+- A refusal after the scratch directory exists leaves no directory; an error
+  injected after the spawn leaves no backend process.
+- An unremovable path yields a nonzero exit, the named postcondition, and a
+  failing event.
+- The audit chain binds the record to the admission digest and places it
+  before the seal; an unmet postcondition yields `ok` false.
+- The redactor finds no configured credential in the event.
+
+### Cost
+
+Estimated 250–320 trusted lines: `keel-input` about 200 (registry and checks),
+`keel-kernel` about 40 (event plumbing), and `keel-audit` about 20 (sink and
+verification rule). Status and report changes are untrusted.
+
+## v3 slice: supervisor receipt and two-stage stop
+
+**Status: implemented (PLAN D74).** The persistent session supervisor
+(`keel-input-runtime serve`) now owns the facts established after the seal and
+records them in a signed receipt; `keel stop` returns only once that receipt is
+durable.
+
+### Key anchoring
+
+The chain's run key never leaves the run process, so the supervisor cannot sign
+with it. Instead `serve` generates its own Ed25519 key, held only in memory,
+and passes the public half to the run it spawns. The run records it as
+`supervisor_key` in `kernel.run-teardown`, inside the authenticated chain. A
+receipt therefore verifies only under the key its own sealed chain names.
+
+### Protocol
+
+1. `STOP` makes `serve` send the cooperative shutdown control and reply
+   `STOPPING`. It holds the connection and accepts no further clients.
+2. When the run exits (or, after 5 s, is terminated), `serve` closes its
+   listener, ends whatever remains of the runtime's process group (`SIGTERM`,
+   then `SIGKILL`), removes the attach socket, pid file, and request file, and
+   checks each is gone.
+3. It locates the run's chain (named for the runtime pid and written after the
+   spawn), requires it to be sealed with a teardown record naming this
+   supervisor, and records the seal's record digest as `chain_tip`.
+4. It records the SHA-256 of each file kept on purpose (`attach.exit`,
+   `floor.json`), signs the receipt, writes `AUDIT.receipt.json` beside the
+   chain with `fsync` of the file and directory, and replies
+   `STOPPED AUDIT.receipt.json`.
+5. `keel stop` reads the receipt, names every unmet check, and exits nonzero
+   if any. Repeating it after the session has gone reports the latest receipt.
+
+A run that exits on its own writes a receipt by the same path, with
+`stop_reason` `exited`.
+
+### Consumers
+
+`keel status` verifies the receipt beside the chain against `supervisor_key`
+and the verified seal, and prints a `receipt:` line. A receipt that does not
+verify, or names another chain, is an error, as an edited chain is. A sealed
+chain whose receipt has an unmet check, or whose `floor.json` or `attach.exit`
+no longer matches the recorded digest, is `closed-unclean`. This gives
+`floor.json` the attestation the v2 slice could not.
+
+### Limits
+
+- The receipt's trust is the chain's: local tamper evidence, not attestation.
+  Anyone who can replace the chain, its key file, and the receipt together can
+  forge all three.
+- `KEEL_SUPERVISOR_KEY` is honoured only with `KEEL_INPUT_SOURCE` set to
+  `trusted-supervisor`, but both are environment the untrusted CLI could set on
+  a direct `run`; a forged key can only vouch for serve-side files.
+- A supervisor that crashes or is killed writes no receipt; `keel stop`
+  reports a stale socket as a supervisor gone without one. Crash recovery
+  remains the next slice.
+- Deny-pending-approval at stop, secret zeroization, and connection-pool
+  checks are not yet recorded.
+
+## v4 slice: in-chain resources and crash recovery
+
+**Status: implemented (PLAN D75).**
+
+### Registration
+
+The run records each host resource in the authenticated chain as
+`kernel.run-resource` (`kind`, `detail`) before the backend can act on it:
+the broker's private directory, the run scratch directory, and the backend's
+process group. Audit records are `fsync`ed as they are written, so the
+records survive a `SIGKILL` of the run. A resource whose record cannot be
+written makes the run refuse to continue, and the D71 guard releases it.
+
+### Recovery
+
+`keel recover SESSION` runs trusted `keel-input-runtime recover`. For each
+chain in the session directory that is unsealed, whose writer (the pid in its
+file name) is not a live `keel-input-runtime`, and that has no recovery record,
+it reads the authenticated prefix and releases each recorded resource:
+
+- a directory only if it is in the expected temporary root and named for that
+  run's pid (`keel-runtime-PID-…`, `keel-kernel-PID-…`); otherwise it is
+  reported, not removed;
+- a process group only if every member is a Keel backend component
+  (`sandbox-exec`, `keel-runtime`, `keel-vz-spike`, `deno`, `git`, `git-*`)
+  and a live leader started before the run recorded it. A group whose leader
+  is gone cannot have been reused while members remain. It is then ended
+  `SIGTERM`, then `SIGKILL`, and checked empty. An unreadable process table
+  refuses rather than signals.
+
+It writes `AUDIT.recovery.json` (chain, authenticated record count, recovery
+time, one check per resource, `ok`) with `fsync`, and never touches the chain.
+If `attach.pid` names a supervisor that is gone, it also removes the attach
+socket and pid file and records `attach-PID.recovery.json`.
+
+### Consumers
+
+`keel status` reports an unsealed chain whose writer is gone as `stale` until
+recovery has run, then `recovered` or `recovered-unclean`, with a `recovery:`
+line. `keel doctor` warns of stale sessions and names the command to run.
+
+### Limits
+
+- The recovery record is unsigned: no key the chain names outlives the crash.
+  It describes what recovery observed and when, not the state at the crash.
+- A backend spawned but killed before its record was written is not recorded;
+  the window is one `spawn` return.
+- Virtualization.framework may keep the VM in an XPC service outside the
+  recorded group (see the v2 limits).
+- Recovery runs only when invoked; `keel run` does not yet reconcile at start.
+- Run request files are not removed: one may belong to a session starting
+  concurrently.
+
+## v5 slice: idle timeout and recovery on use
+
+**Status: implemented (PLAN D76), except the opt-in reaper, which is
+planned.** A session can be stale in two ways that need different answers: it
+crashed and left resources behind, or it is alive but nobody is attending it.
+The second holds a VM and live credentials, so it is the larger risk.
+
+### Idle timeout
+
+`serve` stops a session that is detached and has produced no output for its
+idle limit, through the same cooperative shutdown as `STOP`, so the run seals
+and the receipt records `stop_reason` `idle`. A pending approval with no one
+attached counts as idle, since the agent is blocked on a person. The limit
+defaults to 12 hours; `keel run --idle-timeout HOURS` (0 to 720, 0 disables)
+reaches `serve` as `KEEL_IDLE_TIMEOUT_SECS`. A malformed value keeps the
+default rather than disabling it. The setting is untrusted input but can only
+end a session sooner.
+
+### Recovery on use
+
+There is no daemon. `keel run` and `keel attach` first recover every stale
+session whose chain has not changed for a grace period (15 minutes,
+`KEEL_RECOVERY_GRACE_MINUTES`; `KEEL_AUTO_RECOVER=off` disables it), report
+one line, and never block the command. The grace exists only to keep a fresh
+crash's scratch directory for inspection: recovery's own checks, not the
+timer, make it safe. A cheap pre-filter skips chains that are recovered,
+receipted, sealed (by their last line), or recently written, and only the rest
+are authenticated in full; on 217 session directories a warm pass takes about
+80 ms. `keel recover --all` runs the same pass with no grace. `keel status`
+and `keel doctor` only report.
+
+### Opt-in reaper (planned)
+
+A host where Keel is not used for days would keep an orphaned backend until
+the next command. `keel setup --install-reaper` would install a launchd agent
+running `keel recover --all` hourly. It changes host configuration, so it is
+opt-in and not part of this slice.
+
+### Fault injection (PLAN D77)
+
+`ci/faults.py` runs the trusted runtime in front of a fake backend that
+misbehaves on purpose. Its first runs found three defects, all fixed in D77:
+
+- **The supervisor's pty reached the backend.** `openpty` returns descriptors
+  without close-on-exec, so the run, and through it the untrusted backend,
+  inherited both ends of the persistent supervisor's terminal and could write
+  to them from inside the sandbox: the master is the trusted operator-input
+  path, the slave the operator's screen. `serve` now marks both close-on-exec,
+  and the trusted runtime refuses to start holding any inherited
+  terminal-class descriptor; trusted code cannot mark a raw inherited
+  descriptor itself without `unsafe`.
+- **A cooperative stop never escalated.** On the shutdown control or a
+  forwarded signal the run sent `SIGTERM` to the backend group and waited for
+  the backend indefinitely; a backend that ignored it outlived the run when
+  `serve` killed the run's own group. Each stop request now escalates to
+  `SIGKILL` after the same 2 s grace teardown uses, and the in-chain teardown
+  records it. A forced stop in `serve` also runs recovery on the chain before
+  writing its receipt.
+- **A run outlived its supervisor.** With the master leaked, a dead `serve`
+  never produced a hangup, so the run ran on unattended, reported `active`,
+  and could be neither stopped nor recovered. With the master closed, the run
+  now treats end-of-input on its terminal as a hangup and stops in order.
+
+### Not done
+
+Session directories are never deleted automatically: chains are evidence, and
+pruning them is a retention decision for the operator.
+
 ## Verified teardown
 
-`keel stop RUN` will become a two-stage protocol:
+The two-stage protocol and receipt below are implemented for persistent
+sessions by the v3 slice; the remaining supervisor duties (denying a pending
+approval, relays and connection pools, zeroization) are not yet recorded.
+
+`keel stop RUN` is a two-stage protocol:
 
 1. `STOPPING` acknowledges that the trusted supervisor accepted the request.
 2. `STOPPED` is returned only after teardown checks pass and the receipt is
@@ -152,6 +433,9 @@ receipt or complete interrupted cleanup.
 
 ## Crash recovery
 
+The [v4 slice](#v4-slice-in-chain-resources-and-crash-recovery) implements
+the first form of this section.
+
 Normal shutdown is insufficient because the host or supervisor can crash.
 Startup and `keel doctor` should detect session directories with no live
 supervisor and no successful teardown receipt. A recovery command can remove
@@ -160,6 +444,9 @@ rewrite the earlier audit chain or claim that unobserved cleanup happened at the
 original crash time.
 
 ## Implementation stages
+
+Stages 2, 3, and 5 are implemented (v2 and v3 slices), stage 4 by the v1 slice
+for the audit event, and stage 6 in its operator-invoked form (v4 slice).
 
 1. Define canonical admission and teardown receipt schemas.
 2. Add an explicit run resource registry owned by the supervisor.
@@ -191,9 +478,6 @@ original crash time.
 
 The pragmatic implementation is expected to add roughly 700–1,200 first-party
 lines across trusted validation, untrusted orchestration, schemas, and tests.
-This proposal predated D39. D64 records the current 16,000-line hard ceiling
-with 15,331 lines allocated and a 669-line reserve after regression-only code
-was moved out of production `src` and the broker's atomic grant-liveness
-guarantee was added. Future trusted growth requires an explicit
-reallocation or a separately recorded change to the hard ceiling; it must not
-move silently.
+This proposal predated D39. Since D65 each trusted crate is held to a line
+ratchet with no aggregate ceiling; trusted growth raises a ratchet with a stated
+reason and must not move silently.

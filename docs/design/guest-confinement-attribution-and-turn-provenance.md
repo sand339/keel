@@ -8,9 +8,11 @@ Security claims about Keel must still be judged from the source, tests, and
 | Workstream | State |
 |---|---|
 | W1 intent envelopes | **Implemented (shadow)**, D45: verdicts stamped and audited on every action; branch scopes enforced |
-| W2 payload provenance | **Implemented (shadow)**: egress confidentiality (D47) and push-content integrity (D52) |
-| W3 quarantine extraction | Planned |
-| W4 per-turn context provenance | **Digest log implemented (shadow)**, D54; walker ranking, operator matching, and turn binding planned |
+| W2 payload provenance | **Implemented and enforced** (D81): egress and push confidentiality, and push-content integrity on a push the kernel derives from its own bytes; shadow increments D47 and D52 |
+| W3 quarantine extraction | **Implemented** (D82, D83): schema-bounded extraction through a sandboxed, credential-free helper the kernel binds and validates |
+| W4a declared-rank floor | **Implemented**, D80: `workspace:own` at trusted admission starts the floor at 2 from a clean clone of the accepted `HEAD` |
+| W4b lockfile inheritance | **Implemented**, D85: a fetched tarball whose SHA-512 the accepted `package-lock.json` pins keeps rank 2; held back until hashed |
+| W4 per-turn context provenance | **Digest log implemented (shadow)**, D54; ranking, operator matching, and turn binding **deferred** until measured against the W4a baseline (D79) |
 | W5 guest confinement | **Implemented** (Landlock file rules, and ABI 6 signal and abstract-socket scoping on the 6.12 guest kernel), D46, D53 |
 | W6 process attribution | **Implemented** for Git, egress, and MCP channels, D51, D55 |
 
@@ -35,6 +37,33 @@ relying on operator floor lifts alone.
 Two guest-side workstreams make the attribution half of this sound: a second
 confinement layer inside the guest, and per-process attribution of every
 mediated request.
+
+**Revision, D79: make the ranks meaningful before making the floor
+precise.** In a coding agent, the answer to "who influenced this decision" is
+almost always "something untrusted", because the workspace starts at rank 0
+and the guest reads it directly. Per-turn tracking (W4) is a large amount of
+machinery to rescue that answer. The revision changes the order and the
+emphasis:
+
+1. **W4a, a declared-rank floor.** The operator declares the workspace rank
+   at trusted admission, bound to the `HEAD` they accept (§8.0). Reading
+   one's own repository no longer pins the floor to 0; it drops only on
+   broker-delivered external content.
+2. **Payload checks carry the security weight.** W2's flow and integrity
+   checks look only at the effect's own bytes, so they need no turn table and
+   no timing-based binding. They move to enforcement once the push diff is
+   derived by trusted code (§6.2).
+3. **Restart replaces W4's taint decay.** A new run starts at the declared
+   rank, subject to `HEAD` re-acceptance; the operator carries context
+   forward in a note they write.
+4. **W3 becomes how the agent reads untrusted input without dropping the
+   floor.** Without it, the first raw issue read ends the session's high rank.
+5. **W4 is measured against this baseline,** not against the old rank-0
+   floor, and may be dropped.
+
+Step 0, before any of this: the model endpoint must not perform egress for
+the workload, and private clearance must end at the origin repository's path
+boundary (D78, §6.5).
 
 ## 2. Problem
 
@@ -143,11 +172,31 @@ Default sink assignments:
 | inside the envelope | violation | any | escalate, showing the exact flagged spans |
 | outside the envelope | no violation | high (rank ≥ 2) | escalate (exact action) |
 | outside the envelope | no violation | low | escalate, showing the low-rank sources |
+| outside the envelope | violation | high (rank ≥ 2) | escalate, showing the exact flagged spans (D79) |
 | outside the envelope | violation | low | deny, with an operator override only through the challenge gate |
 | any | `secret` content to a sink below `secret` | any | deny |
 
 Today's built-in restrictions, structural denials, budgets, and accepted Cedar
 policy still apply first. These rules replace only the minimum-rank check.
+
+**Shadow-only row, D79.** Outside the envelope, with no violation, at high
+influence, to a low-impact sink (a read request to a non-protected host):
+allow. This is where a declared-rank floor saves prompts. It rests on the
+payload check of the URL path and query, which is sound for verbatim content
+only, so it runs in shadow and is measured with `keel report --axes` before
+it allows anything. Protected sinks stay at escalate.
+
+**Enforced rows, D81.** The violation rows are in force: a payload violation
+escalates inside the envelope; outside it at a floor of 2 or more it
+escalates; outside it below 2 only the typed challenge overrides; and secret
+content to a sink below `secret` is denied. The rows without a violation still
+fall to the minimum-rank check.
+
+**Interim, D79.** Until W1 is enforced and these rules replace the
+minimum-rank check, the floor still gates rank-2 actions: a declared-rank
+session that reads external content escalates even an in-intent action with
+a clean payload. That is stricter than the table, and it is relaxed only when
+the table takes over.
 
 **The lethal trifecta follows from these rules.** Private data in context,
 untrusted content in context, and an external channel together produce an
@@ -246,11 +295,18 @@ least *k* bytes, embedded anywhere in a payload, with bounded memory.
 | PR title and body | The trusted PR POST through TLS, already bound by an effect permit | Confidentiality against clearance; integrity of text |
 | Git push | The digest-bound pack in the receive-pack POST | Integrity of every new blob entering a `protected` ref or path; confidentiality against clearance |
 
-**Push derivation without new trusted parsing.** The kernel writes the exact
-digest-bound pack bytes into a kernel-private directory and runs
-`index-pack` and `cat-file --batch` with the hardened host Git. It never trusts
-untrusted `keel-gitd`'s object enumeration. Pack parsing therefore stays in
-Git, which is already a pinned host dependency, rather than in Keel's TCB.
+**Push derivation without new trusted parsing. Implemented, D81.** The relay
+hands the kernel the exact receive-pack body, and the push permit binds that
+body's digest. Pushes from a guest Git client are thin, so the kernel indexes
+the pack with `index-pack --fix-thin` in a fresh repository whose only other
+objects come, through alternates, from a private bare copy of the admitted
+branch that trusted admission makes in the broker's own directory, where
+neither the guest nor the backend can write. Bases in the guest-writable
+workspace are never used. Objects the copy lacks are what the push adds; their
+paths come from `ls-tree` over each pushed commit, and a tree that does not
+resolve fails the push as uninspectable rather than hiding its content. Pack
+parsing stays in Git. The kernel parses only the pkt-line ref commands, whose
+names replace the relay's list.
 
 Each changed blob is classified:
 
@@ -262,6 +318,14 @@ Each changed blob is classified:
 
 A push of unmatched or rank-0 content into a `protected` sink is a data-flow
 violation. The gate shows the exact hunks and their classification.
+
+**As built, D81.** The classification is per line rather than per blob: a
+line committed anywhere at the admitted `HEAD` is unchanged, a line the model
+wrote in a tool call is model-authored, and anything else is unaccounted. The
+gate shows the counts. Every push that touches the default branch, a manifest,
+or CI was already inherently gated, so for pushes enforcement adds a reason,
+the challenge rule, and flags the relay cannot hide; for egress and for pushes
+to non-cleared remotes, `payload:flow` adds a gate that did not exist.
 
 ### 6.3 Implemented increment (shadow), D47
 
@@ -322,6 +386,25 @@ Still to do:
 - paraphrased and encoded exfiltration are included as negative tests that
   document what is not caught.
 
+### 6.5 Effects the model provider performs, and the origin's clearance, D78
+
+**Implemented, D78.** The model endpoint is cleared for everything and is not
+scanned, so any fetch the provider performs for the workload would bypass W2,
+the egress allowlist, and the network floor together. Trusted termination
+therefore forwards only tools the harness executes itself (no `type`, or
+`type: "custom"`); every typed tool, including server tools not yet invented,
+is stripped and recorded. A request whose content the provider would fetch is
+refused: an image or document with a `url` or `file` source, or a
+`container_upload`, anywhere in `system` or `messages`, including inside
+`tool_result` and document content. OpenRouter's routing, plugin, and web
+variants were already refused (D56).
+
+Private clearance covers the workspace origin's Git paths
+(`/{owner}/{name}/`, `/{owner}/{name}.git/`) and its API paths
+(`/repos/{owner}/{name}/`) only, each ending at a path boundary, so
+`/{owner}/{name}-other` is public. Gists, other repositories, and repository
+creation were never cleared.
+
 ## 7. Workstream 3: schema-bounded quarantine extraction
 
 This is a trusted channel for raising the integrity of untrusted content. It
@@ -350,6 +433,68 @@ A compartmented variant runs the same extraction in a fresh quarantine vertex
 for content that must not touch the main guest at all. This is the project
 brief's "fresh vertex per untrusted read", as a designed feature.
 
+### 7.1 As built, D82 and D83
+
+**Implemented.** Decisions taken: GitHub issues and pull requests and web
+pages by URL; an operator-accepted registry; the smallest model of the run's
+provider family on the run budget (on OpenRouter, the admitted model, because
+its price snapshot prices only that one).
+
+**Schemas (D82, `keel_provenance::extraction`).** A closed grammar with no
+string type: `enum` (at most 32 short identifiers), bounded `integer`,
+`boolean`, `path` (must name a file in the admitted tree), `issue` (a number),
+and an unnested `list` of those (at most 16), at most 16 fields. Each schema
+reports an upper bound on its bandwidth in bits. `keel run --schemas
+BUNDLE.json` copies a bundle of at most 16 schemas into the session, pins its
+hash in the `keel-extraction-v1` domain, and is task authority: the trusted
+admission screen lists each schema and its bandwidth.
+
+**The call (D83): the kernel binds and validates; it originates nothing.** An
+untrusted helper, `keel-extract`, runs on the host under its own sandbox,
+which reaches one Unix socket, the kernel's `extract.sock`, and nothing else:
+no IP network, no file writes, no other program. The guest's MCP host, which
+also bridges guest traffic, can neither reach that socket nor impersonate it,
+so it cannot launder a guest fetch as an extraction. Requests are typed by
+the socket they arrive on.
+
+1. The guest calls the `keel_extract` MCP tool with a source (`issue:N`,
+   `pull:N` on the admitted repository, or `url:https://HOST/PATH`) and a
+   schema. The MCP host sends the kernel an extraction request and waits.
+2. The helper, blocked on its socket, receives the job: the fetch host and
+   path, the model, and the forced tool. One job is active at a time, so
+   every request on the helper's channel binds to it.
+3. The helper fetches the source as an ordinary mediated request. The kernel
+   requires it to be exactly the job's `GET`, judges it like any egress, and
+   records the SHA-256 of the decoded body. The response reaches only the
+   helper, so it does not lower the guest's floor.
+4. The helper calls the model as an ordinary mediated request, under the run
+   budget. Trusted termination requires exactly one tool, the schema's,
+   forced, and one user text block whose SHA-256 is the fetched body's.
+5. The kernel takes the tool input from its own reassembly of the model's
+   response, validates it against the schema and the admitted tree, audits
+   `kernel.extraction` (source, schema, fetched and result digests, outcome),
+   and answers the guest with only the canonical result.
+
+A compromised helper can feed garbage, refuse, or spend the run's model
+budget; it cannot make the kernel accept a result that is not a correctly
+shaped model call over the fetched body, validated against the schema, and it
+cannot show the guest the source. Live E2E `extract-url` reads `example.com`
+this way with an own workspace: the agent receives `{"kind": "documentation",
+"has_links": true}`, no page text, and the floor stays at 2.
+
+**Cost.** Schema language 322 lines (moved from keel-policy); the call 442 in
+the kernel, 156 in keel-input, about 80 in keel-secrets, and 21 in keel-audit,
+about 700 trusted lines in all, more than the 150 to 200 first estimated for
+this design.
+
+**Role after D79.** With a declared-rank floor, raw untrusted content still
+lowers the floor; extracting it through a schema delivers rank 2 and leaves
+the floor where it is, because the guest receives only the extracted result.
+A schema carries no free text, so W3 covers routing, triage, and
+classification, not "fix the bug this issue describes", which still needs the
+raw prose and still drops the floor. The raw read tool remains available; an
+agent that calls it drops the floor, which fails safe.
+
 Exit criteria:
 
 - the extraction output validator rejects free text, unadmitted identifiers,
@@ -359,7 +504,96 @@ Exit criteria:
 - an injection suite shows that adversarial content cannot move an extracted
   result outside its schema.
 
-## 8. Workstream 4: per-turn context provenance (control-influence axis)
+## 8. Workstream 4: context provenance (control-influence axis)
+
+### 8.0 W4a and W4b: a declared-rank floor, D79
+
+**W4a implemented, D80; W4b implemented, D85.** As built: the acceptance ledger lives
+in `accepted-heads/` beside `sessions/` in the Keel state directory, keyed by
+the workspace's canonical path, and records the accepted commit. The trusted
+admission screen names the relation (first acceptance, unchanged, *n* commits
+ahead, diverged) and never shows commit messages, which a tainted run may
+have written. The clone is single-branch and tagless, fetched over `file://`
+so only reachable objects arrive, with a fresh configuration and `origin`
+pointed at the real remote. It is not shallow: the backend's Git relay
+mirrors the workspace with `git clone --local`, which a shallow source
+disables, so the acceptance covers `HEAD` and its own history. The clone stays
+in the session directory, and the CLI prints how to fetch its commits.
+
+**Declaration.** `workspace:own` is task authority, like `workspace:public`:
+it is confirmed on the trusted admission screen, which shows the `HEAD`
+digest, and recorded in the admission manifest. It is never honoured from the
+request file or CLI alone. Declared, the run's floor starts at rank 2 instead
+of 0; the default stays 0 for cloned or third-party repositories. The floor is
+then the minimum of the declared rank and the ranks of broker-delivered
+content, so it drops only on web, MCP, issue, and registry reads.
+
+**The workspace must be exactly the accepted `HEAD`.** The kernel never sees
+which file the guest reads, so the floor cannot rank individual files; the
+declaration is all-or-nothing. It requires:
+
+- a `HEAD` the operator accepted. If `HEAD` has moved since the last accepted
+  run, admission shows the commits since then and asks again; otherwise the
+  floor starts at 0. This closes laundering through commits, where a tainted
+  session commits its output and the next run reads it at rank 2.
+- a workspace with no dirty, untracked, or ignored-but-present files, since
+  `node_modules`, `.venv`, `target/`, and caches hold third-party code the
+  guest can read but `HEAD` does not commit. The practical form is an
+  ephemeral checkout of `HEAD` (building on D70).
+
+For payload classification (§6.1), per-blob ranks still apply: a blob not in
+the accepted `HEAD` is rank 0 for W2's integrity check even when the floor is
+declared.
+
+**Channel inventory.** The floor's meaning rests on the set of things the
+guest can read without the broker being closed: the accepted `HEAD` tree, the
+pinned guest image, model output, and operator input. Before W4a ships, the
+threat model lists that set, including anything mounted from the host such as
+harness configuration, and every other channel is either removed or treated
+as rank 0.
+
+**Restart and handoff.** A new run starts at the declared rank, subject to
+`HEAD` re-acceptance. The operator carries context forward in a handoff note.
+A note copied from a tainted session's own summary launders its taint, and
+Keel cannot tell; admission records the note's digest, and the documentation
+says the note must be operator-written.
+
+**W4b: lockfile inheritance.** Registry fetches would drop the floor on every
+install. A fetched artifact whose digest the accepted lockfile pins keeps the
+declared rank. The first ecosystem is `npm ci`, which fetches tarballs by
+their `resolved` URL and checks `integrity`, fields trusted code reads as
+JSON it already parses. Registry metadata (npm packuments, Cargo's sparse
+index, PyPI simple pages) carries no lockfile digest and still lowers the
+floor, so `cargo fetch --locked` does not benefit until its index is handled.
+Extracting digests with untrusted code is ruled out: a lying extractor would
+be a floor lift. Admission says that install scripts of pinned dependencies
+run at the inherited rank.
+
+As built (D85): trusted admission reads `package-lock.json` from the accepted
+commit's tree with trusted host Git, not from the working tree. It pins every
+package with an `https` `resolved` URL on the default port, with no query or
+credentials, and a `sha512` integrity. Lockfile version 1, a malformed file,
+and conflicting duplicate pins pin nothing, and the screen says so. The
+kernel holds the pins. Trusted termination asks whether the authorized `GET`
+is pinned. If it is, it reads the whole response (bounded at 16 MiB) without
+delivering any of it, and gives the kernel the SHA-512 of the decoded body.
+The kernel ranks the response 2 only if host, path, and digest all match the
+pin, and 0 otherwise. Only then are the bytes released, so the guest never
+holds an unverified tarball at the declared rank. The audit and floor treat
+a pinned fetch as operator data from that host and path, and the manifest
+records `lockfile_pins`.
+
+**What this gives up.** No taint decay within a session: one external read
+holds the floor down until restart. Payload checks can be evaded by
+paraphrase, compression, and encoding, so they protect against plain
+injection, not a model deliberately evading them. The declared rank is the
+operator's judgment, recorded in the manifest.
+
+| Session | Floor | Rank-2 actions |
+|---|---|---|
+| Own repository, accepted `HEAD`, no external reads | 2 | Pass; payload checks still apply |
+| Own repository, then a web, MCP, or issue read | Drops | Escalate |
+| Third-party repository, or a moved `HEAD` not re-accepted | 0 | Always escalate |
 
 This refines axis 3 and implements the
 [roadmap item](../ROADMAP.md#per-turn-content-provenance). It runs in shadow
@@ -681,6 +915,25 @@ lifts (about 250 lines), and analyze it offline against the content store.
 
 ## 12. Sequencing
 
+**Revised, D79.** The plan below supersedes the original sequencing:
+
+1. **D78 (done):** the model endpoint performs no egress for the workload;
+   private clearance ends at the origin's path boundary.
+2. W1, W2, and W6 as already built, in shadow.
+3. **W4a:** the declared-rank floor with `HEAD` re-acceptance, the exact-`HEAD`
+   workspace requirement, and the channel inventory.
+4. Fill the §4.3 row, derive the push diff in trusted code (§6.2), then move
+   W2 to enforcement. Integrity enforcement must not rest on `keel-gitd`'s
+   diff.
+5. **W3** extraction.
+6. **W4b** lockfile inheritance, `npm ci` first, measured.
+7. `keel report --axes` on real sessions; then decide on W4 against the
+   W4a, restart, and extraction baseline. Its remaining value is sessions that
+   stay high-rank long after one external read, where restarting is costly;
+   that may be a small set. Dropping W4 is a valid outcome.
+
+The original sequencing, for reference:
+
 ~~~text
 W5 confinement (guest-only) ─────► W6 attribution ───────────────┐
 W1 intent envelopes ──► W2 payload provenance (shadow → enforce) ─┼─► §4.3 rules
@@ -725,13 +978,16 @@ schema-escape, attribution-forgery, and confinement-escape cases.
   Schemas need review.
 - Attribution is only as sound as the guest kernel.
 - The model endpoint is cleared for `secret` by necessity. Keel cannot stop
-  the model provider from receiving context.
+  the model provider from receiving context, but it refuses requests that
+  would have the provider fetch or execute for the workload (D78).
 
 ## 15. Open questions
 
-1. Should admitted workspace content default to `private` and rank 2, or
+1. ~~Should admitted workspace content default to `private` and rank 2, or
    should the operator designate paths and leave the rest at `public` and
-   rank 0?
+   rank 0?~~ Answered by D79: content stays `private` by default, and the
+   operator declares the rank of the whole accepted `HEAD` at admission
+   (§8.0); the default rank stays 0.
 2. What shingle size *k* balances fragment detection against false positives
    on common code idioms?
 3. Which Claude Code settings minimize dynamic content injection without

@@ -20,6 +20,8 @@ use std::{
 /// The remote the acceptance run pushes to.
 const REMOTE: &str = "https://github.com/example-org/keel-acceptance.git";
 const MODEL_HOST: &str = "api.anthropic.com";
+/// The receive-pack body every push in these tests sends.
+const PUSH_BODY: &[u8] = b"0000";
 
 /// One thing the guest asks the broker for, in the order it asks.
 enum Step {
@@ -71,7 +73,10 @@ impl EgressSession for Session {
     ) -> Result<(), String> {
         // Nothing is relayed: the rank the response carries is the whole
         // subject, so both streams are dropped once it is recorded.
-        let result = authorizer.authorize(self.method, self.path, [0; 32], None);
+        // A receive-pack POST carries the exact body the push permit bound.
+        let mut digest = [0_u8; 32];
+        digest.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, PUSH_BODY).as_ref());
+        let result = authorizer.authorize(self.method, self.path, digest, None);
         if result.is_ok() {
             authorizer.commit_request_send()?;
             authorizer.record_response()?;
@@ -205,7 +210,16 @@ fn push(path: &Path, force: bool) -> u64 {
     client
         .write_all(&[u8::from(force), 0, 0, 0])
         .expect("flags");
-    client.write_all(&[0_u8; 32]).expect("body digest");
+    {
+        // The receive-pack body follows its digest; the kernel checks both.
+        let body = PUSH_BODY;
+        let digest = ring::digest::digest(&ring::digest::SHA256, body);
+        client.write_all(digest.as_ref()).expect("body digest");
+        client
+            .write_all(&u32::try_from(body.len()).unwrap().to_be_bytes())
+            .expect("body length");
+        client.write_all(body).expect("body");
+    }
     client.flush().expect("request flush");
     let mut response = [0_u8; 9];
     client.read_exact(&mut response).expect("broker response");

@@ -85,7 +85,7 @@ Explain any proposed exception in the pull request and update the architecture a
 
 ## Trusted computing base budget
 
-CI enforces a 16,000-line ceiling across the six trusted crates, together with per-crate allocations and dependency-direction checks. Per-crate allocations total 14,567 lines (D52); the remaining 1,433 lines are unallocated reserve, not incidental headroom.
+CI holds each of the six trusted crates to a per-crate line ratchet in [`ci/check_invariants.py`](ci/check_invariants.py) (invariant I1), together with dependency-direction and allowlist checks. A change that grows a trusted crate past its ratchet fails CI until the number is raised in the same change. The trusted total, about 15,300 lines, is reported on every run but is not capped.
 
 When changing trusted code:
 
@@ -94,9 +94,9 @@ When changing trusted code:
 - prefer closed enums and bounded inputs over extensible strings;
 - document new authority and failure states;
 - add negative tests for bypass, replay, malformed input, and partial failure;
-- justify any budget reallocation or total increase in the decision log.
+- when you raise a ratchet, say in the commit message what the new trusted lines buy.
 
-The line ceiling is a reviewability constraint, not a security proof.
+The ratchet is a reviewability constraint, not a security proof.
 
 ## Coding expectations
 

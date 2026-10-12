@@ -1,16 +1,23 @@
 #![forbid(unsafe_code)]
 #![doc = "Trusted terminal owner for an interactive Keel runtime."]
 
+#[path = "keel-input-runtime/receipt.rs"]
+mod receipt;
+#[path = "keel-input-runtime/recover.rs"]
+mod recover;
 #[path = "keel-input-runtime/session.rs"]
 mod session;
+#[path = "keel-input-runtime/teardown.rs"]
+mod teardown;
 
+use keel_audit::RunKey;
 use keel_input::{
-    GateController, InputEvent, InputGate, PendingApproval, RuntimeBroker, RuntimeIntent,
-    SECURE_ATTENTION, TerminalControl, TerminalControlReader, encode_resize, push_keystroke,
-    render_gate, safe_text, terminal_gate_channel,
+    GateController, InputEvent, InputGate, PendingApproval, RunTeardownEvent, RuntimeBroker,
+    RuntimeIntent, SECURE_ATTENTION, TerminalControl, TerminalControlReader, encode_resize,
+    push_keystroke, render_gate, safe_text, terminal_gate_channel,
 };
 use keel_kernel::GateDecision;
-use nix::sys::signal::{SigSet, Signal, killpg};
+use nix::sys::signal::{SigSet, Signal};
 use nix::unistd::{Pid, dup, getpgrp, tcgetpgrp};
 use std::{
     env,
@@ -32,6 +39,7 @@ use std::{
     thread::{self, JoinHandle},
     time::Duration,
 };
+use teardown::RunResources;
 
 const APPROVAL_TITLE_NOTICE: &[u8] = b"\x1b]2;Keel approval: Ctrl-] or Ctrl-A /approve\x07";
 const NORMAL_TITLE_NOTICE: &[u8] = b"\x1b]2;keel mux\x07";
@@ -370,7 +378,9 @@ fn spawn_runtime(
     arguments: &[std::ffi::OsString],
     broker: &RuntimeBroker,
     isolation: &str,
-) -> Result<(Child, PathBuf), Box<dyn Error>> {
+    resources: &mut RunResources,
+    termination: SigSet,
+) -> Result<(), Box<dyn Error>> {
     let runtime = bundled_component("keel-runtime", "KEEL_RUNTIME_BACKEND")?;
     let component_root = runtime
         .parent()
@@ -389,7 +399,7 @@ fn spawn_runtime(
     let rootfs = component_root
         .join("../images/keel-phase1-rootfs.squashfs")
         .canonicalize()?;
-    let workspace = env::current_dir()?.canonicalize()?;
+    let workspace = broker.workspace().to_path_buf();
     let request = arguments
         .get(2)
         .map(PathBuf::from)
@@ -399,7 +409,23 @@ fn spawn_runtime(
     // `/var`. The sandbox compares the resolved vnode spelling, so the policy
     // and child environment must use that same canonical socket path.
     let broker_socket = broker.socket_path().canonicalize()?;
-    let scratch = trusted_scratch("runtime")?;
+    // Each resource is in the chain before the backend can run, so recovery
+    // after a crash releases what the authenticated record names (PLAN D75).
+    if let Some(directory) = broker_socket.parent() {
+        broker.record_resource("broker-dir", directory.display().to_string())?;
+    }
+    let scratch = resources.scratch(trusted_scratch("runtime")?).to_path_buf();
+    broker.record_resource("scratch", scratch.display().to_string())?;
+    // The one session file the untrusted runtime may write: the guest's own
+    // event stream, beside the audit chain it never touches (PLAN D68).
+    let audit = broker.audit_path();
+    let guest_events = audit
+        .parent()
+        .ok_or("audit path has no session directory")?
+        .canonicalize()?
+        .join(audit.file_name().map_or_else(String::new, |name| {
+            name.to_string_lossy().replacen("audit-", "guest-", 1)
+        }));
     let allowed_child = if isolation == "v8-sandboxed" {
         &deno
     } else {
@@ -419,7 +445,7 @@ fn spawn_runtime(
         &workspace,
         installation_root,
         &request,
-        &scratch,
+        [&scratch, &guest_events],
         &broker_socket,
         v8_proxy_port,
     );
@@ -428,12 +454,14 @@ fn spawn_runtime(
         .args(["-p", &profile])
         .arg(&runtime)
         .args(arguments)
+        .current_dir(&workspace)
         .env_clear()
         .env("PATH", git.search_path)
         .env("HOME", &scratch)
         .env("TMPDIR", &scratch)
         .env("KEEL_KERNEL_SOCKET", broker_socket)
         .env("KEEL_RUNTIME_SCRATCH", &scratch)
+        .env("KEEL_GUEST_EVENTS", &guest_events)
         .env("KEEL_VZ_BACKEND", &vz_backend)
         .env(
             "KEEL_GIT_UPLOAD_PACK",
@@ -522,13 +550,9 @@ fn spawn_runtime(
     if let Some(listener) = inherited_v8_proxy.as_ref() {
         command.env("KEEL_V8_PROXY_FD", listener.as_raw_fd().to_string());
     }
-    match command.spawn() {
-        Ok(child) => Ok((child, scratch)),
-        Err(error) => {
-            let _ = fs::remove_dir_all(&scratch);
-            Err(error.into())
-        }
-    }
+    let backend = resources.backend(spawn_stoppable(&mut command, termination)?);
+    broker.record_resource("backend-group", format!("pgid {}", backend.id()))?;
+    Ok(())
 }
 
 fn bundled_component(name: &str, development_override: &str) -> Result<PathBuf, Box<dyn Error>> {
@@ -630,7 +654,7 @@ fn runtime_sandbox_profile(
     workspace: &Path,
     components: &Path,
     request: &Path,
-    scratch: &Path,
+    [scratch, guest_events]: [&Path; 2],
     broker: &Path,
     v8_proxy_port: Option<u16>,
 ) -> String {
@@ -660,6 +684,7 @@ fn runtime_sandbox_profile(
   (subpath "{}") {}
   (subpath "{}") {}
   (literal "{}") (subpath "{}") {}
+  (literal "{}") {}
   (subpath "{}") (subpath "{}")
   (subpath "/System") (subpath "/usr/lib") (subpath "/usr/share")
   (subpath "/usr/bin") (subpath "/bin") (subpath "/sbin")
@@ -668,7 +693,7 @@ fn runtime_sandbox_profile(
   (literal "/etc/gitconfig") (literal "/private/etc/gitconfig")
   (literal "/private/var/select") (literal "/private/var/select/sh"))))
 (deny file-write* (require-not (require-any
-  (subpath "{}") (subpath "{}") (literal "/dev/null"))))
+  (subpath "{}") (subpath "{}") (literal "{}") (literal "/dev/null"))))
 (deny process-exec (require-not (require-any
   (literal "{}") (literal "{}") (literal "{}") (subpath "{}")
   (literal "/bin/sh") (literal "/bin/bash"))))
@@ -690,10 +715,13 @@ fn runtime_sandbox_profile(
         sb_string(request),
         sb_string(scratch),
         sb_ancestor_literals(scratch),
+        sb_string(guest_events),
+        sb_ancestor_literals(guest_events),
         sb_string(git_exec_root),
         sb_string(git_data_root),
         sb_string(workspace),
         sb_string(scratch),
+        sb_string(guest_events),
         sb_string(runtime),
         sb_string(allowed_child),
         sb_string(git),
@@ -702,6 +730,74 @@ fn runtime_sandbox_profile(
         tcp_outbound,
         tcp_inbound,
     )
+}
+
+/// Starts the untrusted extraction helper (PLAN D83). Its sandbox reaches
+/// one Unix socket, the kernel's extraction channel, and nothing else: no IP
+/// network, no file writes, no other program. Its output goes nowhere near
+/// the operator's terminal.
+fn spawn_extract_helper(
+    broker: &RuntimeBroker,
+    socket: &Path,
+    resources: &mut RunResources,
+    termination: SigSet,
+) -> Result<(), Box<dyn Error>> {
+    let helper = bundled_component("keel-extract", "KEEL_EXTRACT_HELPER")?;
+    let socket = socket.canonicalize()?;
+    let components = helper.parent().unwrap_or_else(|| Path::new("/nonexistent"));
+    let profile = format!(
+        r#"(version 1)
+(allow default)
+(deny network-outbound (remote ip))
+(deny network-inbound (local ip))
+(deny network-outbound (remote unix-socket))
+(allow network-outbound (remote unix-socket (path-literal "{}")))
+(deny file-read* (require-not (require-any
+  (literal "/") (literal "/var") (literal "/etc") (literal "/tmp")
+  (subpath "{}") (subpath "/System") (subpath "/usr/lib")
+  (subpath "/dev") (subpath "/private/var/db") (literal "/private/etc/localtime"))))
+(deny file-write*)
+(deny process-fork)
+(deny process-exec (require-not (literal "{}")))"#,
+        sb_string(&socket),
+        sb_string(components),
+        sb_string(&helper),
+    );
+    let provider = keel_secrets::runtime_model_provider()?;
+    let mut command = Command::new("/usr/bin/sandbox-exec");
+    command
+        .args(["-p", &profile])
+        .arg(&helper)
+        .env_clear()
+        .env("KEEL_EXTRACT_SOCKET", &socket)
+        .env("KEEL_MODEL_HOST", &provider.host)
+        .env("KEEL_MODEL_SENTINEL", provider.sentinel)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    if let Some(certificate) = broker.ca_certificate_pem() {
+        command.env("KEEL_RUN_CA_PEM", certificate);
+    }
+    if let Some(repository) = broker.github_private_repository() {
+        command.env("KEEL_GITHUB_PRIVATE_REPOSITORY", repository);
+    }
+    if provider.host == keel_secrets::OPENROUTER_HOST {
+        command.env("KEEL_MODEL_PROVIDER", "openrouter");
+    }
+    if provider.region.is_some() {
+        command.env("KEEL_MODEL_PROVIDER", "bedrock").env(
+            "KEEL_MODEL_AUTH_MODE",
+            if env::var_os("AWS_BEARER_TOKEN_BEDROCK").is_some() {
+                "bearer"
+            } else {
+                "sigv4"
+            },
+        );
+    }
+    let child = resources.helper(spawn_stoppable(&mut command, termination)?);
+    broker.record_resource("extract-group", format!("pgid {}", child.id()))?;
+    Ok(())
 }
 
 fn renderer_sandbox_profile(renderer: &Path) -> String {
@@ -822,17 +918,49 @@ fn terminal_dimensions() -> Option<(u16, u16)> {
     Some((rows, columns))
 }
 
-/// Stops SIGWINCH from being delivered to a handler so it can be waited for.
+/// Stops SIGWINCH, SIGHUP, and SIGTERM from being delivered to a handler so
+/// each can be waited for, and returns the resize and termination sets.
 ///
 /// This must run before any other thread or child exists, because both inherit
 /// the mask and the waiting thread has to be the signal's only consumer. No
 /// process in the runtime chain below this one handles SIGWINCH; each is either
 /// a byte filter or the VM host, and this process alone owns the operator's tty.
-fn block_resize_signal() -> Result<SigSet, Box<dyn Error>> {
+/// Children that must stay stoppable are spawned through [`spawn_stoppable`].
+fn block_handled_signals() -> Result<(SigSet, SigSet), Box<dyn Error>> {
     let mut winch = SigSet::empty();
     winch.add(Signal::SIGWINCH);
     winch.thread_block()?;
-    Ok(winch)
+    let mut termination = SigSet::empty();
+    termination.add(Signal::SIGHUP);
+    termination.add(Signal::SIGTERM);
+    termination.thread_block()?;
+    Ok((winch, termination))
+}
+
+/// Spawns a child that inherits the termination signals unblocked. A signal
+/// that arrives during the spawn itself takes its default action.
+fn spawn_stoppable(command: &mut Command, termination: SigSet) -> io::Result<Child> {
+    termination.thread_unblock().map_err(io::Error::from)?;
+    let child = command.spawn();
+    termination.thread_block().map_err(io::Error::from)?;
+    child
+}
+
+/// Turns a hangup of the operator's terminal or a `SIGTERM` into the same
+/// orderly shutdown as the trusted shutdown control, so the run's resources
+/// are released instead of orphaned.
+fn spawn_termination_forwarder(
+    termination: SigSet,
+    runtime_group: Pid,
+    shutdown: Arc<AtomicBool>,
+    escalated: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
+        while termination.wait().is_ok() {
+            shutdown.store(true, Ordering::Release);
+            teardown::request_stop(runtime_group, &escalated);
+        }
+    });
 }
 
 /// Tells the guest this terminal's new size each time the operator resizes it.
@@ -882,13 +1010,45 @@ fn spawn_resize_forwarder(
     });
 }
 
+/// Refuses to start while holding a terminal-class descriptor it did not
+/// open. A child inherits every descriptor not marked close-on-exec, and
+/// trusted code cannot mark a raw inherited descriptor without `unsafe`, so an
+/// inherited terminal would reach the untrusted backend or renderer, which
+/// could then type into or paint over the operator's terminal.
+fn refuse_inherited_terminals() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+
+    let null = fs::metadata("/dev/null")?;
+    let descriptors = fs::read_dir("/dev/fd")?
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|descriptor| *descriptor > 2)
+        .collect::<Vec<_>>();
+    // The directory's own descriptor is closed by now, so it fails to stat.
+    for descriptor in descriptors {
+        if let Ok(metadata) = fs::metadata(format!("/dev/fd/{descriptor}"))
+            && metadata.file_type().is_char_device()
+            && metadata.rdev() != null.rdev()
+        {
+            return Err(format!(
+                "refusing to start: inherited terminal descriptor {descriptor} would reach \
+                 the untrusted backend; close it before launching Keel"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn main() -> Result<(), Box<dyn Error>> {
+    refuse_inherited_terminals()?;
     let arguments = env::args_os().skip(1).collect::<Vec<_>>();
     match arguments.first().and_then(|argument| argument.to_str()) {
         Some("serve") => return session::serve(&arguments),
         Some("attach") => return session::attach(&arguments),
         Some("stop") => return session::stop(&arguments),
+        Some("recover") => return recover::recover(&arguments),
         Some("lift") => return session::lift(&arguments),
         Some("launcher") => return session::launcher(&arguments),
         _ => {}
@@ -896,7 +1056,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() || !io::stderr().is_terminal() {
         return Err("keel-input-runtime requires exclusive terminal stdio".into());
     }
-    let winch = block_resize_signal()?;
+    let (winch, termination) = block_handled_signals()?;
     let mut intent = RuntimeIntent::from_runtime_arguments(&arguments)?;
     let isolation = intent.isolation().to_owned();
     let input_source = env::var_os("KEEL_INPUT_SOURCE");
@@ -908,6 +1068,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         confirm_host_v8_admission(trusted_approval_input)?;
     }
     confirm_task_admission(&mut intent, trusted_approval_input)?;
+    // Only a run spawned by `serve` is supervised. The key verifies the
+    // receipt that supervisor signs after this run's chain is sealed.
+    let supervisor_key = (input_source.as_deref()
+        == Some(std::ffi::OsStr::new("trusted-supervisor")))
+    .then(|| env::var("KEEL_SUPERVISOR_KEY").ok())
+    .flatten()
+    .map(|key| RunKey::from_hex(&key).map(|key| key.public_hex()))
+    .transpose()?;
     let (gate, controller) = terminal_gate_channel();
     let broker = intent.start_kernel_broker_with_gate(gate)?;
     let floor_control = broker.control();
@@ -944,9 +1112,23 @@ fn main() -> Result<(), Box<dyn Error>> {
     let renderer_directory = renderer
         .parent()
         .ok_or("renderer has no containing directory")?;
-    let (mut child, runtime_scratch) = spawn_runtime(&arguments, &broker, &isolation)?;
+    // Declared after the broker so that, on every early return, the backend
+    // group is ended before the broker seals the audit chain.
+    let mut resources = RunResources::default();
+    spawn_runtime(&arguments, &broker, &isolation, &mut resources, termination)?;
+    if let Some(socket) = broker.extract_socket_path() {
+        spawn_extract_helper(&broker, &socket, &mut resources, termination)?;
+    }
+    let child = resources.running_backend()?;
     let runtime_group = Pid::from_raw(child.id().cast_signed());
     let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let stop_escalated = Arc::new(AtomicBool::new(false));
+    spawn_termination_forwarder(
+        termination,
+        runtime_group,
+        Arc::clone(&shutdown_requested),
+        Arc::clone(&stop_escalated),
+    );
     let mut child_output = child.stdout.take().ok_or("runtime stdout unavailable")?;
     let (rows, columns) = terminal_dimensions().unwrap_or((24, 80));
     let mut renderer_command = Command::new("/usr/bin/sandbox-exec");
@@ -964,7 +1146,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut renderer = renderer_command.spawn()?;
+    let mut renderer = spawn_stoppable(&mut renderer_command, termination)?;
     let renderer_control = Arc::new(Mutex::new(
         renderer.stdin.take().ok_or("renderer stdin unavailable")?,
     ));
@@ -1064,6 +1246,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let input_state = Arc::clone(&interactive);
     let input_renderer = Arc::clone(&renderer_control);
     let input_shutdown = Arc::clone(&shutdown_requested);
+    let input_escalated = Arc::clone(&stop_escalated);
     let _input_thread = thread::spawn(move || -> io::Result<()> {
         let mut input = io::stdin().lock();
         let mut bytes = [0_u8; 256];
@@ -1074,10 +1257,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut keystrokes = Vec::with_capacity(bytes.len());
         let mut reader = TerminalControlReader::new();
         loop {
-            let count = input.read(&mut bytes)?;
-            if count == 0 {
-                return Ok(());
-            }
+            let count = match input.read(&mut bytes) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Ok(0) | Err(_) if !input_shutdown.load(Ordering::Acquire) => {
+                    // The terminal's other end is gone, as when a persistent
+                    // session's supervisor dies. Stop in order rather than run
+                    // on with no one able to attach, stop, or recover it.
+                    input_shutdown.store(true, Ordering::Release);
+                    teardown::request_stop(runtime_group, &input_escalated);
+                    return Ok(());
+                }
+                Ok(0) | Err(_) => return Ok(()),
+                Ok(count) => count,
+            };
             // A persistent session's attach client reports its terminal size
             // down this same stream. A directly attached terminal sends no
             // control messages and reaches the guest through SIGWINCH instead.
@@ -1103,7 +1295,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                     TerminalControl::Shutdown => {
                         input_shutdown.store(true, Ordering::Release);
-                        let _ = killpg(runtime_group, Signal::SIGTERM);
+                        teardown::request_stop(runtime_group, &input_escalated);
                     }
                 }
             }
@@ -1121,7 +1313,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .join()
         .map_err(|_| "renderer feed thread panicked")?
         .map_err(|error| format!("send guest output to terminal renderer: {error}"))?;
-    let scratch_cleanup = fs::remove_dir_all(&runtime_scratch);
+    let released = resources.release();
     begin_shutdown(&interactive)?;
     let renderer_status = renderer.wait()?;
     output_thread
@@ -1137,7 +1329,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     floor_lift_worker
         .join()
         .map_err(|_| "floor lift worker panicked")?;
-    let _broker_report = broker.shutdown()?;
+    let stop_reason = if orderly_shutdown {
+        "shutdown"
+    } else if status.success() {
+        "exited"
+    } else {
+        "error"
+    };
+    let _broker_report = broker.shutdown_with_teardown(Some(RunTeardownEvent {
+        stop_reason,
+        escalated: released.escalated || stop_escalated.load(Ordering::Acquire),
+        checks: released.checks.clone(),
+        supervisor_key,
+    }))?;
     gate_thread
         .join()
         .map_err(|_| "gate receiver thread panicked")??;
@@ -1146,7 +1350,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     if !status.success() && !orderly_shutdown {
         return Err(format!("runtime exited with {status}").into());
     }
-    scratch_cleanup?;
+    if let Some(error) = released.error() {
+        return Err(error.into());
+    }
     if !renderer_status.success() {
         return Err(format!("renderer exited with {renderer_status}").into());
     }
@@ -1163,3 +1369,7 @@ fn report_audit_paths(audit: &Path, key: &Path) {
 #[cfg(test)]
 #[path = "../../tests/support/runtime_security.rs"]
 mod security_tests;
+
+#[cfg(test)]
+#[path = "../../tests/support/teardown.rs"]
+mod teardown_tests;

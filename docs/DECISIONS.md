@@ -873,3 +873,470 @@ and the analyst as a CLI, and both share one browser through its daemon.
   empirically in one run, which showed no traffic beyond the model's.
 
 **Budget.** No trusted lines.
+
+## D37 (condensed log; PLAN D65) — Trusted crates are held to per-crate ratchets, not an aggregate ceiling
+
+**Decision.** Invariant I1 keeps a first-party line ratchet for each trusted
+crate and drops the 16,000-line aggregate ceiling and its unallocated reserve.
+A crate that grows past its ratchet fails CI until the number is raised in
+`ci/check_invariants.py`, with the reason in the commit message. The total is
+printed on every run and stated in the README.
+
+**Why.** The ceiling had moved twice, so it worked as a budget rather than a
+limit, and each reserve allocation needed its own decision entry. Line count
+is a review-cost signal, not a security property: rustls, hyper, Cedar, and
+serde dwarf the first-party count, and I4 already controls which trusted
+dependencies exist. The useful part, that trusted growth is never accidental,
+is kept by the per-crate ratchets.
+
+**Residual.**
+
+- Raising a ratchet is now cheap, so trusted growth can drift without a
+  deliberate reconsideration; the reported total is the only signal.
+- The boundary invariants I2 to I12 are unchanged.
+
+**Budget.** No trusted lines; ratchets are unchanged at 15,331.
+
+## D38 (condensed log; PLAN D66) — The guest's Alpine packages are locked, and the image builds byte-identically
+
+**Decision.** `spikes/guest-packages.lock` pins every Alpine package the image
+build installs, dependencies included, by repository, name, exact version, and
+SHA-256. The build installs only those files, offline, and fails unless the
+installed set equals the lock. Build-time timestamps are fixed so that the
+root disk and initramfs are byte-identical across builds.
+
+**Why.** The admission manifest records image digests, but they meant little
+while each setup resolved packages against Alpine's live index: two machines,
+or one machine a week apart, ran different guests. A lock makes the guest a
+reviewable input and the digests comparable.
+
+**Residual.**
+
+- Guest packages, Chromium included, are patched only when the lock is
+  refreshed. Before, setup picked up security updates automatically.
+- Alpine prunes superseded versions, so a fresh checkout with an old lock fails
+  to download until the lock is refreshed.
+- `keel-mcp-guest` is built locally; cross-machine identity is unverified.
+
+**Budget.** No trusted lines.
+
+## D39 (condensed log; PLAN D67) — The triage profile is renamed `scoped`, and `--scope none` admits no outside host
+
+**Decision.** `--profile triage` becomes `--profile scoped`, with no alias:
+the old name fails with a message naming the new one. `KEEL_TRIAGE_PROVIDERS`
+becomes `KEEL_SCOPED_PROVIDERS`, and the admission line and manifest use the
+new name. `--scope none`, on its own, admits no host beyond the run's own.
+
+**Why.** The profile is a confinement mode, not a triage feature. The same
+mode fits validating a finding in code, where the workspace is the repository
+and the run needs no outside host, or only package registries. v0.1.0 is not
+tagged, so the rename breaks no user.
+
+**Residual.**
+
+- Audit logs from earlier runs record `triage` as their profile.
+- `none` cannot be combined with rules; a validation that needs a registry
+  lists the registry instead.
+- Workflow presets (`triage`, `code-validation`) over this mode remain the
+  proposal in [run profiles](design/run-profiles.md).
+
+**Budget.** Provenance ratchet 1,321 → 1,330; input 3,326 → 3,325.
+
+## D40 (condensed log; PLAN D68) — The guest reports its own processes and file writes, and sessions export as OpenTelemetry traces
+
+**Decision.** The guest's PID 1 observes process execs and exits (the
+kernel's process-events connector) and file writes (fanotify) and streams them
+to the host, which records them in `guest-*.ndjson` beside the audit chain.
+`keel export` authenticates a session's audit chains and emits OTLP/JSON
+traces that join the audit records with the guest's events, to a file or an
+OTLP/HTTP collector.
+
+**Why.** Keel saw everything that crossed the VM boundary and nothing inside
+it, and its evidence could only be read with Keel's own reports. Process and
+file activity is the context an operator needs to understand a run, and is the
+input that generated confinement profiles would need. OpenTelemetry puts runs
+in the tools teams already use, without a live connection from the runtime.
+
+**Residual.**
+
+- Guest events are the guest's claims: unsigned, outside the audit chain, and
+  lossy under load. They decide nothing.
+- Processes that fork without exec are not reported, so their children attach
+  to the run span; syscalls, network inside the guest, and reads are not
+  observed.
+- Export is after the fact; there is no live stream.
+- To reach its one writable file, the runtime may now list the entries of the
+  session directory and its parents, which names other sessions in
+  `~/.keel/sessions`. It cannot read or write any other file there.
+
+**Budget.** keel-input ratchet 3,325 → 3,338.
+
+## D41 (condensed log; PLAN D69) — A run may record network targets in plain text for incident response
+
+**Decision.** An audit action still commits to its exact target with a hash by
+default. A run admitted with `--record-targets` additionally writes each
+network action's method, host, port, and query-free path as a readable
+`target` field. The flag needs trusted-terminal admission, appears on the
+admission screen, and is recorded in the run manifest. Recorded targets pass
+through the same secret redactor as every other field.
+
+**Why.** The hashed target protects private hosts and URLs, but an
+investigator triaging untrusted code needs the hosts it tried to reach as
+readable indicators. Making it an admitted, off-by-default choice keeps the
+privacy-preserving default while enabling the incident-response use.
+
+**Residual.**
+
+- Only network targets gain detail; workspace, command, and Git targets stay
+  hashed.
+- Query strings and fragments are stripped, so a credential in a query
+  parameter is not recorded; a credential in a path still relies on the
+  redactor.
+- The field is still inside the local audit chain, with no external witness.
+
+**Budget.** kernel 5,266 → 5,279; audit 1,228 → 1,282; input 3,338 → 3,349.
+
+## D42 (condensed log; PLAN D70) — A run may detonate untrusted code with an ephemeral workspace
+
+**Decision.** `keel run --ephemeral-workspace` shares the workspace read-only
+and the guest layers a tmpfs overlay at `/workspace`. The workload reads the
+files but every write stays in guest RAM and is discarded at shutdown; the host
+directory is never modified. The trusted manifest records the choice.
+
+**Why.** Running untrusted code to observe it means its writes must not touch
+the analyst's disk. The default read-write share is right for ordinary work;
+the overlay is right for detonation. Recording it in the manifest lets the
+audit evidence state whether writes could have reached the host.
+
+**Residual.**
+
+- Writes consume guest memory; a write-heavy sample needs a higher `--memory`.
+- Nothing persists from an ephemeral run except what the workload sends through
+  the brokered relays and what the guest-event log and audit chain captured.
+- It changes only where writes land, not what the workload may do; scope,
+  budgets, and approvals are unchanged.
+
+**Budget.** input 3,349 → 3,354; the mechanism is otherwise untrusted.
+
+## D43 (condensed log; PLAN D71) — One guard releases a run's host resources and verifies each postcondition
+
+**Decision.** `keel-input-runtime` registers the backend's process group and
+the run scratch directory in one `RunResources` guard as each is created. Its
+release, on the normal path and on drop, ends the whole backend group with
+`SIGTERM`, escalating to `SIGKILL` after a bounded grace, removes the scratch
+directory, and checks that the group is gone and the path absent. A failed
+postcondition makes the run exit nonzero and names it.
+
+**Why.** Cleanup was scattered and unchecked. The backend leads its own process
+group, and only the graceful path signalled it, with no escalation, so a member
+that outlived `keel-runtime` kept running. Any error between creating the
+scratch directory and the end of the run, including a refused admission, left
+the directory behind, and after the spawn also left the backend running,
+because dropping a `Child` does not kill it. One guard that owns both makes
+every exit path the same path, and the first step toward a teardown event in
+the audit chain.
+
+**Residual.**
+
+- The broker directory, the renderer, the V8 proxy listener, and serve-side
+  files are not yet registered.
+- After the leader is reaped, a group with no members could in principle have
+  its id reused before the final check; the window is milliseconds.
+- `SIGKILL` of the trusted runtime itself still skips the guard; signals the
+  runtime can catch are handled separately.
+- The result is reported on stderr and in the exit status, not yet in the
+  audit chain.
+
+**Budget.** input 3,356 → 3,460.
+
+## D44 (condensed log; PLAN D72) — A terminal hangup or SIGTERM stops a run in order
+
+**Decision.** The trusted runtime blocks `SIGHUP` and `SIGTERM` and waits for
+them on a dedicated thread. Either one starts the same shutdown as the trusted
+shutdown control, so the D71 guard ends the backend group and verifies cleanup.
+The backend and renderer are spawned with the two signals unblocked for the
+spawn alone. Serve gives a terminated runtime 5 s before `SIGKILL`.
+
+**Why.** Closing the operator's terminal sent `SIGHUP` to the trusted runtime,
+whose default action killed it without running any cleanup, while the backend,
+in its own process group, kept the VM running. Serve's forced stop did the
+same with `SIGTERM`, then `SIGKILL` after 2 s, which was shorter than the
+runtime's own escalation.
+
+**Residual.**
+
+- `SIGKILL` of the trusted runtime and host crashes still orphan the backend;
+  crash recovery is a later slice.
+- A signal that arrives during a stoppable spawn takes its default action.
+- Short-lived helpers inherit the blocked mask; they are not signalled.
+- A termination signal during admission is acted on only after the backend
+  starts, which then stops at once.
+
+**Budget.** input 3,460 → 3,490.
+
+## D45 (condensed log; PLAN D73) — Each run records its teardown in the audit chain
+
+**Decision.** `kernel.run-teardown` is the last record before `audit.sealed`.
+It is bound to the admission manifest by digest, names how the run stopped and
+whether the backend needed `SIGKILL`, and carries one check per released
+resource, including the broker's own socket, with an overall `ok`. `keel status`
+reports a sealed chain whose teardown is not `ok` as `closed-unclean`.
+
+**Why.** A sealed chain said the audit was complete, not that the run left
+nothing behind. Recording the checks inside the chain gives them the chain's
+authentication; recording them after the seal is impossible, because the writer
+is closed and the verifier rejects anything after it.
+
+**Residual.**
+
+- Early-error exits seal through the broker's drop without a teardown record.
+  Status reports `teardown: not recorded`; verification does not reject it.
+- Serve-side files (attach socket, pid, request, `attach.exit`) and
+  `floor.json` are handled after the seal and are not in the record.
+- The renderer and the V8 proxy listener are not yet checked.
+
+**Budget.** kernel 5,279 → 5,337, audit 1,282 → 1,317, input 3,490 → 3,531.
+
+## D46 (condensed log; PLAN D74) — The session supervisor signs a teardown receipt after the seal
+
+**Decision.** `keel stop` is two-stage: `STOPPING` on acceptance, `STOPPED` only
+once `serve` has checked its own cleanup and made a signed receipt durable
+beside the chain. The receipt is signed by a key `serve` holds only in memory,
+whose public half the run records in `kernel.run-teardown`, and it names the
+chain's seal digest and the digests of `floor.json` and `attach.exit`.
+
+**Why.** The serve-side files and `floor.json` are settled after the seal, so
+the chain cannot record them, and the chain's private key never leaves the run.
+Anchoring a second key inside the chain gives the post-seal facts the chain's
+authentication without reopening it. Returning only after the receipt is
+durable makes stop's success mean the checks held.
+
+**Residual.**
+
+- A supervisor that crashes or is killed writes no receipt; crash recovery
+  remains planned.
+- Foreground runs have no supervisor and no receipt.
+- The receipt is local tamper evidence, like the chain: replacing chain, key,
+  and receipt together is not detected.
+- Pending-approval denial at stop, secret zeroization, and connection-pool
+  checks are not yet recorded.
+
+**Budget.** kernel 5,337 → 5,338, audit 1,317 → 1,404, input 3,531 → 3,912.
+
+## D47 (condensed log; PLAN D75) — Crash recovery acts only on resources the authenticated chain names
+
+**Decision.** Each run records the host resources it creates in its chain as
+`kernel.run-resource`. `keel recover` reads a crashed run's authenticated
+prefix and releases those resources, after checking that each directory is of
+that run's naming in the expected root and that each process group holds only
+Keel components and has not been reused. It writes an unsigned recovery
+record beside the chain and never rewrites it.
+
+**Why.** After a `SIGKILL` the run's in-memory registry is gone, and the
+backend's process group, the one resource that keeps running, was recorded
+nowhere. A journal file would let anyone who can write the session directory
+point recovery at arbitrary paths or processes; chain records cannot be forged
+without the run's private key, which never left the run.
+
+**Residual.**
+
+- The recovery record is unsigned and describes recovery time, not crash time.
+- A backend killed between `spawn` returning and its record is missed.
+- Recovery is invoked by the operator; `keel run` does not reconcile at start.
+- Run request files are left in place.
+
+**Budget.** kernel 5,338 → 5,356, audit 1,404 → 1,415, input 3,912 → 4,185.
+
+## D48 (condensed log; PLAN D76) — Abandoned sessions stop themselves; crashed ones are recovered on use
+
+**Decision.** A detached persistent session that produces no output for its
+idle limit (12 hours by default) stops through the normal cooperative path
+and records `idle` in its receipt. `keel run` and `keel attach` recover
+crashed sessions older than a 15-minute grace before they start.
+
+**Why.** An abandoned live session holds a VM and live credentials with no one
+watching, which is worse than leftover directories, and only its supervisor
+can end it with a receipt. Recovery is safe as soon as the writer is gone, so
+the grace only preserves a fresh crash for inspection; tying it to commands
+the operator already runs avoids a daemon.
+
+**Residual.**
+
+- A host where Keel is not used keeps an orphaned backend until the next
+  command; the launchd reaper is planned and opt-in.
+- An idle limit is a timer, not a judgement: a long silent task is stopped too,
+  unless the operator raises or disables the limit.
+- Session directories are never pruned automatically.
+
+**Budget.** input 4,185 → 4,226.
+
+## D49 (condensed log; PLAN D77) — Terminal descriptors never reach the backend, and every stop escalates
+
+**Decision.** `serve` marks both ends of its pty close-on-exec, and the
+trusted runtime refuses to start while holding an inherited terminal-class
+descriptor. Each cooperative stop request escalates the backend group to
+`SIGKILL` after 2 s and records it, a forced stop runs recovery before its
+receipt, and end-of-input on the run's terminal is a hangup.
+
+**Why.** Fault injection showed a persistent session's untrusted backend held
+the supervisor's pty master and slave, writable from inside its sandbox. The
+master carries trusted operator input, including secure attention and
+challenge answers, so the backend could in principle have forged an approval;
+the slave let it paint the operator's screen. The same leak kept a dead
+supervisor's pty open, so its run never saw a hangup, and a cooperative stop
+waited forever on a backend that ignored `SIGTERM`. Approval authority rests
+on who holds the input terminal, so descriptor custody is part of the trusted
+input path, not plumbing.
+
+**Residual.**
+
+- Non-terminal descriptors a launcher leaks into the trusted runtime still
+  reach its children; trusted code cannot close them without `unsafe`.
+- Persistent sessions before D77 were exposed. No exploitation was attempted
+  beyond showing the descriptors were open and writable.
+
+**Budget.** input 4,226 → 4,306.
+
+## D50 (condensed log; PLAN D78) — The model provider performs no egress for the workload
+
+**Decision.** Only harness-executed tools reach the model provider; every
+typed tool is stripped. A request whose content the provider would fetch, by
+`url` or `file` source or container upload, is refused. Private clearance for
+the origin repository ends at a path boundary.
+
+**Why.** The model endpoint receives everything and is not scanned. A server
+tool or a URL-sourced block makes the provider fetch for the workload, which
+bypassed the egress allowlist and network floor, not just the payload checks,
+and the prefix denylist failed open on any tool type it did not name. The
+origin prefix without a boundary cleared sibling repositories for private
+content.
+
+**Residual.**
+
+- A refused request fails the harness's turn; it does not degrade silently.
+- The provider still receives the full context by design.
+
+**Budget.** secrets 3,338 → 3,392, input 4,306 → 4,310.
+
+## D51 (condensed log; PLAN D79) — Make the ranks meaningful before making the floor precise
+
+**Decision.** Per-turn provenance is deferred behind a cheaper baseline: an
+operator-declared workspace rank bound to the accepted `HEAD` (W4a), payload
+checks enforced on effects, restart in place of taint decay, schema-bounded
+extraction, and lockfile inheritance (W4b). Per-turn provenance is built only
+if it beats that baseline.
+
+**Why.** In a coding agent the workspace pins the floor to 0, so the floor
+carries no signal and per-turn tracking spends about 1,200 trusted lines and a
+separate attestation design to recover one. A declared rank gives the floor a
+signal for tens of lines, and the payload checks judge the effect's own bytes
+without any turn table.
+
+**Residual.**
+
+- No taint decay within a session.
+- Payload checks are blind to paraphrase and encoding.
+- The declared rank is operator judgment, and a handoff note can launder taint.
+
+## D52 (condensed log; PLAN D80) — An own workspace starts at rank 2, served as a clean clone of the accepted HEAD
+
+**Decision.** The operator may declare `workspace:own` at trusted admission.
+The run then works in a clone of the accepted `HEAD`'s branch made by trusted
+host Git, and its floor starts at rank 2. A `HEAD` that moved since the last
+acceptance is named on the admission screen.
+
+**Why.** A clone, not the working directory, is the only form in which the
+guest reads exactly what was accepted: the working directory also exposes
+other branches, the stash, reflog, ignored dependencies, and untracked files,
+none of which an acceptance of `HEAD` covers. Naming a moved `HEAD` closes
+laundering through commits, where a tainted run commits and the next run
+would read its output at rank 2.
+
+**Residual.**
+
+- The clone carries `HEAD`'s history, so old versions of accepted files are
+  readable.
+- The agent's commits stay in the clone until the operator fetches them.
+- The declared rank is the operator's judgment; the screen shows commit
+  counts, not content.
+
+**Budget.** input 4,310 → 4,513.
+
+## D53 (condensed log; PLAN D81) — Payload checks decide, on pushes the kernel derives itself
+
+**Decision.** The kernel derives every push from the exact receive-pack body
+it binds, resolving the pack against a private copy of admitted history, and
+the payload verdicts become gate reasons: flow leaks escalate, secrets are
+denied, unaccounted or uninspectable protected content escalates, and a
+violation outside the envelope at a low floor needs the challenge.
+
+**Why.** The integrity verdict was only as good as the untrusted relay's diff,
+and the relay also set the flags that gate a push. Resolving against the
+guest-writable workspace would let a guest doctor the bases; a private copy
+made by trusted admission cannot be. Once the bytes are the kernel's own, the
+payload checks are the cheap, turn-free half of the action-centric rules.
+
+**Residual.**
+
+- Verbatim only: paraphrase, compression, and encoding defeat both checks.
+- A push built on history the private copy lacks, such as newly fetched
+  remote commits, is uninspectable and escalates; that is noisy but closed.
+- Pushes to protected places were already gated, so for them enforcement adds
+  reasons, the challenge, and honest flags rather than new gates.
+
+**Budget.** kernel 5,356 → 5,554, provenance 1,330 → 1,614, input 4,513 → 4,575.
+
+## D54 (condensed log; PLAN D82) — Extraction schemas cannot spell free text
+
+**Decision.** An extraction schema is written in a closed grammar with no
+string type, and the validator returns only the schema's fields, in canonical
+form, each value an enum member, a bounded number, a boolean, an admitted
+path, or an issue number.
+
+**Why.** Quarantine extraction is safe only if its output channel is too
+narrow to carry an instruction. Bounding the channel by grammar, and showing
+its size in bits, makes the bound reviewable without trusting the extracting
+model.
+
+**Residual.** The schema language alone grants nothing; the call that uses it
+adds the kernel's own network and model requests and is reviewed separately.
+
+**Budget.** policy 852 → 1,186.
+
+## D55 (condensed log; PLAN D83) — Extraction runs in a helper the kernel binds, not in the kernel
+
+**Decision.** Quarantine extraction runs in an untrusted, credential-free,
+sandboxed helper on its own kernel socket. The kernel binds every helper
+request to the active job, trusted termination enforces the model call's
+shape against the fetched body's digest, and the kernel validates its own
+reassembly of the result before returning only that to the guest.
+
+**Why.** The kernel originating fetches and model calls would add a network
+client and a confused-deputy surface to trusted code. Mediating the helper's
+ordinary requests reuses the paths trusted code already guards. The helper
+needs its own socket, because the guest's MCP host also carries guest
+traffic and could otherwise launder a guest fetch as an extraction.
+
+**Residual.**
+
+- A compromised helper can spend the run's model budget or refuse to work.
+- Results carry only what a schema can spell; prose-dependent tasks still read
+  sources raw and lower the floor.
+- The trusted cost, about 700 lines, is well above the first estimate.
+
+**Budget.** kernel 5,554 → 5,996, provenance 1,614 → 1,936, input 4,575 →
+4,731, secrets 3,392 → 3,498 (with D84), audit 1,415 → 1,436, policy 1,186 → 856.
+
+## D56 (condensed log; PLAN D84) — Trusted relay masks AWS session tokens in responses
+
+**Decision.** Every response trusted termination relays is scanned for
+`x-amz-security-token`, and the value after it is overwritten in place.
+
+**Why.** Bedrock's signature errors echo the expected canonical request,
+session token included, and the relay passed provider bodies through
+verbatim. A session token cannot sign without the secret key, but it is
+credential material, and trusted code exists to keep credential material away
+from the workload.
+
+**Residual.** Masking keys on AWS's header name. A provider that echoed
+credential material under another name would not be caught.

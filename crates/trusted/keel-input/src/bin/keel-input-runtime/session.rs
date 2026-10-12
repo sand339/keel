@@ -1,4 +1,8 @@
-use super::CANONICAL_TERMINAL_RESET;
+use super::{
+    CANONICAL_TERMINAL_RESET,
+    receipt::{self, Teardown},
+};
+use keel_audit::RunKey;
 use keel_input::{
     MuxCommandEvent, MuxCommandInput, TERMINAL_CONTROL, TERMINAL_CONTROL_REDRAW, TerminalControl,
     TerminalControlReader, detached_output_has_pending_approval, encode_floor_lift, encode_resize,
@@ -7,7 +11,7 @@ use keel_input::{
 #[cfg(target_os = "macos")]
 use nix::sys::socket::{getsockopt, sockopt};
 use nix::{
-    fcntl::{FcntlArg, OFlag, fcntl},
+    fcntl::{FcntlArg, FdFlag, OFlag, fcntl},
     libc,
     poll::{PollFd, PollFlags, poll},
     pty::{Winsize, openpty},
@@ -35,27 +39,49 @@ use std::{
         atomic::{AtomicU8, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 const REDRAW: &[u8] = &[TERMINAL_CONTROL, TERMINAL_CONTROL_REDRAW];
 const STTY: &str = "/bin/stty";
 const MAX_DETACHED_OUTPUT: usize = 256 * 1024;
 const COMPLETED_ATTACH_GRACE: Duration = Duration::from_secs(5);
-const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(5);
-const STOP_COMPLETION_TIMEOUT: Duration = Duration::from_secs(8);
+// Longer than the run's own orderly stop: its 2 s escalation grace and 1 s
+// kill grace, plus VM, renderer, and broker shutdown, which a live VM run has
+// taken more than 5 s to finish.
+const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+// Long enough for the runtime's own teardown, which may escalate to SIGKILL
+// for its backend, to finish before the runtime is killed in turn.
+const TERMINATED_RUNTIME_GRACE: Duration = Duration::from_secs(5);
+// Covers the graceful stop, the forced stop, and ending the runtime group.
+const STOP_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_STOP_RESPONSE: usize = 160;
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_hours(12);
 
 struct Cleanup {
     socket: PathBuf,
     pid: PathBuf,
     request: PathBuf,
+    released: bool,
+}
+
+impl Cleanup {
+    /// Removes the supervisor's own files and checks that each is gone.
+    fn release(&mut self, teardown: &mut Teardown) {
+        teardown.remove_file("attach-socket", &self.socket);
+        teardown.remove_file("pid-file", &self.pid);
+        teardown.remove_file("request-file", &self.request);
+        self.released = true;
+    }
 }
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.socket);
-        let _ = fs::remove_file(&self.pid);
-        let _ = fs::remove_file(&self.request);
+        if !self.released {
+            let _ = fs::remove_file(&self.socket);
+            let _ = fs::remove_file(&self.pid);
+            let _ = fs::remove_file(&self.request);
+        }
     }
 }
 
@@ -65,27 +91,29 @@ struct ChildGroup {
 }
 
 impl ChildGroup {
-    fn terminate(&mut self) {
+    /// Ends the runtime and reaps it; returns whether `SIGKILL` was needed.
+    fn terminate(&mut self) -> bool {
         let pid = Pid::from_raw(self.child.id().cast_signed());
         let _ = killpg(pid, Signal::SIGTERM);
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + TERMINATED_RUNTIME_GRACE;
         while Instant::now() < deadline {
             if self.child.try_wait().ok().flatten().is_some() {
                 self.armed = false;
-                return;
+                return false;
             }
             thread::sleep(Duration::from_millis(20));
         }
         let _ = killpg(pid, Signal::SIGKILL);
         let _ = self.child.wait();
         self.armed = false;
+        true
     }
 }
 
 impl Drop for ChildGroup {
     fn drop(&mut self) {
         if self.armed {
-            self.terminate();
+            let _ = self.terminate();
         }
     }
 }
@@ -305,7 +333,11 @@ fn completed_exit_status(path: &Path) -> io::Result<Option<i32>> {
     }
 }
 
-fn spawn_foreground(request: &Path, slave: OwnedFd) -> Result<ChildGroup, Box<dyn Error>> {
+fn spawn_foreground(
+    request: &Path,
+    slave: OwnedFd,
+    supervisor_key: &str,
+) -> Result<ChildGroup, Box<dyn Error>> {
     let input = File::from(slave.try_clone()?);
     let output = File::from(slave.try_clone()?);
     let errors = File::from(slave);
@@ -315,6 +347,7 @@ fn spawn_foreground(request: &Path, slave: OwnedFd) -> Result<ChildGroup, Box<dy
         .arg("--request")
         .arg(request)
         .env("KEEL_INPUT_SOURCE", "trusted-supervisor")
+        .env("KEEL_SUPERVISOR_KEY", supervisor_key)
         .stdin(Stdio::from(input))
         .stdout(Stdio::from(output))
         .stderr(Stdio::from(errors))
@@ -350,10 +383,14 @@ fn peer_terminal_is_foreground(stream: &UnixStream) -> bool {
 }
 
 fn read_command(stream: &mut UnixStream) -> io::Result<String> {
-    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+    read_line(stream, 64, Duration::from_secs(1))
+}
+
+fn read_line(stream: &mut UnixStream, limit: usize, timeout: Duration) -> io::Result<String> {
+    stream.set_read_timeout(Some(timeout))?;
     let mut command = Vec::new();
     let mut byte = [0_u8; 1];
-    while command.len() < 64 {
+    while command.len() < limit {
         stream.read_exact(&mut byte)?;
         if byte[0] == b'\n' {
             return String::from_utf8(command)
@@ -373,30 +410,31 @@ fn accept_clients(
     attached: &mut Option<UnixStream>,
     attached_once: &mut bool,
     detached_output: &mut Vec<u8>,
-) -> io::Result<bool> {
+) -> io::Result<Option<UnixStream>> {
     loop {
         let (stream, _) = match listener.accept() {
             Ok(connection) => connection,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
             Err(error) => return Err(error),
         };
         // One misbehaving or vanishing client must never end the session, so
         // every client failure is reported and dropped instead of returned.
         match serve_client(stream, terminal, attached, attached_once, detached_output) {
-            Ok(true) => return Ok(true),
-            Ok(false) => {}
+            Ok(Some(stopper)) => return Ok(Some(stopper)),
+            Ok(None) => {}
             Err(error) => eprintln!("keel: attach client failed: {error}"),
         }
     }
 }
 
+/// Returns the stop requester, which is told once the receipt is durable.
 fn serve_client(
     mut stream: UnixStream,
     terminal: &mut File,
     attached: &mut Option<UnixStream>,
     attached_once: &mut bool,
     detached_output: &mut Vec<u8>,
-) -> io::Result<bool> {
+) -> io::Result<Option<UnixStream>> {
     // Sockets accepted from a non-blocking listener inherit O_NONBLOCK on
     // macOS. The client protocol is blocking with explicit timeouts, so the
     // flag is cleared before the handshake reads or the replay writes.
@@ -405,7 +443,7 @@ fn serve_client(
         "ATTACH" if attached.is_none() => {
             if !peer_terminal_is_foreground(&stream) {
                 stream.write_all(b"UNTRUSTED\n")?;
-                return Ok(false);
+                return Ok(None);
             }
             stream.write_all(if *attached_once {
                 b"OK RESUME\n"
@@ -432,7 +470,7 @@ fn serve_client(
             terminal.write_all(&encode_shutdown())?;
             terminal.flush()?;
             stream.write_all(b"STOPPING\n")?;
-            return Ok(true);
+            return Ok(Some(stream));
         }
         command if command.starts_with("LIFT ") => {
             let rank = command[5..].parse::<u8>().ok().filter(|rank| *rank <= 3);
@@ -449,7 +487,7 @@ fn serve_client(
         }
         _ => stream.write_all(b"ERROR\n")?,
     }
-    Ok(false)
+    Ok(None)
 }
 
 fn remember_detached_output(output: &mut Vec<u8>, bytes: &[u8]) {
@@ -468,16 +506,19 @@ fn remember_detached_output(output: &mut Vec<u8>, bytes: &[u8]) {
     output.extend_from_slice(bytes);
 }
 
+/// Relays pending runtime output; returns whether there was any.
 fn drain_terminal(
     terminal: &mut File,
     attached: &mut Option<UnixStream>,
     detached_output: &mut Vec<u8>,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let mut buffer = [0_u8; 16 * 1024];
+    let mut output = false;
     loop {
         match terminal.read(&mut buffer) {
-            Ok(0) => return Ok(()),
+            Ok(0) => return Ok(output),
             Ok(count) => {
+                output = true;
                 if let Some(stream) = attached.as_mut() {
                     if stream.write_all(&buffer[..count]).is_err() {
                         *attached = None;
@@ -487,8 +528,8 @@ fn drain_terminal(
                     remember_detached_output(detached_output, &buffer[..count]);
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-            Err(error) if error.raw_os_error() == Some(libc::EIO) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(output),
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => return Ok(output),
             Err(error) => return Err(error),
         }
     }
@@ -546,6 +587,145 @@ fn forward_input(
     Ok(())
 }
 
+/// Opens the session's pty: the non-blocking master `serve` keeps, and the
+/// slave the run gets as its stdio.
+fn open_session_terminal() -> io::Result<(File, OwnedFd)> {
+    let pty = openpty(Some(&dimensions()), None)?;
+    // Neither end may reach a child except as the stdio it is handed. Without
+    // this the run, and through it the untrusted backend, inherits both: the
+    // master types into the trusted operator-input path and the slave paints
+    // the operator's screen.
+    for end in [&pty.master, &pty.slave] {
+        fcntl(end, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+    }
+    prepare_slave_terminal(&pty.slave)?;
+    fcntl(&pty.master, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
+    Ok((File::from(pty.master), pty.slave))
+}
+
+/// Binds the attach socket and writes the pid file, both owned by the guard
+/// from here on.
+fn claim_session(socket: PathBuf, request: &Path) -> io::Result<(UnixListener, Cleanup)> {
+    let listener = prepare_socket(&socket)?;
+    let pid_path = socket.with_extension("pid");
+    let cleanup = Cleanup {
+        socket,
+        pid: pid_path.clone(),
+        request: request.to_path_buf(),
+        released: false,
+    };
+    fs::write(&pid_path, format!("{}\n", std::process::id()))?;
+    fs::set_permissions(&pid_path, fs::Permissions::from_mode(0o600))?;
+    Ok((listener, cleanup))
+}
+
+/// How long a detached session may produce no output before it stops itself.
+/// `KEEL_IDLE_TIMEOUT_SECS=0` disables the limit; a malformed value keeps the
+/// default rather than disabling it.
+fn idle_limit(value: Option<&str>) -> Option<Duration> {
+    value.map_or(Some(DEFAULT_IDLE_TIMEOUT), |value| {
+        value
+            .trim()
+            .parse::<u64>()
+            .map_or(Some(DEFAULT_IDLE_TIMEOUT), |seconds| {
+                (seconds > 0).then(|| Duration::from_secs(seconds))
+            })
+    })
+}
+
+/// Whether a session has been detached and silent for longer than `limit`.
+/// A pending approval nobody is attached to answer counts as idle.
+fn idle_expired(limit: Option<Duration>, attached: bool, last_activity: Instant) -> bool {
+    !attached && limit.is_some_and(|limit| last_activity.elapsed() >= limit)
+}
+
+struct IdleClock {
+    limit: Option<Duration>,
+    last_activity: Instant,
+}
+
+impl IdleClock {
+    /// Notes output or an attached client, then reports whether the limit
+    /// has passed.
+    fn expired(&mut self, output: bool, attached: bool) -> bool {
+        if output || attached {
+            self.last_activity = Instant::now();
+        }
+        idle_expired(self.limit, attached, self.last_activity)
+    }
+}
+
+fn stop_reason(idle: bool, requested: bool) -> &'static str {
+    match (idle, requested) {
+        (true, _) => "idle",
+        (false, true) => "stop",
+        (false, false) => "exited",
+    }
+}
+
+/// The persistent session's own identity for its post-seal teardown.
+struct Supervisor {
+    directory: PathBuf,
+    key: RunKey,
+    runtime_pid: u32,
+    spawned: SystemTime,
+}
+
+impl Supervisor {
+    /// Releases what `serve` owns, writes the signed receipt, and only then
+    /// answers the stop requester, if any.
+    fn finish(
+        &self,
+        listener: UnixListener,
+        mut cleanup: Cleanup,
+        stopper: Option<(UnixStream, Teardown)>,
+        stop_reason: &str,
+        escalated: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        drop(listener);
+        if stop_reason == "forced" {
+            // The run was killed before it could end its backend or seal, so
+            // release what its chain records now rather than leave an orphan.
+            if let Err(error) =
+                super::recover::recover_directory(&self.directory, &super::recover::KEEL)
+            {
+                eprintln!("keel: recovery after forced stop failed: {error}");
+            }
+        }
+        let (stream, mut teardown) = stopper
+            .map_or((None, Teardown::begin()), |(stream, teardown)| {
+                (Some(stream), teardown)
+            });
+        if escalated {
+            teardown.escalated();
+        }
+        teardown.end_group(
+            "runtime-group",
+            Pid::from_raw(self.runtime_pid.cast_signed()),
+        );
+        cleanup.release(&mut teardown);
+        let (path, ok) = teardown.finish(
+            &self.directory,
+            self.runtime_pid,
+            self.spawned,
+            &self.key,
+            stop_reason,
+        )?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if let Some(mut stream) = stream {
+            let _ = stream.write_all(format!("STOPPED {name}\n").as_bytes());
+        }
+        if ok {
+            Ok(())
+        } else {
+            Err(format!("session teardown incomplete; see {}", path.display()).into())
+        }
+    }
+}
+
 pub(super) fn serve(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
     let (request, socket) = parse_serve(arguments)?;
     let exit_path = exit_status_path(&socket);
@@ -554,30 +734,40 @@ pub(super) fn serve(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Erro
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let listener = prepare_socket(&socket)?;
-    let pid_path = socket.with_extension("pid");
-    fs::write(&pid_path, format!("{}\n", std::process::id()))?;
-    fs::set_permissions(&pid_path, fs::Permissions::from_mode(0o600))?;
-    let _cleanup = Cleanup {
-        socket,
-        pid: pid_path,
-        request: request.clone(),
-    };
+    let directory = socket
+        .parent()
+        .ok_or("attach socket has no session directory")?
+        .to_path_buf();
+    let (listener, cleanup) = claim_session(socket, &request)?;
+    // Held only in memory; the run records its public half in the chain, so
+    // the receipt this key signs after the seal is anchored there.
+    let supervisor = RunKey::generate()?;
 
-    let pty = openpty(Some(&dimensions()), None)?;
-    prepare_slave_terminal(&pty.slave)?;
-    fcntl(&pty.master, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
-    let mut terminal = File::from(pty.master);
-    let mut child = spawn_foreground(&request, pty.slave)?;
+    let (mut terminal, slave) = open_session_terminal()?;
+    let spawned = SystemTime::now();
+    let mut child = spawn_foreground(&request, slave, &supervisor.public_hex())?;
+    let runtime_pid = child.child.id();
     let mut attached = None;
     let mut attached_once = false;
     let mut detached_output = Vec::new();
     let mut attach_input = TerminalControlReader::new();
     let mut stop_deadline = None;
+    let mut stopper: Option<(UnixStream, Teardown)> = None;
+    let mut idle = IdleClock {
+        limit: idle_limit(env::var("KEEL_IDLE_TIMEOUT_SECS").ok().as_deref()),
+        last_activity: Instant::now(),
+    };
+    let mut idle_stopped = false;
+    let supervisor = Supervisor {
+        directory,
+        key: supervisor,
+        runtime_pid,
+        spawned,
+    };
 
     loop {
         if stop_deadline.is_none()
-            && accept_clients(
+            && let Some(stream) = accept_clients(
                 &listener,
                 &mut terminal,
                 &mut attached,
@@ -585,9 +775,17 @@ pub(super) fn serve(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Erro
                 &mut detached_output,
             )?
         {
+            stopper = Some((stream, Teardown::begin()));
             stop_deadline = Some(Instant::now() + GRACEFUL_STOP_TIMEOUT);
         }
-        drain_terminal(&mut terminal, &mut attached, &mut detached_output)?;
+        let output = drain_terminal(&mut terminal, &mut attached, &mut detached_output)?;
+        if stop_deadline.is_none() && idle.expired(output, attached.is_some()) {
+            // The same cooperative stop as `STOP`, so the run seals and the
+            // receipt records why it ended.
+            terminal.write_all(&encode_shutdown())?;
+            idle_stopped = true;
+            stop_deadline = Some(Instant::now() + GRACEFUL_STOP_TIMEOUT);
+        }
         forward_input(
             &mut terminal,
             &mut attached,
@@ -596,29 +794,40 @@ pub(super) fn serve(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Erro
         )?;
         if let Some(status) = child.child.try_wait()? {
             child.armed = false;
-            drain_terminal(&mut terminal, &mut attached, &mut detached_output)?;
+            let _ = drain_terminal(&mut terminal, &mut attached, &mut detached_output)?;
             persist_exit_status(&exit_path, status)?;
             if attached.is_none() && !attached_once && stop_deadline.is_none() {
                 let deadline = Instant::now() + COMPLETED_ATTACH_GRACE;
-                while Instant::now() < deadline && attached.is_none() {
-                    let _ = accept_clients(
+                while Instant::now() < deadline && attached.is_none() && stopper.is_none() {
+                    // A stop arriving after the run exited still waits for
+                    // the receipt rather than seeing its connection close.
+                    if let Some(stream) = accept_clients(
                         &listener,
                         &mut terminal,
                         &mut attached,
                         &mut attached_once,
                         &mut detached_output,
-                    )?;
+                    )? {
+                        stopper = Some((stream, Teardown::begin()));
+                    }
                     thread::sleep(Duration::from_millis(5));
                 }
             }
-            return if status.success() {
-                Ok(())
-            } else {
-                Err(format!("persistent runtime exited with {status}").into())
-            };
+            let stop_reason = stop_reason(idle_stopped, stop_deadline.is_some());
+            let released = supervisor.finish(listener, cleanup, stopper, stop_reason, false);
+            if !status.success() {
+                if let Err(error) = released {
+                    eprintln!("keel: {error}");
+                }
+                return Err(format!("persistent runtime exited with {status}").into());
+            }
+            return released;
         }
         if stop_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            child.terminate();
+            let escalated = child.terminate();
+            if let Err(error) = supervisor.finish(listener, cleanup, stopper, "forced", escalated) {
+                eprintln!("keel: {error}");
+            }
             return Err("graceful session stop timed out; process group was terminated".into());
         }
         thread::sleep(Duration::from_millis(5));
@@ -655,6 +864,20 @@ pub(super) fn lift(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error
         "UNTRUSTED" => Err("floor lift request did not come from a foreground terminal".into()),
         _ => Err(format!("session refused floor lift: {response}").into()),
     }
+}
+
+fn report_receipt(path: &Path, state: &str) -> Result<(), Box<dyn Error>> {
+    let unmet = receipt::unmet(path)?;
+    if !unmet.is_empty() {
+        return Err(format!(
+            "Keel session teardown incomplete: {}; receipt {}",
+            safe_text(unmet.join("; ").as_bytes()),
+            path.display()
+        )
+        .into());
+    }
+    println!("Keel session {state}; teardown receipt {}", path.display());
+    Ok(())
 }
 
 fn handshake(stream: &mut UnixStream, command: &[u8]) -> io::Result<String> {
@@ -971,21 +1194,43 @@ pub(super) fn attach(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Err
     Ok(())
 }
 
+/// Stops the session and returns only once its supervisor's teardown receipt
+/// is durable. A session that has already stopped reports its latest receipt.
 pub(super) fn stop(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
     let socket = parse_socket(arguments, "stop")?;
+    let directory = socket
+        .parent()
+        .ok_or("attach socket has no session directory")?;
     let exit_path = exit_status_path(&socket);
-    let mut stream = UnixStream::connect(&socket)?;
+    let mut stream = match UnixStream::connect(&socket) {
+        Ok(stream) => stream,
+        Err(_) if !socket.exists() => {
+            let receipt = receipt::latest(directory).ok_or("Keel session is not running")?;
+            return report_receipt(&receipt, "already stopped");
+        }
+        Err(error) => {
+            return Err(format!(
+                "Keel session supervisor is gone without a teardown receipt: {error}"
+            )
+            .into());
+        }
+    };
     let response = handshake(&mut stream, b"STOP\n")?;
     if response != "STOPPING" {
         return Err(format!("cannot stop Keel session: {response}").into());
     }
-    let deadline = Instant::now() + STOP_COMPLETION_TIMEOUT;
-    while socket.exists() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    if socket.exists() {
-        return Err("Keel session did not finish stopping".into());
-    }
+    let response = read_line(&mut stream, MAX_STOP_RESPONSE, STOP_COMPLETION_TIMEOUT)
+        .map_err(|error| format!("Keel session did not finish stopping: {error}"))?;
+    let name = response
+        .strip_prefix("STOPPED ")
+        .filter(|name| name.ends_with(".receipt.json") && !name.contains('/'))
+        .ok_or_else(|| {
+            format!(
+                "unexpected stop response: {}",
+                safe_text(response.as_bytes())
+            )
+        })?;
+    report_receipt(&directory.join(name), "stopped")?;
     match completed_exit_status(&exit_path)? {
         Some(0) => Ok(()),
         Some(code) => Err(format!("Keel session stopped with status {code}").into()),

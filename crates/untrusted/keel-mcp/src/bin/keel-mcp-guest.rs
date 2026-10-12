@@ -9,6 +9,10 @@ mod confine;
 mod supervise;
 
 #[cfg(target_os = "linux")]
+#[path = "keel-mcp-guest/observe.rs"]
+mod observe;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use keel_mcp::{GuestReport, NetworkPreflight, submit_guest_report};
     use std::{
@@ -26,7 +30,7 @@ mod linux {
 
     const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 
-    fn connect_vsock(port: u32) -> io::Result<UnixStream> {
+    pub(crate) fn connect_vsock(port: u32) -> io::Result<UnixStream> {
         // SAFETY: `socket` has no Rust-side aliasing requirements. The returned
         // descriptor is checked before ownership is transferred below.
         let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };

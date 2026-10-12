@@ -42,7 +42,7 @@ Design notes explain individual mechanisms in more detail. They are useful to co
 - [Linux KVM and Cloud Hypervisor backend](design/linux-platform-support.md)
 - [Action-centric provenance, guest confinement, and process attribution](design/guest-confinement-attribution-and-turn-provenance.md)
 - [Distributed evaluation and RL substrate](design/distributed-eval-rl-substrate.md)
-- [Triage reproduction profile](design/triage-reproduction.md)
+- [Triage reproduction (now the scoped profile)](design/triage-reproduction.md)
 - [Run profiles](design/run-profiles.md)
 - [Render vertex concept](design/render-vertex.md)
 

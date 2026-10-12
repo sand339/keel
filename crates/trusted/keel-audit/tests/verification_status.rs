@@ -36,7 +36,8 @@ fn authenticated_prefix_is_reported_but_not_accepted_as_complete() {
         inspect_file(&path, &RunKey::new([31; 32])).unwrap(),
         keel_audit::VerificationStatus {
             records: 1,
-            sealed: false
+            sealed: false,
+            seal_hash: None
         }
     );
     assert_eq!(

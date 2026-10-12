@@ -317,11 +317,12 @@ def case_refusals(suite: Suite) -> Result:
     workspace = suite.workspace("refusals", {})
     cases = [
         ("unknown profile", ["run", "--profile", "recon", "claude"], {}, "profile"),
-        ("malformed triage scope", ["run", "--profile", "triage", "--scope", "*", "claude"], {}, "scope"),
+        ("malformed scope", ["run", "--profile", "scoped", "--scope", "*", "claude"], {}, "scope"),
+        ("retired triage name", ["run", "--profile", "triage", "--scope", "example.com", "claude"], {}, "--profile scoped"),
         (
-            "triage with an unapproved provider",
-            ["run", "--profile", "triage", "--scope", "example.com", "claude"],
-            {"KEEL_TRIAGE_PROVIDERS": "openrouter"},
+            "scoped run with an unapproved provider",
+            ["run", "--profile", "scoped", "--scope", "example.com", "claude"],
+            {"KEEL_SCOPED_PROVIDERS": "openrouter"},
             "approved model providers",
         ),
         ("zero memory", ["run", "--memory", "0", "claude"], {}, "--memory"),
@@ -344,7 +345,8 @@ def case_refusals(suite: Suite) -> Result:
 
 
 def case_interrupted(suite: Suite) -> Result:
-    """A session whose trusted runtime dies is reported as interrupted."""
+    """A session whose trusted runtime dies is stale until `keel recover`
+    releases what its chain records, and nothing below it survives."""
     result = Result("interrupted")
     workspace = suite.workspace("interrupted", {})
     before = suite.session_names()
@@ -372,36 +374,375 @@ def case_interrupted(suite: Suite) -> Result:
     result.check("the session started and called the model", chain is not None)
     if chain is not None:
         writer = int(chain.name.split("-")[1])
-        # Nothing yet tears down the runtime and VM below a trusted runtime
-        # that dies (verified teardown is unbuilt). Record whether they stop
-        # on their own, then clean up so the case leaves nothing running.
         descendants = descendants_of(writer)
         os.kill(writer, signal.SIGKILL)
-        time.sleep(20)
+        time.sleep(5)
+    try:
+        process.wait(timeout=120)
+    except subprocess.TimeoutExpired:
+        process.kill()
+    if chain is not None:
+        session = chain.parent.name
+        result.sessions.append(session)
+        stale = subprocess.run(
+            [str(suite.keel), "status", session], env=suite.environment, capture_output=True, text=True
+        )
+        result.check("keel status reports state: stale", "state: stale" in stale.stdout, first_line_after_session(stale))
+        orphaned = [pid for pid in descendants if alive(pid)]
+        result.note = f"{len(orphaned)} of {len(descendants)} processes below the killed runtime were still running when recovery began"
+        recover = subprocess.run(
+            [str(suite.keel), "recover", session], env=suite.environment, capture_output=True, text=True
+        )
+        result.check("keel recover releases what the chain records", recover.returncode == 0, (recover.stdout + recover.stderr).strip())
         survivors = [pid for pid in descendants if alive(pid)]
-        result.note = (
-            f"{len(survivors)} of {len(descendants)} processes below the trusted runtime "
-            "outlived it by 20s and were killed by the suite (known gap: no verified teardown)"
-            if survivors
-            else "the runtime and VM stopped with the trusted runtime"
+        result.check(
+            "nothing below the killed trusted runtime survives recovery",
+            not survivors,
+            f"{len(survivors)} of {len(descendants)} still running; the suite kills them",
         )
         for pid in survivors:
             try:
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-        result.sessions.append(chain.parent.name)
+        recovered = subprocess.run(
+            [str(suite.keel), "status", session], env=suite.environment, capture_output=True, text=True
+        )
+        result.check("keel status then reports state: recovered", "state: recovered\n" in recovered.stdout, first_line_after_session(recovered))
+    result.seconds = time.monotonic() - started
+    return result
+
+
+def case_persistent_stop(suite: Suite) -> Result:
+    """`keel stop` on a persistent session returns only after a verified
+    teardown receipt, and leaves no supervisor file or runtime process."""
+    result = Result("persistent-stop")
+    workspace = suite.workspace("persistent-stop", {})
+    before = suite.session_names()
+    transcript = suite.transcripts / "persistent-stop.typescript"
+    started = time.monotonic()
+    process = subprocess.Popen(
+        [
+            "script", "-q", str(transcript), str(suite.keel), "run", "--keep-alive", "claude", "-p",
+            "Run `sleep 300` with the Bash tool, then reply DONE.", "--allowedTools", "Bash",
+        ],
+        cwd=workspace,
+        env=suite.environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    chain = None
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline and chain is None:
+        for session in suite.sessions_since(before):
+            chains = list((suite.state / "sessions" / session).glob("audit-*.ndjson"))
+            if chains and any("settled-actual" in line for line in chains[0].read_text().splitlines()):
+                chain = chains[0]
+        time.sleep(2)
+    result.check("the persistent session started and called the model", chain is not None)
+    if chain is not None:
+        session = chain.parent.name
+        result.sessions.append(session)
+        descendants = descendants_of(int(chain.name.split("-")[1]))
+        stop = subprocess.run(
+            [str(suite.keel), "stop", session], env=suite.environment, capture_output=True, text=True, timeout=60
+        )
+        result.check("keel stop succeeds and names its receipt", stop.returncode == 0 and "teardown receipt" in stop.stdout, (stop.stdout + stop.stderr).strip())
+        directory = chain.parent
+        result.check("the receipt sits beside the chain", chain.with_suffix(".receipt.json").exists())
+        leftovers = [name for name in ("attach.sock", "attach.pid") if (directory / name).exists()]
+        result.check("no supervisor file remains", not leftovers, ", ".join(leftovers))
+        survivors = [pid for pid in descendants if alive(pid)]
+        result.check("no runtime process survives the stop", not survivors, f"{len(survivors)} of {len(descendants)} still running")
+        for pid in survivors:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        status = subprocess.run(
+            [str(suite.keel), "status", session], env=suite.environment, capture_output=True, text=True
+        )
+        result.check("keel status reports closed with a verified receipt", "state: closed\n" in status.stdout and "receipt: verified after stop" in status.stdout, status.stdout.strip() or status.stderr.strip())
+        again = subprocess.run(
+            [str(suite.keel), "stop", session], env=suite.environment, capture_output=True, text=True, timeout=30
+        )
+        result.check("a repeated stop reports the existing receipt", again.returncode == 0 and "already stopped" in again.stdout, (again.stdout + again.stderr).strip())
     try:
-        process.wait(timeout=120)
+        process.wait(timeout=60)
     except subprocess.TimeoutExpired:
         process.kill()
     result.seconds = time.monotonic() - started
-    if chain is not None:
-        status = subprocess.run(
-            [str(suite.keel), "status", chain.parent.name], env=suite.environment, capture_output=True, text=True
-        )
-        result.check("keel status reports state: interrupted", "state: interrupted" in status.stdout, status.stdout.splitlines()[1] if status.stdout else status.stderr)
     return result
+
+
+def case_idle_timeout(suite: Suite) -> Result:
+    """A detached persistent session that stays silent past its idle limit
+    stops itself through the normal path and records why in its receipt."""
+    result = Result("idle-timeout")
+    workspace = suite.workspace("idle-timeout", {})
+    before = suite.session_names()
+    transcript = suite.transcripts / "idle-timeout.typescript"
+    started = time.monotonic()
+    process = subprocess.Popen(
+        [
+            "script", "-q", str(transcript), str(suite.keel), "run", "--keep-alive", "claude", "-p",
+            "Run `sleep 300` with the Bash tool, then reply DONE.", "--allowedTools", "Bash",
+        ],
+        cwd=workspace,
+        env=dict(suite.environment, KEEL_IDLE_TIMEOUT_SECS="15"),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    chain = None
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline and chain is None:
+        for session in suite.sessions_since(before):
+            chains = list((suite.state / "sessions" / session).glob("audit-*.ndjson"))
+            if chains and any("settled-actual" in line for line in chains[0].read_text().splitlines()):
+                chain = chains[0]
+        time.sleep(2)
+    result.check("the persistent session started and called the model", chain is not None)
+    # Ending the attached client detaches the session; the supervisor and
+    # its run are in their own sessions and keep running.
+    os.killpg(process.pid, signal.SIGKILL)
+    process.wait()
+    if chain is not None:
+        session = chain.parent.name
+        result.sessions.append(session)
+        receipt = chain.with_suffix(".receipt.json")
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline and not receipt.exists():
+            time.sleep(2)
+        result.check("the detached session stopped itself", receipt.exists())
+        if receipt.exists():
+            body = json.loads(receipt.read_text())
+            result.check("its receipt records stop_reason idle", body.get("stop_reason") == "idle", str(body.get("stop_reason")))
+            result.check("and every teardown check passed", body.get("ok") is True)
+        status = subprocess.run(
+            [str(suite.keel), "status", session], env=suite.environment, capture_output=True, text=True
+        )
+        result.check("keel status reports closed after idle", "state: closed\n" in status.stdout and "receipt: verified after idle" in status.stdout, status.stdout.strip() or status.stderr.strip())
+    result.seconds = time.monotonic() - started
+    return result
+
+
+def case_workspace_own(suite: Suite) -> Result:
+    """`workspace:own`, approved at the trusted admission screen, starts the
+    floor at 2 from a clean clone of the accepted HEAD, and reading the
+    repository inside the guest does not lower it."""
+    result = Result("workspace-own")
+    workspace = suite.workspace("workspace-own", {"NOTE.md": "E2E-OWN-NOTE\n"})
+    (workspace / "untracked-secret.txt").write_text("E2E-UNTRACKED\n")
+    started = time.monotonic()
+    texts = []
+    for attempt in ("first", "again"):
+        before = suite.session_names()
+        transcript = suite.transcripts / f"workspace-own-{attempt}.typescript"
+        process = subprocess.Popen(
+            [
+                "script", "-q", str(transcript), str(suite.keel), "run", "--allow", "workspace:own", "claude", "-p",
+                "Use the Read tool on NOTE.md and on untracked-secret.txt, then reply with what each contains.",
+                "--allowedTools", "Read",
+            ],
+            cwd=workspace,
+            env=suite.environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # Input typed before the trusted screen appears is discarded, so the
+        # approval is typed only once the prompt is on the terminal.
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not (
+            transcript.exists() and b"Type APPROVE" in transcript.read_bytes()
+        ):
+            time.sleep(0.2)
+        assert process.stdin is not None
+        process.stdin.write(b"APPROVE\r")
+        process.stdin.flush()
+        try:
+            code = process.wait(timeout=420)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            code = None
+        text = clean(transcript.read_bytes()) if transcript.exists() else ""
+        texts.append(text)
+        sessions = suite.sessions_since(before)
+        result.sessions.extend(sessions)
+        result.check(f"{attempt}: the run completed", code == 0, text[-400:])
+        for session in sessions:
+            if not (suite.state / "sessions" / session / "floor.json").exists():
+                result.check(f"{attempt}: {session} reached shutdown", False)
+                continue
+            manifest = suite.manifest(session) or {}
+            declared = manifest.get("workspace", {})
+            result.check(f"{attempt}: the manifest declares rank 2", declared.get("declared_rank") == 2, str(declared))
+            result.check(
+                f"{attempt}: the guest worked in the clone",
+                str(declared.get("root", "")).endswith(f"/sessions/{session}/workspace"),
+                str(declared.get("root")),
+            )
+            floor = json.loads((suite.state / "sessions" / session / "floor.json").read_text())
+            result.check(f"{attempt}: reading the repository left the floor at 2", floor.get("floor") == 2, str(floor.get("floor")))
+    result.check("the tracked note was read", "E2E-OWN-NOTE" in texts[0])
+    result.check("the untracked file was not in the clone", "E2E-UNTRACKED" not in texts[0])
+    result.check("the first admission was a first acceptance", "first acceptance of this workspace" in texts[0])
+    result.check("the second admission saw the same HEAD", "unchanged since last accepted" in texts[1])
+    result.check("the run printed how to fetch the agent's commits", "git fetch" in texts[0])
+    result.seconds = time.monotonic() - started
+    return result
+
+
+NPM_PACKAGE = json.dumps({"name": "w4b", "version": "1.0.0", "private": True, "dependencies": {"is-number": "7.0.0"}})
+NPM_LOCKFILE = json.dumps({
+    "name": "w4b",
+    "version": "1.0.0",
+    "lockfileVersion": 3,
+    "requires": True,
+    "packages": {
+        "": {"name": "w4b", "version": "1.0.0", "dependencies": {"is-number": "7.0.0"}},
+        "node_modules/is-number": {
+            "version": "7.0.0",
+            "resolved": "https://registry.npmjs.org/is-number/-/is-number-7.0.0.tgz",
+            "integrity": "sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==",
+        },
+    },
+})
+
+
+def case_npm_ci_pinned(suite: Suite) -> Result:
+    """W4b: `npm ci` in an own workspace fetches only what the accepted
+    lockfile pins, so the floor stays at the declared rank 2."""
+    result = Result("npm-ci-pinned")
+    workspace = suite.workspace("npm-ci-pinned", {"package.json": NPM_PACKAGE, "package-lock.json": NPM_LOCKFILE})
+    started = time.monotonic()
+    before = suite.session_names()
+    transcript = suite.transcripts / "npm-ci-pinned.typescript"
+    process = subprocess.Popen(
+        [
+            "script", "-q", str(transcript), str(suite.keel), "run",
+            "--allow", "workspace:own", "--allow", "egress:registry.npmjs.org", "claude", "-p",
+            "Use the Bash tool to run exactly `npm ci --no-audit --no-fund` and then "
+            "`cat node_modules/is-number/package.json`, then reply with the package's version.",
+            "--allowedTools", "Bash",
+        ],
+        cwd=workspace,
+        env=suite.environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline and not (transcript.exists() and b"Type APPROVE" in transcript.read_bytes()):
+        time.sleep(0.2)
+    assert process.stdin is not None
+    process.stdin.write(b"APPROVE\r")
+    process.stdin.flush()
+    try:
+        code = process.wait(timeout=420)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        code = None
+    text = clean(transcript.read_bytes()) if transcript.exists() else ""
+    sessions = suite.sessions_since(before)
+    result.sessions.extend(sessions)
+    result.check("the run completed", code == 0, text[-400:])
+    result.check("admission named the pinned package", "1 npm package(s) pinned by package-lock.json" in text, text[:1200])
+    result.check("the agent read the installed package", "7.0.0" in text, text[-400:])
+    for session in sessions:
+        floor_path = suite.state / "sessions" / session / "floor.json"
+        if not floor_path.exists():
+            result.check(f"{session} reached shutdown", False)
+            continue
+        manifest = suite.manifest(session) or {}
+        result.check("the manifest records one pin", manifest.get("workspace", {}).get("lockfile_pins") == 1, str(manifest.get("workspace")))
+        floor = json.loads(floor_path.read_text())
+        result.check("the pinned install left the floor at 2", floor.get("floor") == 2, json.dumps(floor.get("floor_history", []))[:600])
+        npm_egress = [
+            record["fields"] for record in suite.records(session)
+            if record["event"] == "kernel.action"
+            and record["fields"].get("action_class") == "egress" and record["fields"].get("outcome") == "executed"
+            and str(record["fields"].get("origin", "")).startswith("node ")
+        ]
+        result.check("npm's fetch went through Keel", bool(npm_egress), str(len(npm_egress)))
+    result.seconds = time.monotonic() - started
+    return result
+
+
+PAGE_SCHEMAS = json.dumps([{
+    "version": 1,
+    "name": "page-kind",
+    "fields": {
+        "kind": {"enum": ["documentation", "example", "login", "news", "other"]},
+        "has_links": {"boolean": True},
+    },
+}])
+
+
+def case_extract_url(suite: Suite) -> Result:
+    """`keel_extract` reads an untrusted page through the quarantine helper:
+    the agent gets only the schema's fields, the floor does not drop, and the
+    audit records the extraction."""
+    result = Result("extract-url")
+    workspace = suite.workspace("extract-url", {})
+    schemas = suite.root / "page-schemas.json"
+    schemas.write_text(PAGE_SCHEMAS)
+    before = suite.session_names()
+    transcript = suite.transcripts / "extract-url.typescript"
+    started = time.monotonic()
+    process = subprocess.Popen(
+        [
+            "script", "-q", str(transcript), str(suite.keel), "run", "--schemas", str(schemas),
+            "--allow", "egress:example.com", "--allow", "workspace:own", "claude", "-p",
+            "Call the keel_extract MCP tool with source url:https://example.com/ and schema page-kind, "
+            "then reply with exactly the JSON result it returns and nothing else.",
+            "--allowedTools", "mcp__keel__keel_extract",
+        ],
+        cwd=workspace,
+        env=suite.environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline and not (
+        transcript.exists() and b"Type APPROVE" in transcript.read_bytes()
+    ):
+        time.sleep(0.2)
+    assert process.stdin is not None
+    process.stdin.write(b"APPROVE\r")
+    process.stdin.flush()
+    try:
+        code = process.wait(timeout=420)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        code = None
+    text = clean(transcript.read_bytes()) if transcript.exists() else ""
+    sessions = suite.sessions_since(before)
+    result.sessions.extend(sessions)
+    result.check("the run completed", code == 0, text[-600:])
+    result.check("the admission screen showed the schema and its bandwidth", "extract:page-kind (" in text)
+    result.check("the agent relayed a schema-shaped result", '"kind"' in text and '"has_links"' in text, text[-600:])
+    result.check("no page text reached the agent", "Example Domain" not in text.split("Type APPROVE")[-1])
+    for session in sessions:
+        records = suite.records(session)
+        extractions = [r for r in records if r["event"] == "kernel.extraction"]
+        result.check("the audit records the extraction", any(r["fields"].get("outcome") == "ok" for r in extractions), str(extractions))
+        floor_file = suite.state / "sessions" / session / "floor.json"
+        floor = json.loads(floor_file.read_text()).get("floor") if floor_file.exists() else None
+        provenance = [r for r in records if r["event"] == "kernel.provenance" and "example.com" in r["fields"].get("source", "")]
+        result.check("the page never entered the guest's provenance", not provenance, str(provenance))
+        result.check("an own workspace's floor stays at 2 through the extraction", floor == 2, str(floor))
+    result.seconds = time.monotonic() - started
+    return result
+
+
+def first_line_after_session(completed: subprocess.CompletedProcess) -> str:
+    lines = completed.stdout.splitlines()
+    return lines[1] if len(lines) > 1 else completed.stderr.strip()
 
 
 def alive(pid: int) -> bool:
@@ -445,6 +786,11 @@ CASES: dict[str, tuple[Callable[[Suite], Result], list[str]]] = {
     "build-offline": (case_build_offline, []),
     "refusals": (case_refusals, []),
     "interrupted": (case_interrupted, []),
+    "persistent-stop": (case_persistent_stop, []),
+    "idle-timeout": (case_idle_timeout, []),
+    "workspace-own": (case_workspace_own, []),
+    "npm-ci-pinned": (case_npm_ci_pinned, []),
+    "extract-url": (case_extract_url, []),
     "provider-anthropic": (case_provider_anthropic, ["ANTHROPIC_API_KEY"]),
 }
 

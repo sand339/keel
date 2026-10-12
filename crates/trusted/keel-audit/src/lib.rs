@@ -2,9 +2,9 @@
 #![doc = "Trusted append-only audit primitives for Keel."]
 
 use keel_kernel::{
-    AuditEvent, AuditSink, ContextEvent, EnforcementStateEvent, GateDecision,
+    AuditEvent, AuditSink, ContextEvent, EnforcementStateEvent, ExtractionEvent, GateDecision,
     ModelReservationEvent, ModelUsageEvent, ProvenanceEvent, ProvenanceMode, ReportedOutcomeEvent,
-    RunAdmittedEvent, StructuralRejectionEvent,
+    RunAdmittedEvent, RunResourceEvent, RunTeardownEvent, StructuralRejectionEvent,
 };
 use ring::{
     digest::{SHA256, digest},
@@ -28,6 +28,7 @@ const HASH_DOMAIN: &[u8] = b"keel-audit-record-v1\0";
 const SIGNATURE_DOMAIN: &[u8] = b"keel-audit-signature-v1\0";
 const REDACTED: &str = "[REDACTED]";
 const SEAL_EVENT: &str = "audit.sealed";
+const RECEIPT_DOMAIN: &[u8] = b"keel-teardown-receipt-v1\0";
 
 /// Per-run audit signing or verification key.
 ///
@@ -85,6 +86,12 @@ impl RunKey {
             signing: None,
             public: decode_hex::<32>(value.trim(), "audit verification key")?,
         })
+    }
+
+    /// Returns the public verification key as lowercase hexadecimal.
+    #[must_use]
+    pub fn public_hex(&self) -> String {
+        encode_hex(&self.public)
     }
 
     /// Writes the public verification key to a newly created mode-0600 file.
@@ -312,6 +319,8 @@ impl AuditWriter {
 /// Durable adapter for every kernel audit event class.
 pub struct KernelAudit {
     writer: Option<AuditWriter>,
+    record_targets: bool,
+    admission: Option<[u8; 32]>,
 }
 
 impl KernelAudit {
@@ -320,7 +329,16 @@ impl KernelAudit {
     pub const fn new(writer: AuditWriter) -> Self {
         Self {
             writer: Some(writer),
+            record_targets: false,
+            admission: None,
         }
+    }
+
+    /// Writes network targets in plain text, for a run admitted with it.
+    #[must_use]
+    pub const fn with_target_recording(mut self, record_targets: bool) -> Self {
+        self.record_targets = record_targets;
+        self
     }
 
     fn write(&self, payload: AuditPayload) -> Result<(), String> {
@@ -347,6 +365,9 @@ impl AuditSink for KernelAudit {
                 serde_json::to_string(&event.rules).map_err(|error| error.to_string())?,
             ),
         ]);
+        if let Some(detail) = event.target_detail.filter(|_| self.record_targets) {
+            fields.insert("target".to_owned(), detail);
+        }
         if let Some(origin) = event.origin {
             fields.insert("origin".to_owned(), origin);
         }
@@ -434,6 +455,7 @@ impl AuditSink for KernelAudit {
     }
 
     fn record_run_admitted(&mut self, event: RunAdmittedEvent) -> Result<(), String> {
+        self.admission = Some(event.digest);
         self.write(AuditPayload {
             timestamp_ms: timestamp_ms()?,
             event: "kernel.run-admitted".to_owned(),
@@ -564,6 +586,78 @@ impl AuditSink for KernelAudit {
             event: "kernel.enforcement-state".to_owned(),
             action_id: None,
             fields,
+        })
+    }
+
+    fn record_run_teardown(&mut self, event: RunTeardownEvent) -> Result<(), String> {
+        // Check keys are prefixed, as boundary keys are, and a repeated kind
+        // gets an index so no entry overwrites another.
+        let mut fields = BTreeMap::from([
+            ("stop_reason".to_owned(), event.stop_reason.to_owned()),
+            ("escalated".to_owned(), event.escalated.to_string()),
+            (
+                "ok".to_owned(),
+                event
+                    .checks
+                    .iter()
+                    .all(|check| check.unmet.is_none())
+                    .to_string(),
+            ),
+        ]);
+        if let Some(digest) = self.admission {
+            fields.insert("admission_sha256".to_owned(), encode_hex(&digest));
+        }
+        if let Some(key) = event.supervisor_key {
+            fields.insert("supervisor_key".to_owned(), key);
+        }
+        for (index, check) in event.checks.into_iter().enumerate() {
+            let outcome = check
+                .unmet
+                .map_or_else(|| "ok".to_owned(), |unmet| format!("unmet: {unmet}"));
+            fields.insert(
+                format!("check.{index}.{}", check.kind),
+                format!("{outcome}: {}", check.detail),
+            );
+        }
+        self.write(AuditPayload {
+            timestamp_ms: timestamp_ms()?,
+            event: "kernel.run-teardown".to_owned(),
+            action_id: None,
+            fields,
+        })
+    }
+
+    fn record_extraction(&mut self, event: ExtractionEvent) -> Result<(), String> {
+        let mut fields = BTreeMap::from([
+            ("schema".to_owned(), event.schema),
+            ("source".to_owned(), event.source),
+            ("outcome".to_owned(), event.outcome),
+        ]);
+        for (key, digest) in [
+            ("fetched_sha256", event.fetched),
+            ("result_sha256", event.result),
+        ] {
+            if let Some(digest) = digest {
+                fields.insert(key.to_owned(), encode_hex(&digest));
+            }
+        }
+        self.write(AuditPayload {
+            timestamp_ms: timestamp_ms()?,
+            event: "kernel.extraction".to_owned(),
+            action_id: None,
+            fields,
+        })
+    }
+
+    fn record_run_resource(&mut self, event: RunResourceEvent) -> Result<(), String> {
+        self.write(AuditPayload {
+            timestamp_ms: timestamp_ms()?,
+            event: "kernel.run-resource".to_owned(),
+            action_id: None,
+            fields: BTreeMap::from([
+                ("kind".to_owned(), event.kind.to_owned()),
+                ("detail".to_owned(), event.detail),
+            ]),
         })
     }
 
@@ -730,6 +824,8 @@ pub struct VerificationStatus {
     pub records: u64,
     /// Whether a valid terminal seal completed the stream.
     pub sealed: bool,
+    /// Record digest of the seal, which a teardown receipt names as the tip.
+    pub seal_hash: Option<[u8; 32]>,
 }
 
 /// Authenticates the complete available stream and reports whether it is sealed.
@@ -786,6 +882,7 @@ fn walk_verified_file(
     let mut logical_records = 0_u64;
     let mut expected_run_id: Option<String> = None;
     let mut sealed = false;
+    let mut seal_hash = None;
     for line in BufReader::new(file).lines() {
         if sealed {
             return Err(AuditError::SealNotTerminal);
@@ -833,6 +930,7 @@ fn walk_verified_file(
                 return Err(AuditError::InvalidSeal(record.seq));
             }
             sealed = true;
+            seal_hash = Some(actual_hash);
         } else {
             logical_records = logical_records
                 .checked_add(1)
@@ -847,7 +945,113 @@ fn walk_verified_file(
     Ok(VerificationStatus {
         records: logical_records,
         sealed,
+        seal_hash,
     })
+}
+
+/// What the supervising `serve` process established after the seal, signed by
+/// the key the sealed chain names in `kernel.run-teardown`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeardownReceipt {
+    /// Receipt format, currently 1.
+    pub version: u8,
+    /// Run identifier of the chain.
+    pub run_id: String,
+    /// File name of the audit chain within the session directory.
+    pub chain: String,
+    /// Hex record digest of the chain's seal; empty when it was not sealed.
+    pub chain_tip: String,
+    /// `stop`, `exited`, or `forced`.
+    pub stop_reason: String,
+    /// Whether ending the runtime group needed `SIGKILL`.
+    pub escalated: bool,
+    /// When the supervisor began teardown, in Unix milliseconds.
+    pub started_ms: u64,
+    /// When every check had run, in Unix milliseconds.
+    pub finished_ms: u64,
+    /// `N.KIND` to `ok: DETAIL` or `unmet: REASON: DETAIL`.
+    pub checks: BTreeMap<String, String>,
+    /// File kept on purpose to the hex SHA-256 of its contents.
+    pub retained: BTreeMap<String, String>,
+    /// Whether every check passed.
+    pub ok: bool,
+    /// Hex Ed25519 signature over the receipt with this field empty.
+    pub signature: String,
+}
+
+impl TeardownReceipt {
+    fn signed_message(&self) -> Result<Vec<u8>, AuditError> {
+        let unsigned = Self {
+            signature: String::new(),
+            ..self.clone()
+        };
+        let body = serde_json::to_vec(&unsigned)
+            .map_err(|error| AuditError::Serialization(error.to_string()))?;
+        Ok([RECEIPT_DOMAIN, &body].concat())
+    }
+
+    /// Sets `ok` from the checks and signs the receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `key` holds no signing key or encoding fails.
+    pub fn sign(&mut self, key: &RunKey) -> Result<(), AuditError> {
+        let signing = key
+            .signing
+            .as_ref()
+            .ok_or(AuditError::SigningKeyUnavailable)?;
+        self.ok = self
+            .checks
+            .values()
+            .all(|outcome| outcome.starts_with("ok"));
+        self.signature = encode_hex(signing.sign(&self.signed_message()?).as_ref());
+        Ok(())
+    }
+
+    /// Checks the signature against the chain's supervisor key, that the
+    /// receipt names the verified seal, and that `ok` agrees with the checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditError::Receipt`] naming the first failed condition.
+    pub fn verify(&self, key: &RunKey, seal_hash: Option<[u8; 32]>) -> Result<(), AuditError> {
+        let signature = decode_hex::<64>(&self.signature, "receipt signature")?;
+        UnparsedPublicKey::new(&ED25519, key.public)
+            .verify(&self.signed_message()?, &signature)
+            .map_err(|_| AuditError::Receipt("signature does not verify"))?;
+        if self.version != 1 {
+            return Err(AuditError::Receipt("unsupported version"));
+        }
+        if self.chain_tip != seal_hash.map(|hash| encode_hex(&hash)).unwrap_or_default() {
+            return Err(AuditError::Receipt("does not name this chain's seal"));
+        }
+        if self.ok
+            != self
+                .checks
+                .values()
+                .all(|outcome| outcome.starts_with("ok"))
+        {
+            return Err(AuditError::Receipt("ok disagrees with its checks"));
+        }
+        Ok(())
+    }
+
+    /// Names each retained file in `directory` that is missing or no longer
+    /// matches the digest the receipt recorded.
+    #[must_use]
+    pub fn changed_files(&self, directory: &Path) -> Vec<String> {
+        self.retained
+            .iter()
+            .filter(|(name, recorded)| {
+                name.contains('/')
+                    || std::fs::read(directory.join(name.as_str())).map_or(true, |bytes| {
+                        encode_hex(digest(&SHA256, &bytes).as_ref()) != **recorded
+                    })
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
 }
 
 fn calculate_record_hash(
@@ -980,6 +1184,8 @@ pub enum AuditError {
     SealNotTerminal,
     /// Sequence counter overflowed.
     SequenceOverflow,
+    /// A teardown receipt failed verification.
+    Receipt(&'static str),
 }
 
 impl fmt::Display for AuditError {
@@ -1015,6 +1221,7 @@ impl fmt::Display for AuditError {
             Self::InvalidSeal(seq) => write!(formatter, "invalid audit seal at record {seq}"),
             Self::SealNotTerminal => formatter.write_str("audit seal is not the terminal record"),
             Self::SequenceOverflow => formatter.write_str("audit sequence overflow"),
+            Self::Receipt(reason) => write!(formatter, "teardown receipt rejected: {reason}"),
         }
     }
 }
@@ -1232,6 +1439,46 @@ mod tests {
     }
 
     #[test]
+    fn admitted_target_recording_writes_the_redacted_query_free_target() {
+        let path = scratch_file("target-recording");
+        let mut audit = KernelAudit::new(
+            AuditWriter::spawn(
+                &path,
+                "run-targets",
+                RunKey::new([18; 32]),
+                Redactor::new(vec!["token-123".to_owned()]).expect("redactor"),
+            )
+            .expect("writer"),
+        )
+        .with_target_recording(true);
+        audit
+            .record(AuditEvent {
+                action_id: 1,
+                principal: PrincipalId::new("vertex-1").expect("principal"),
+                class: ActionClass::Egress,
+                target_kind: "network",
+                target_hash: [0x22; 32],
+                target_detail: Some("POST unlisted.example:443/token-123".to_owned()),
+                outcome: AuditOutcome::Denied,
+                intent: "outside",
+                flow: "clean".to_owned(),
+                origin: None,
+                integrity: None,
+                rules: vec!["kernel:out-of-scope".to_owned()],
+                gate: None,
+                denial: None,
+            })
+            .expect("record action");
+        audit.shutdown().expect("clean shutdown");
+        let records = read_records(&path);
+        assert_eq!(
+            records[0].payload.fields.get("target").map(String::as_str),
+            Some("POST unlisted.example:443/[REDACTED]")
+        );
+        fs::remove_file(path).expect("remove audit");
+    }
+
+    #[test]
     fn denied_action_records_typed_opaque_scope_metadata() {
         let path = scratch_file("denial-telemetry");
         let mut audit = KernelAudit::new(
@@ -1250,6 +1497,7 @@ mod tests {
                 class: ActionClass::Egress,
                 target_kind: "network",
                 target_hash: [0x11; 32],
+                target_detail: Some("GET unlisted.example:443/beacon".to_owned()),
                 outcome: AuditOutcome::Denied,
                 intent: "inside",
                 flow: "clean".to_owned(),
@@ -1269,6 +1517,10 @@ mod tests {
 
         let records = read_records(&path);
         assert_eq!(records[0].payload.event, "kernel.action");
+        assert!(
+            !records[0].payload.fields.contains_key("target"),
+            "targets stay hashed unless the run admitted recording them"
+        );
         assert_eq!(
             records[0]
                 .payload

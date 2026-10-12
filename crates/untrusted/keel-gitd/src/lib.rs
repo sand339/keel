@@ -407,11 +407,7 @@ pub trait PushAuthorizer {
     /// # Errors
     ///
     /// Returns an error when the PDP cannot produce a complete decision.
-    fn authorize(
-        &mut self,
-        action: &Asserted,
-        body_digest: [u8; 32],
-    ) -> Result<Option<u64>, GitdError>;
+    fn authorize(&mut self, action: &Asserted, body: &[u8]) -> Result<Option<u64>, GitdError>;
 
     /// Reports what became of an authorized push after forwarding.
     ///
@@ -458,11 +454,7 @@ impl KernelPushAuthorizer {
 }
 
 impl PushAuthorizer for KernelPushAuthorizer {
-    fn authorize(
-        &mut self,
-        action: &Asserted,
-        body_digest: [u8; 32],
-    ) -> Result<Option<u64>, GitdError> {
+    fn authorize(&mut self, action: &Asserted, body: &[u8]) -> Result<Option<u64>, GitdError> {
         let Target::Git {
             remote,
             refs,
@@ -521,8 +513,14 @@ impl PushAuthorizer for KernelPushAuthorizer {
                 .write_all(&[0])
                 .map_err(|error| GitdError::Kernel(error.to_string()))?,
         }
+        // The kernel derives the push from these exact bytes and binds its
+        // permit to their digest (PLAN D81).
+        let length = u32::try_from(body.len())
+            .map_err(|_| GitdError::Kernel("push is too large for kernel channel".to_owned()))?;
         stream
-            .write_all(&body_digest)
+            .write_all(digest(&SHA256, body).as_ref())
+            .and_then(|()| stream.write_all(&length.to_be_bytes()))
+            .and_then(|()| stream.write_all(body))
             .map_err(|error| GitdError::Kernel(error.to_string()))?;
         stream
             .flush()
@@ -1418,10 +1416,7 @@ pub fn mediate_receive_pack(
     mirror.stage_pack(&body[pack_offset..])?;
     let assessment = assess_push(mirror, updates, default_branches)?;
     let action = assessment.asserted_action(remote);
-    let hash = digest(&SHA256, body);
-    let mut body_digest = [0_u8; 32];
-    body_digest.copy_from_slice(hash.as_ref());
-    let Some(action_id) = authorizer.authorize(&action, body_digest)? else {
+    let Some(action_id) = authorizer.authorize(&action, body)? else {
         return Err(GitdError::Denied);
     };
     // The forward is the leg that can still fail — the remote may refuse the push,
@@ -2023,7 +2018,7 @@ mod tests {
             fn authorize(
                 &mut self,
                 _action: &keel_kernel::Asserted,
-                _body_digest: [u8; 32],
+                _body: &[u8],
             ) -> Result<Option<u64>, GitdError> {
                 Ok(self.allow.then_some(7))
             }
@@ -2103,7 +2098,7 @@ mod tests {
             fn authorize(
                 &mut self,
                 _action: &keel_kernel::Asserted,
-                _body_digest: [u8; 32],
+                _body: &[u8],
             ) -> Result<Option<u64>, GitdError> {
                 Ok(Some(11))
             }

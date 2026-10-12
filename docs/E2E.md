@@ -35,8 +35,13 @@ proceed, and the suite counts any such screen as a failure.
 | `browser-mcp` | The agent drives the guest browser over MCP; the screenshot lands in the workspace, and Git ignores it |
 | `browser-cli` | The `agent-browser` CLI drives the same browser from a guest shell |
 | `build-offline` | gcc, Rust, Go, pip, and npm work in the guest; `--memory 4` reaches the guest and the manifest |
-| `refusals` | Invalid configurations are refused before any VM boots: unknown profile, malformed scope, unapproved triage provider, invalid memory and auth |
-| `interrupted` | A session whose trusted runtime dies is reported as `interrupted`, and its chain verifies as an unsealed prefix |
+| `refusals` | Invalid configurations are refused before any VM boots: unknown profile, the retired `triage` name, malformed scope, unapproved provider for a scoped run, invalid memory and auth |
+| `interrupted` | A session whose trusted runtime is killed with `SIGKILL` is reported `stale`; `keel recover` succeeds, nothing below the killed runtime survives, status then reports `recovered`, and the chain verifies as an unsealed prefix |
+| `persistent-stop` | `keel stop` on a `--keep-alive` session returns only after a teardown receipt; no supervisor file or runtime process remains; status reports `closed` with `receipt: verified after stop`; a repeated stop reports the same receipt |
+| `idle-timeout` | A detached `--keep-alive` session silent past a 15 s limit stops itself; its receipt records `stop_reason` `idle` with every check passing; status reports `closed` with `receipt: verified after idle` |
+| `workspace-own` | `--allow workspace:own`, approved once the trusted screen is up, runs in a clean clone of `HEAD` (untracked files absent), starts and stays at floor 2 while the agent reads the repository, and a second run reports the `HEAD` unchanged since acceptance |
+| `npm-ci-pinned` | An own workspace with a committed `package-lock.json` pinning `is-number`: admission names one pinned package, `npm ci` fetches the tarball through Keel, the agent reads the installed package, the manifest records `lockfile_pins: 1`, and the floor stays at 2 |
+| `extract-url` | With `--schemas` and an own workspace, the agent calls `keel_extract` on `example.com`: it receives only the schema's fields, no page text, the page never enters the guest's provenance, the audit records `kernel.extraction` as `ok`, and the floor stays at 2 |
 | `provider-anthropic` | The Anthropic API key path works (needs `ANTHROPIC_API_KEY`) |
 
 Every session must also record an admission manifest, present no operator
@@ -50,7 +55,32 @@ Results go to `~/.keel/e2e-results/<UTC time>/`:
 - `report-axes.txt` and `report-context.txt`, the reports;
 - `state/`, every session and audit chain.
 
-## 2. Manual runbook
+## 2. Lifecycle fault injection
+
+```sh
+python3 ci/faults.py                    # every case, about a minute
+python3 ci/faults.py --case supervisor-killed --keep
+```
+
+The fault suite needs an installed runtime (for the renderer, images, and VZ
+siblings) but calls no model and boots no VM. It builds a debug
+`keel-input-runtime`, the only build that honours
+`KEEL_UNSAFE_DEVELOPMENT_OVERRIDES`, and points it at a fake `keel-runtime`
+compiled from C that misbehaves on purpose.
+
+| Case | Fault | What must hold |
+|---|---|---|
+| `backend-descriptors` | A probe backend lists every descriptor it inherited | No terminal reaches the backend, persistent or foreground |
+| `stop-escalates` | The backend ignores `SIGTERM` | `keel stop` succeeds; the in-chain teardown records `SIGKILL` escalation; the receipt passes; the group is gone |
+| `crash-orphan-leader` | The trusted runtime is `SIGKILL`ed; the backend keeps running | Status is `stale`; `keel recover` ends the group and records it; status is `recovered` |
+| `crash-orphan-member` | As above, but the leader exits and a member survives | Recovery ends the group without a live leader |
+| `supervisor-killed` | `serve` is `SIGKILL`ed | The run sees the hangup, ends its backend, and seals; `keel stop` reports a supervisor gone without a receipt; `keel recover` removes its files |
+
+A failed audit write at teardown is not injected live: on macOS an append to
+an already-open chain survives both the immutable flag and a full volume. It
+is covered in-process by `broker_shutdown_propagates_durable_audit_failure`.
+
+## 3. Manual runbook
 
 Run each case from an interactive terminal in a throwaway Git workspace.
 - **Keys.** When an approval is pending, the terminal title reads "Keel
@@ -70,13 +100,14 @@ Run each case from an interactive terminal in a throwaway Git workspace.
 | M2 | Reusable grant | Same command | `G` at the first prompt | One prompt; the second request runs without one |
 | M3 | Deny | Same command, one request | `Escape` | The request fails; `keel report AUDIT KEY` counts one denial |
 | M4 | Task admission, dependency fetch | `keel run --allow egress:registry.npmjs.org claude -p 'Run npm init -y and npm install is-number with Bash.' --allowedTools Bash` | `APPROVE` on the admission screen | The admission screen lists `egress:registry.npmjs.org`; the install completes with no further prompt |
-| M5 | Triage scope | `keel run --profile triage --scope example.com claude -p 'Run curl -sI https://example.com and curl -sI https://www.google.com with Bash.' --allowedTools Bash` | `APPROVE` | The admission screen shows the triage scope line; example.com succeeds with no prompt; google.com is refused at once; the audit shows `kernel:out-of-scope` |
+| M5 | Scoped run | `keel run --profile scoped --scope example.com claude -p 'Run curl -sI https://example.com and curl -sI https://www.google.com with Bash.' --allowedTools Bash` | `APPROVE` | The admission screen shows the scope line; example.com succeeds with no prompt; google.com is refused at once; the audit shows `kernel:out-of-scope` |
+| M5b | Offline scoped run | `keel run --profile scoped --scope none claude -p 'Run curl -sI https://example.com with Bash.' --allowedTools Bash` | `APPROVE` | The admission screen shows `scope (all else refused): none`; the model still answers; example.com is refused at once as `kernel:out-of-scope` |
 | M6 | Browser on a real site | `keel run claude -p 'Open https://example.com in the browser, take a screenshot, and tell me the title.' --allowedTools mcp__browser` | `A` for example.com | Title "Example Domain"; screenshot in `.keel-browser/screenshots/`; no prompt for any Google host |
 | M7 | MCP issue read and attribution | `keel run claude -p 'Use the keel gh_issue_read tool to read issue 1 of octocat/Hello-World.' --allowedTools mcp__keel` | `A` for api.github.com | The issue is returned; the action's `origin` in the audit names `keel-mcp-guest` |
 | M8 | Host V8 sandbox | `keel run --isolation v8-sandboxed --allow isolation:v8-sandboxed v8 docs/examples/v8-smoke.mjs` (from the repository) | Type `HOST V8` | The smoke script runs; the manifest records `v8-sandboxed` |
 | M9 | Elevated budget | `keel run --model-cost-budget 25 claude -p 'Reply OK.'` | `APPROVE` | The admission screen shows the USD 25 ceiling; the manifest records it |
 | M10 | OpenRouter | `keel run --auth openrouter --model anthropic/claude-sonnet-4.6 claude -p 'Reply OK.'` | `APPROVE` | The admission screen shows the price snapshot. Its `kernel.model-reservation` records end in `settled-actual` with an actual cost below the reserved cost, which confirms OpenRouter usage parsing; `committed-conservative` would mean usage was not parsed |
-| M11 | Persistent mux | `keel mux`, then `Ctrl-A /detach`, `keel attach SESSION`, `keel stop SESSION` | Launcher choices | The session survives detach, reattaches with its screen, and stops cleanly; `keel status` shows `closed` |
+| M11 | Persistent mux | `keel mux`, then `Ctrl-A /detach`, `keel attach SESSION`, `keel stop SESSION` | Launcher choices | The session survives detach, reattaches with its screen, and stops cleanly; `keel stop` prints its teardown receipt; `keel status` shows `closed` with `receipt: verified after stop` |
 | M12 | Git push, default branch, force | In a disposable private GitHub repository you own: `--allow push:branch` and a feature-branch push, then a default-branch push, then a force push | `APPROVE`, then `A`, then the challenge | The feature push succeeds; the default-branch push asks for a challenge; with `--allow deny:force-push` the force push is denied with no prompt |
 
 M12 writes to a real GitHub repository; use one created for this purpose.

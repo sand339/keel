@@ -27,7 +27,23 @@ done
 
 mkdir -p /workspace /run/keel /tmp /var/tmp
 chmod 1777 /tmp /var/tmp
-mount -t virtiofs keel-workspace /workspace
+# The workspace is either shared read-write, or (for detonation of untrusted
+# code) shared read-only with a tmpfs overlay, so the guest can read the
+# evidence but every write stays in guest RAM and never reaches the host.
+if grep -qw keel.workspace=overlay /proc/cmdline; then
+    modprobe overlay 2>/dev/null || true
+    # The overlay upperdir must live on a real tmpfs, not on the root overlay
+    # (overlayfs refuses an overlayfs upperdir), so mount it before use.
+    mkdir -p /run/keel-ws
+    mount -t tmpfs tmpfs /run/keel-ws
+    mkdir -p /run/keel-ws/lower /run/keel-ws/upper /run/keel-ws/work
+    mount -t virtiofs -o ro keel-workspace /run/keel-ws/lower
+    mount -t overlay overlay \
+        -o lowerdir=/run/keel-ws/lower,upperdir=/run/keel-ws/upper,workdir=/run/keel-ws/work \
+        /workspace
+else
+    mount -t virtiofs keel-workspace /workspace
+fi
 mount -t virtiofs keel-control /run/keel
 mount -t cgroup2 none /sys/fs/cgroup
 ifconfig lo 127.0.0.1 up

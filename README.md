@@ -2,7 +2,7 @@
 
 Keel is a research prototype for running AI coding and research workloads inside a local security boundary. It treats the model, its harness, repository content, tool output, and network content as potentially hostile, then places sensitive actions behind a small trusted kernel.
 
-Keel currently targets Apple silicon macOS. It is suitable for research, evaluation, and local experimentation; it is not yet a production security product.
+Keel currently targets Apple silicon macOS. It is suitable for research, evaluation, and local experimentation; it is not yet production ready.
 
 <p align="center">
   <img src="docs/assets/keel-launcher.png" alt="Keel secure-session launcher with Claude Code and V8 isolation profiles" width="900">
@@ -64,9 +64,11 @@ The Claude microVM guest is an Alpine Linux image with:
   reached through Keel's proxy. See
   [building software in the guest](docs/USAGE.md#building-software-in-the-guest).
 
-A **triage profile** (`--profile triage --scope RULE`) confines a run to the
-hosts an analyst declares and refuses everything else without a prompt. See
-[reproducing a report](docs/USAGE.md#10-reproduce-a-report-triage-profile).
+A **scoped run** (`--profile scoped --scope RULE`) confines a run to the hosts
+the operator declares and refuses everything else without a prompt, for
+example to reproduce a vulnerability report against its target. `--scope none`
+admits no host beyond the run's own, such as its model endpoint, for
+validating a finding in code offline. See [scoped runs](docs/USAGE.md#10-scoped-runs).
 
 ## Quick start
 
@@ -97,9 +99,9 @@ keel doctor
 
 The setup command builds the runtime, installs the launcher at ~/.local/bin/keel,
 and prepares the pinned guest, V8, and xterm-headless renderer artifacts used by
-the current checkout. Downloads are version- and SHA-256-pinned; the guest's
-Alpine packages are not, so the guest image is not yet reproducible. See
-[pinned artifacts](docs/ARTIFACTS.md).
+the current checkout. Downloads, including every Alpine package in the guest, are version- and
+SHA-256-pinned, and the guest image builds byte-identically from the same
+checkout. See [pinned artifacts](docs/ARTIFACTS.md).
 
 ### Configure model access
 
@@ -168,10 +170,11 @@ exercise it.
 | Explicit policy combines with data provenance, budgets, and operator approval | [`primary_scenario.rs`](crates/trusted/keel-policy/tests/primary_scenario.rs), [`stateful_rules.rs`](crates/trusted/keel-policy/tests/stateful_rules.rs), [`write_inheritance.rs`](crates/trusted/keel-provenance/tests/write_inheritance.rs), [`model_budget.rs`](crates/trusted/keel-kernel/tests/model_budget.rs) |
 | Approval input is isolated from the untrusted terminal renderer | [`secure_attention.rs`](crates/trusted/keel-input/tests/secure_attention.rs), [`terminal_control.rs`](crates/trusted/keel-input/tests/terminal_control.rs) |
 | `A` binds to one exact action and is consumed once; `G` covers only the displayed host, port, and method, expires after 15 minutes, 64 actions, or a floor drop, and excludes credential-bearing and high-impact effects | [`egress_grant_scope.rs`](crates/trusted/keel-kernel/tests/egress_grant_scope.rs) and the permit tests in the kernel's [unit suite](crates/trusted/keel-kernel/tests/support/unit.rs) |
-| A triage run's declared scope is enforced, refusing everything else without a prompt | [`scope.rs`](crates/trusted/keel-provenance/tests/scope.rs), [`triage_scope.rs`](crates/trusted/keel-input/tests/triage_scope.rs) |
+| A scoped run's declared scope is enforced, refusing everything else without a prompt | [`scope.rs`](crates/trusted/keel-provenance/tests/scope.rs), [`scoped_run.rs`](crates/trusted/keel-input/tests/scoped_run.rs) |
 | Every run records a canonical admission manifest before its workload starts | [`admission_manifest.rs`](crates/trusted/keel-input/tests/admission_manifest.rs) |
 | Audit records are authenticated and hash-chained, and an unsealed prefix is never accepted as complete | [`verification_status.rs`](crates/trusted/keel-audit/tests/verification_status.rs) |
-| The hand-written trusted Rust stays under a checked size ceiling | invariant I1 in [`ci/check_invariants.py`](ci/check_invariants.py) |
+| The runtime can write only one file in the session directory, the guest's event stream, and never the audit chain | `runtime_sandbox_writes_only_its_guest_events_file_in_the_session` in [`runtime_security.rs`](crates/trusted/keel-input/tests/support/runtime_security.rs) |
+| The hand-written trusted Rust is small, about 15,300 lines, and each trusted crate is held to a checked line ratchet | invariant I1 in [`ci/check_invariants.py`](ci/check_invariants.py) |
 
 Keel does not claim to:
 
@@ -186,23 +189,33 @@ Read the [threat model](docs/THREAT-MODEL.md) before relying on the prototype fo
 
 ## Known limitations
 
-- **Shadow verdicts.** The action-centric verdicts (task intent, payload flow,
-  push integrity, per-turn context) are recorded and reported, but most do not
-  decide yet. `keel report --axes` and `--context` measure them.
-- **Push diff.** The protected-file diff a push is judged by is computed by
-  the untrusted Git relay, not derived by trusted code from the pack.
+- **Payload checks are verbatim.** Private repository content headed to a
+  destination not cleared for it escalates, admitted secrets are denied, and
+  protected lines in a push that neither the accepted `HEAD` nor the model
+  accounts for escalate; the push is derived by trusted code from its own
+  bytes. Paraphrased, compressed, or re-encoded content is not detected.
+- **Extraction is schema-bounded.** `keel_extract` lets the agent read an
+  issue or page without lowering the floor, but only as the fields an admitted
+  schema allows; tasks that need the prose itself still read it raw.
+- **Shadow verdicts.** Task intent outside branch scopes and per-turn context
+  are recorded and reported but do not decide yet. `keel report --axes` and
+  `--context` measure them.
 - **Proxy protocols.** The trusted proxy speaks HTTP/1.1 only and does not
   relay WebSockets, so pages and tools that need them do not work fully.
-- **Guest image.** Alpine packages, including Chromium, are not pinned, so the
-  image is not reproducible, and Chromium is patched only when setup rebuilds
-  the image. Chromium runs without its own sandbox; the VM is the boundary.
+- **Guest image.** Alpine packages, including Chromium, are locked, so
+  Chromium is patched only when the lock is refreshed
+  (`spikes/lock-guest-packages.sh`) and setup rebuilds the image. Chromium runs without its own sandbox; the VM is the boundary.
 - **Browser view.** There is no live view of the guest browser; use the
   `agent-browser` CLI and the screenshots it saves.
 - **Platform.** Apple silicon macOS only. Linux is design work.
-- **Teardown.** There is no verified teardown receipt or crash-recovery
-  cleanup yet. On some abnormal exits, such as the controlling terminal
-  closing, the runtime backend and its VM can keep running until stopped by
-  hand.
+- **Teardown.** `keel stop` returns only once a persistent session's
+  supervisor has checked its cleanup and written a signed receipt, and a hangup
+  or `SIGTERM` stops a run in order. If the trusted runtime is killed with
+  `SIGKILL` or the host crashes, the runtime backend and its VM keep running
+  until the next `keel run` or `keel attach` (after a 15-minute grace) or
+  `keel recover` releases what the run's audit chain records. Detached
+  sessions stop themselves after 12 idle hours. Recovery records are unsigned,
+  and foreground runs get no receipt.
 
 ## Documentation
 
@@ -220,7 +233,7 @@ Read the [threat model](docs/THREAT-MODEL.md) before relying on the prototype fo
 
 ## Project status
 
-The repository contains working microVM and V8 execution paths, policy enforcement, a conservative session-wide provenance floor, trusted approvals, credential-aware relays, process attribution, an audited admission manifest, session management, and authenticated audit logs. The action-centric verdicts and the per-turn context digest log run in shadow mode while their data is measured. Remaining work includes enforcement of those verdicts, reproducible packaging, evaluation, verified teardown, and portability beyond macOS.
+The repository contains working microVM and V8 execution paths, policy enforcement, a conservative session-wide provenance floor, trusted approvals, credential-aware relays, process attribution, an audited admission manifest, session management, checked teardown with a signed stop receipt, crash recovery from the audit chain, and authenticated audit logs. The action-centric verdicts and the per-turn context digest log run in shadow mode while their data is measured. Remaining work includes enforcement of those verdicts, reproducible packaging, evaluation, automatic crash reconciliation and fault-injection tests for teardown, and portability beyond macOS.
 
 Security-sensitive behavior should be judged from the current source, tests, and threat model—not from roadmap items or design proposals.
 

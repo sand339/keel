@@ -85,6 +85,7 @@ pub fn install() -> Result<String, CliError> {
         "keel",
         "keel-input-runtime",
         "keel-runtime",
+        "keel-extract",
         "keel-vz-spike",
         "keel-render-spike",
         "keel-xterm-renderer",
@@ -234,12 +235,32 @@ pub fn doctor() -> DoctorReport {
         "GitHub credential is available",
         "GitHub authentication is unavailable; run `gh auth login` or set GH_TOKEN",
     );
-    check_git_credentials(&mut report);
-    check_workspace(&mut report);
+    check_local_state(&mut report);
     DoctorReport {
         output: report.output,
         healthy: report.healthy,
     }
+}
+
+fn check_local_state(report: &mut CheckReport) {
+    check_git_credentials(report);
+    check_workspace(report);
+    let stale = super::stale_sessions();
+    report.optional(
+        stale.is_empty(),
+        "no crashed session awaits recovery",
+        &format!(
+            "{} crashed session(s) await `keel recover SESSION`, most recent: {}",
+            stale.len(),
+            stale
+                .iter()
+                .rev()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    );
 }
 
 /// Returns the configured trusted input runtime, honoring an environment

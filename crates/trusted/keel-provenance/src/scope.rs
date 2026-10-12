@@ -1,8 +1,9 @@
-//! Triage scope: the hosts a reproduction may reach, declared by the operator.
+//! Run scope: the hosts a scoped run may reach, declared by the operator.
 //!
 //! `*.example.com` matches subdomains only, never the apex, which must be
 //! listed on its own. A rule without a port matches 443 and 80. An exclusion
-//! beats any match.
+//! beats any match. `none` alone admits no host beyond the run's own, such as
+//! its model endpoint.
 
 /// One host rule.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,7 +65,7 @@ impl Rule {
     }
 }
 
-/// The hosts a triage run may reach.
+/// The hosts a scoped run may reach.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Scope {
     include: Vec<Rule>,
@@ -76,8 +77,15 @@ impl Scope {
     ///
     /// # Errors
     ///
-    /// Returns an error for a malformed rule or an empty scope.
+    /// Returns an error for a malformed rule, an empty scope, or `none`
+    /// combined with any other rule.
     pub fn parse(include: &[String], exclude: &[String]) -> Result<Self, String> {
+        if let [only] = include
+            && only.trim().eq_ignore_ascii_case("none")
+            && exclude.is_empty()
+        {
+            return Ok(Self::default());
+        }
         let rules = |texts: &[String]| {
             texts
                 .iter()
@@ -89,7 +97,7 @@ impl Scope {
             exclude: rules(exclude)?,
         };
         if scope.include.is_empty() {
-            return Err("a triage run needs at least one --scope rule".to_owned());
+            return Err("a scoped run needs at least one --scope rule, or --scope none".to_owned());
         }
         Ok(scope)
     }
@@ -104,6 +112,9 @@ impl Scope {
     /// The normalized rules: included, then `!`-prefixed exclusions.
     #[must_use]
     pub fn describe(&self) -> Vec<String> {
+        if self.include.is_empty() {
+            return vec!["none".to_owned()];
+        }
         let excluded = self
             .exclude
             .iter()

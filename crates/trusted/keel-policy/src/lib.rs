@@ -64,6 +64,12 @@ impl ArtifactHash {
         }
         Ok(Self(bytes))
     }
+
+    /// Wraps a digest computed by trusted code.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 impl fmt::Debug for ArtifactHash {

@@ -15,6 +15,8 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
+pub mod telemetry;
+
 /// Identifies this crate as outside the trusted computing base.
 pub const TRUST_CLASS: &str = "untrusted";
 
@@ -40,6 +42,100 @@ pub struct IssueReadAction {
     pub repository: String,
     /// Positive GitHub issue number.
     pub number: u64,
+}
+
+/// A schema-bounded extraction the guest asks Keel for (PLAN D83). The guest
+/// never receives the source itself, only the fields the admitted schema
+/// allows.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, schemars::JsonSchema)]
+pub struct ExtractAction {
+    /// `issue:N` or `pull:N` on the admitted repository, or
+    /// `url:https://HOST/PATH`.
+    pub source: String,
+    /// The name of an operator-admitted extraction schema.
+    pub schema: String,
+}
+
+/// The validated extraction, or why it was refused.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, schemars::JsonSchema)]
+pub struct ExtractOutput {
+    /// The schema's fields, validated by trusted code.
+    pub result: Option<serde_json::Value>,
+    /// Why no result was produced.
+    pub error: Option<String>,
+}
+
+/// Asks the kernel for one extraction and waits for its validated result.
+///
+/// # Errors
+///
+/// Returns the kernel's refusal or a transport failure.
+pub fn request_extraction(
+    kernel_socket: &Path,
+    origin: Option<&[u8]>,
+    action: &ExtractAction,
+) -> Result<serde_json::Value, String> {
+    let mut stream = UnixStream::connect(kernel_socket).map_err(|error| error.to_string())?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(200)))
+        .map_err(|error| error.to_string())?;
+    if let Some(origin) = origin {
+        let length = u16::try_from(origin.len())
+            .ok()
+            .filter(|_| origin.len() <= keel_kernel::MAX_ORIGIN_BYTES)
+            .ok_or("guest origin exceeds its bound")?;
+        stream
+            .write_all(keel_kernel::ORIGIN_MAGIC)
+            .and_then(|()| stream.write_all(&length.to_be_bytes()))
+            .and_then(|()| stream.write_all(origin))
+            .map_err(|error| error.to_string())?;
+    }
+    stream
+        .write_all(keel_kernel::EXTRACT_MAGIC)
+        .map_err(|error| error.to_string())?;
+    for value in [action.source.as_str(), action.schema.as_str()] {
+        let length = u16::try_from(value.len()).map_err(|_| "extraction field is too long")?;
+        stream
+            .write_all(&length.to_be_bytes())
+            .and_then(|()| stream.write_all(value.as_bytes()))
+            .map_err(|error| error.to_string())?;
+    }
+    stream.flush().map_err(|error| error.to_string())?;
+    let mut kind = [0_u8; 1];
+    stream
+        .read_exact(&mut kind)
+        .map_err(|error| error.to_string())?;
+    match kind[0] {
+        keel_kernel::EXTRACT_OK => {
+            let mut length = [0_u8; 4];
+            stream
+                .read_exact(&mut length)
+                .map_err(|error| error.to_string())?;
+            let length =
+                usize::try_from(u32::from_be_bytes(length)).map_err(|error| error.to_string())?;
+            if length > 1024 * 1024 {
+                return Err("extraction result exceeds its bound".to_owned());
+            }
+            let mut bytes = vec![0_u8; length];
+            stream
+                .read_exact(&mut bytes)
+                .map_err(|error| error.to_string())?;
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+        }
+        keel_kernel::EXTRACT_REFUSED => {
+            let mut length = [0_u8; 2];
+            let mut reason = Vec::new();
+            if stream.read_exact(&mut length).is_ok() {
+                reason = vec![0_u8; usize::from(u16::from_be_bytes(length))];
+                let _ = stream.read_exact(&mut reason);
+            }
+            Err(format!(
+                "Keel refused the extraction: {}",
+                String::from_utf8_lossy(&reason)
+            ))
+        }
+        _ => Err("Keel refused the extraction request".to_owned()),
+    }
 }
 
 /// Structured issue fields returned to the guest.
@@ -151,6 +247,10 @@ enum NodeJob {
     IssueRead {
         action: IssueReadAction,
         response: std::sync::mpsc::SyncSender<Result<GithubIssue, String>>,
+    },
+    Extract {
+        action: ExtractAction,
+        response: std::sync::mpsc::SyncSender<Result<serde_json::Value, String>>,
     },
 }
 
@@ -317,6 +417,36 @@ impl ProbeServer {
     }
 
     #[tool(
+        name = "keel_extract",
+        description = "Extract fields from an issue, pull request, or web page under an operator-admitted schema. You receive only the schema's fields, never the source text, so reading untrusted content this way does not lower the session's trust. Source is issue:N, pull:N, or url:https://HOST/PATH."
+    )]
+    fn keel_extract(&self, Parameters(action): Parameters<ExtractAction>) -> Json<ExtractOutput> {
+        let result = self
+            .node_tx
+            .as_ref()
+            .ok_or_else(|| "extraction is not configured".to_owned())
+            .and_then(|sender| {
+                let (response, receiver) = sync_channel(1);
+                sender
+                    .send(NodeJob::Extract { action, response })
+                    .map_err(|_| "extraction relay is unavailable".to_owned())?;
+                receiver
+                    .recv()
+                    .map_err(|_| "extraction backend is unavailable".to_owned())?
+            });
+        match result {
+            Ok(result) => Json(ExtractOutput {
+                result: Some(result),
+                error: None,
+            }),
+            Err(error) => Json(ExtractOutput {
+                result: None,
+                error: Some(error),
+            }),
+        }
+    }
+
+    #[tool(
         name = "gh_issue_read",
         description = "Read one GitHub issue through Keel's inspected egress path"
     )]
@@ -425,6 +555,10 @@ where
                     }
                     NodeJob::IssueRead { action, response } => {
                         let result = issue_backend(&action);
+                        let _ = response.send(result);
+                    }
+                    NodeJob::Extract { action, response } => {
+                        let result = request_extraction(&kernel_socket, origin.as_deref(), &action);
                         let _ = response.send(result);
                     }
                 }

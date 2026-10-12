@@ -6,9 +6,9 @@ use keel_cli::{
     configured_input_runtime, context_report, derive_workspace_egress, doctor,
     explicit_mux_workspace, fatigue_report, format_enforcement_report, format_floor_status, help,
     host_default_model, install, launch_runtime, load_floor_status, new_session_id, parse_args,
-    persistent_runtime_operation, record_accepted_policy, select_mux_launch, session_directory,
-    session_enforcement_state, start_persistent_runtime, validate_run_isolation,
-    validate_v8_request_entry,
+    persistent_runtime_operation, reconcile_crashed_sessions, record_accepted_policy,
+    select_mux_launch, session_directory, session_enforcement_state, start_persistent_runtime,
+    validate_run_isolation, validate_v8_request_entry,
 };
 use keel_compile::{PolicyArtifact, load_policy_translation, translate_policy_with_claude};
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,25 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn run_export(
+    sessions: &[String],
+    out: Option<&std::path::Path>,
+    otlp: Option<&str>,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let document = keel_cli::export::export_sessions(sessions)?;
+    if let Some(endpoint) = otlp {
+        keel_cli::export::send_otlp(endpoint, &document)?;
+        eprintln!("exported {} session(s) to {endpoint}", sessions.len());
+    }
+    if let Some(path) = out {
+        fs::write(path, serde_json::to_vec_pretty(&document)?)?;
+        eprintln!("wrote {}", path.display());
+    } else if otlp.is_none() {
+        println!("{}", serde_json::to_string_pretty(&document)?);
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
@@ -82,6 +101,11 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             print!("{}", context_report(&sessions)?);
             Ok(ExitCode::SUCCESS)
         }
+        Command::Export {
+            sessions,
+            out,
+            otlp,
+        } => run_export(&sessions, out.as_deref(), otlp.as_deref()),
         Command::Report { inputs } => {
             print!("{}", fatigue_report(&inputs)?);
             Ok(ExitCode::SUCCESS)
@@ -112,26 +136,99 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 None => ExitCode::FAILURE,
             })
         }
-        Command::Attach { session_id } => {
-            let runtime = configured_input_runtime()?;
-            if let Some(manager) = load_mux_manager(&session_id)? {
-                return run_restored_mux_manager(&runtime, &session_id, manager);
-            }
-            let status = persistent_runtime_operation(&runtime, "attach", &session_id)?;
-            if status.code() == Some(MUX_DETACH) {
-                println!("Detached from {session_id}. Reattach with `keel attach {session_id}`.");
-                Ok(ExitCode::SUCCESS)
-            } else {
-                Ok(exit_status(status))
-            }
+        Command::Attach { session_id } => attach(&session_id),
+        Command::Stop { session_id } => session_operation("stop", &session_id),
+        Command::Recover { session_id } => session_operation("recover", &session_id),
+        Command::RecoverAll => recover_all(),
+        Command::Run(request) => {
+            reconcile_on_use();
+            run_harness(request)
         }
-        Command::Stop { session_id } => {
-            let runtime = configured_input_runtime()?;
-            let status = persistent_runtime_operation(&runtime, "stop", &session_id)?;
-            Ok(exit_status(status))
-        }
-        Command::Run(request) => run_harness(request),
     }
+}
+
+fn attach(session_id: &str) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    reconcile_on_use();
+    let runtime = configured_input_runtime()?;
+    if let Some(manager) = load_mux_manager(session_id)? {
+        return run_restored_mux_manager(&runtime, session_id, manager);
+    }
+    let status = persistent_runtime_operation(&runtime, "attach", session_id)?;
+    if status.code() == Some(MUX_DETACH) {
+        println!("Detached from {session_id}. Reattach with `keel attach {session_id}`.");
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(exit_status(status))
+    }
+}
+
+fn recover_all() -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let runtime = configured_input_runtime()?;
+    let (recovered, failures) = reconcile_crashed_sessions(&runtime, Duration::ZERO)?;
+    println!("Recovered {recovered} crashed session(s).");
+    for failure in &failures {
+        eprintln!("keel: recovery incomplete for {failure}");
+    }
+    Ok(if failures.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// Recovers crashed sessions quiet for longer than the grace period before a
+/// command that starts or resumes work. It reports, and never blocks the
+/// command; `KEEL_AUTO_RECOVER=off` disables it.
+fn reconcile_on_use() {
+    if env::var("KEEL_AUTO_RECOVER").is_ok_and(|value| value == "off") {
+        return;
+    }
+    let minutes = env::var("KEEL_RECOVERY_GRACE_MINUTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(15);
+    let Ok(runtime) = configured_input_runtime() else {
+        return;
+    };
+    match reconcile_crashed_sessions(&runtime, Duration::from_mins(minutes)) {
+        Ok((0, failures)) if failures.is_empty() => {}
+        Ok((recovered, failures)) => {
+            eprintln!("Keel recovered {recovered} crashed session(s).");
+            for failure in failures {
+                eprintln!("keel: recovery incomplete for {failure}; see `keel status`");
+            }
+        }
+        Err(error) => eprintln!("keel: automatic recovery skipped: {error}"),
+    }
+}
+
+/// A `workspace:own` run works in a clean clone of the accepted `HEAD`, so its
+/// commits reach the operator's repository only when fetched on purpose.
+fn print_clone_hint(session_id: &str) {
+    let Ok(clone) = session_directory(session_id).map(|directory| directory.join("workspace"))
+    else {
+        return;
+    };
+    if clone.join(".git").is_dir() {
+        println!(
+            "The agent worked in a clean clone of the accepted HEAD. Fetch its commits with:\n  \
+             git fetch {} HEAD:keel/{session_id}",
+            shell_quote(&clone.display().to_string())
+        );
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn session_operation(
+    operation: &str,
+    session_id: &str,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let runtime = configured_input_runtime()?;
+    let status = persistent_runtime_operation(&runtime, operation, session_id)?;
+    Ok(exit_status(status))
 }
 
 fn run_harness(mut request: keel_cli::RunRequest) -> Result<ExitCode, Box<dyn std::error::Error>> {
@@ -168,9 +265,11 @@ fn run_harness(mut request: keel_cli::RunRequest) -> Result<ExitCode, Box<dyn st
             request.session_id
         );
         let status = persistent_runtime_operation(&runtime, "attach", &request.session_id)?;
+        print_clone_hint(&request.session_id);
         Ok(exit_status(status))
     } else {
         let status = launch_runtime(&runtime, &request)?;
+        print_clone_hint(&request.session_id);
         Ok(exit_status(status))
     }
 }

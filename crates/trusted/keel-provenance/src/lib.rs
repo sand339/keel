@@ -18,10 +18,22 @@ pub const BEHAVIORAL_DENIAL_WINDOW_MS: u64 = 15 * 60 * 1_000;
 /// Identifies this crate as part of the trusted computing base.
 pub const TRUSTED_CRATE: &str = "keel-provenance";
 
+mod extraction;
+mod lockfile;
 mod payload;
+mod push;
 mod scope;
 
-pub use payload::{Confidentiality, FragmentCounts, ModelOutputIndex, PayloadIndex, classify_path};
+pub use extraction::{
+    ExtractionError, ExtractionSchema, FieldType, MAX_BUNDLE_BYTES, SchemaRegistry,
+};
+pub use lockfile::{LockfilePins, MAX_LOCKFILE_BYTES};
+pub use payload::{
+    Confidentiality, FragmentCounts, ModelOutputIndex, PayloadIndex, classify_path, committed_paths,
+};
+pub use push::{
+    PushedBlob, PushedContent, RefUpdate, derive_push, is_protected_path, receive_pack_commands,
+};
 pub use scope::Scope;
 
 /// Constructs Git with repository-controlled execution hooks and ambient
@@ -246,7 +258,7 @@ pub struct IntentFlags {
     pub push_refs: BTreeSet<String>,
     /// Admitted pull-request base branches (`pr:target:`); empty means any.
     pub pr_targets: BTreeSet<String>,
-    /// A triage run's declared scope; outside it, egress is refused without
+    /// A scoped run's declared scope; outside it, egress is refused without
     /// a prompt.
     pub scope: Option<Scope>,
 }

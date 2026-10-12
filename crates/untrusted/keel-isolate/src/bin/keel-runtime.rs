@@ -82,6 +82,9 @@ fn run_vm(request: &RunRequest) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(rootfs) = &plan.rootfs {
         backend.arg("--rootfs").arg(rootfs);
     }
+    if request.ephemeral_workspace {
+        backend.arg("--ephemeral-workspace");
+    }
     let status = backend.status();
     let cleanup = fs::remove_dir_all(&control);
     let status = status.map_err(|error| format!("start VZ backend: {error}"))?;
@@ -550,6 +553,11 @@ mod tests {
             session_id: format!("ca-test-{nonce:x}"),
             provenance: ProvenanceMode::Floor,
             reuse_connections: false,
+            record_targets: false,
+            ephemeral_workspace: false,
+            idle_timeout_hours: None,
+            extraction_schemas_hash: None,
+            schemas: None,
             cpus: 2,
             memory_gib: 2,
             isolation: IsolationMode::Vm,
@@ -563,7 +571,7 @@ mod tests {
             harness_args: Vec::new(),
             model: Some("us.anthropic.claude-opus-5".to_owned()),
             auth: None,
-            triage: keel_cli::TriageRequest::default(),
+            scoped: keel_cli::ScopeRequest::default(),
             model_token_budget: keel_cli::DEFAULT_MODEL_TOKEN_BUDGET,
             model_cost_budget_microusd: keel_cli::DEFAULT_MODEL_COST_BUDGET_MICROUSD,
         };

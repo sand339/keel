@@ -92,5 +92,10 @@ name = "keel-runtime"
 path = "src/bin/keel-runtime.rs"
 required-features = ["vz-backend"]
 
+[[bin]]
+name = "keel-extract"
+path = "src/bin/keel-extract.rs"
+required-features = ["vz-backend"]
+
 [lints]
 workspace = true

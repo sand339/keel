@@ -2,8 +2,9 @@
 
 mod setup;
 
+pub mod export;
 mod openrouter;
-use keel_audit::{AuditRecord, RunKey, read_verified_file, read_verified_prefix};
+use keel_audit::{AuditRecord, RunKey, TeardownReceipt, read_verified_file, read_verified_prefix};
 use keel_compile::{PolicyArtifact, SessionPolicyArtifact};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -13,7 +14,7 @@ use std::{
     ffi::{OsStr, OsString},
     fmt, fs,
     fs::OpenOptions,
-    io::Write as _,
+    io::{self, Write as _},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, ExitStatus},
     time::{SystemTime, UNIX_EPOCH},
@@ -107,6 +108,13 @@ pub enum Command {
         /// Session identifier.
         session_id: String,
     },
+    /// Release what a crashed session's chain says it left behind.
+    Recover {
+        /// Session identifier.
+        session_id: String,
+    },
+    /// Recover every crashed session.
+    RecoverAll,
     /// Verify an authenticated audit chain.
     AuditVerify {
         /// NDJSON audit path.
@@ -123,6 +131,15 @@ pub enum Command {
     ReportContext {
         /// Session identifiers; empty means every session with an audit chain.
         sessions: Vec<String>,
+    },
+    /// Export sessions as OpenTelemetry traces.
+    Export {
+        /// Session identifiers.
+        sessions: Vec<String>,
+        /// Write OTLP/JSON here instead of standard output.
+        out: Option<PathBuf>,
+        /// Send to this OTLP/HTTP collector.
+        otlp: Option<String>,
     },
     /// Report escalation-fatigue metrics from authenticated audit chains.
     Report {
@@ -163,13 +180,13 @@ pub enum PolicySource {
     Text(String),
 }
 
-/// A triage run's profile and analyst-declared scope.
+/// A scoped run's profile and operator-declared scope.
 ///
 /// Trusted admission parses the rules, shows them, and refuses everything
 /// outside them; this side only collects them.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct TriageRequest {
-    /// `triage`, or absent.
+pub struct ScopeRequest {
+    /// `scoped`, or absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     /// Host rules: `host`, `*.host`, optionally `:port`.
@@ -181,13 +198,13 @@ pub struct TriageRequest {
 }
 
 #[derive(Default)]
-struct TriageArguments {
-    request: TriageRequest,
+struct ScopeArguments {
+    request: ScopeRequest,
     report: Option<PathBuf>,
 }
 
-impl TriageArguments {
-    /// Consumes one triage option, returning whether `option` was one.
+impl ScopeArguments {
+    /// Consumes one scope option, returning whether `option` was one.
     fn parse(
         &mut self,
         option: &str,
@@ -197,7 +214,12 @@ impl TriageArguments {
         match option {
             "--profile" => {
                 let profile = next_utf8(arguments, index, "--profile")?;
-                if profile != "triage" {
+                if profile == "triage" {
+                    return Err(CliError::new(
+                        "the triage profile is now called scoped: use --profile scoped",
+                    ));
+                }
+                if profile != "scoped" {
                     return Err(CliError::new(format!("unknown --profile `{profile}`")));
                 }
                 self.request.profile = Some(profile);
@@ -232,12 +254,12 @@ impl TriageArguments {
 
     /// Validates the combination and, when no scope was declared, proposes
     /// the report's URL hosts for the analyst to admit or refuse.
-    fn finish(mut self) -> Result<TriageRequest, CliError> {
+    fn finish(mut self) -> Result<ScopeRequest, CliError> {
         let declared = !self.request.scope.is_empty() || !self.request.exclude.is_empty();
         if self.request.profile.is_none() {
             if declared || self.report.is_some() {
                 return Err(CliError::new(
-                    "--scope, --exclude, --scope-file, and --report need --profile triage",
+                    "--scope, --exclude, --scope-file, and --report need --profile scoped",
                 ));
             }
             return Ok(self.request);
@@ -252,7 +274,7 @@ impl TriageArguments {
         }
         if self.request.scope.is_empty() {
             return Err(CliError::new(
-                "--profile triage needs --scope, --scope-file, or a --report naming target URLs",
+                "--profile scoped needs --scope, --scope-file, a --report naming target URLs, or --scope none",
             ));
         }
         Ok(self.request)
@@ -336,6 +358,7 @@ impl IsolationMode {
 
 /// Structured request handed from the untrusted CLI to the runtime.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[allow(clippy::struct_excessive_bools)] // a flat wire DTO of independent run flags
 pub struct RunRequest {
     /// Stable session identifier.
     pub session_id: String,
@@ -344,6 +367,13 @@ pub struct RunRequest {
     /// Reuse bounded same-host HTTP connections inside the trusted proxy.
     #[serde(default)]
     pub reuse_connections: bool,
+    /// Write network targets to the audit log in plain text (admitted).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub record_targets: bool,
+    /// Share the workspace read-only under a tmpfs overlay, so guest writes
+    /// never reach the host (detonation of untrusted code).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ephemeral_workspace: bool,
     /// Number of virtual CPUs assigned to VM profiles.
     #[serde(default = "default_vm_cpus")]
     pub cpus: usize,
@@ -359,6 +389,10 @@ pub struct RunRequest {
     /// Keep the host runtime and VM alive across terminal attachments.
     #[serde(skip)]
     pub keep_alive: bool,
+    /// Hours a detached persistent session may stay silent before it stops
+    /// itself; `Some(0)` disables the limit, `None` keeps the default.
+    #[serde(skip)]
+    pub idle_timeout_hours: Option<u64>,
     /// Reviewed intent capabilities.
     pub allow: Vec<String>,
     /// Accepted natural-language policy selected for this run.
@@ -367,6 +401,12 @@ pub struct RunRequest {
     /// Independently pinned digest for a materialized policy bundle.
     #[serde(default)]
     pub policy_bundle_hash: Option<String>,
+    /// Pinned digest of the extraction schema bundle copied into the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extraction_schemas_hash: Option<String>,
+    /// The extraction schema bundle the operator named with `--schemas`.
+    #[serde(skip)]
+    pub schemas: Option<PathBuf>,
     /// Explicit workspace selected for mux startup; omitted to show the picker.
     #[serde(skip)]
     pub workspace: Option<PathBuf>,
@@ -387,9 +427,9 @@ pub struct RunRequest {
     /// which infers it from which credentials are configured.
     #[serde(default)]
     pub auth: Option<String>,
-    /// The triage profile and its declared scope, when requested.
+    /// The scoped profile and its declared scope, when requested.
     #[serde(flatten)]
-    pub triage: TriageRequest,
+    pub scoped: ScopeRequest,
     /// Maximum model input and output tokens charged to this run.
     #[serde(default = "default_model_token_budget")]
     pub model_token_budget: u64,
@@ -462,9 +502,19 @@ pub fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Comma
             .map(|session_id| Command::Attach { session_id }),
         "stop" => parse_session_command("stop", &arguments[1..])
             .map(|session_id| Command::Stop { session_id }),
+        "recover" if arguments.get(1).and_then(|argument| argument.to_str()) == Some("--all") => {
+            if arguments.len() == 2 {
+                Ok(Command::RecoverAll)
+            } else {
+                Err(CliError::new("usage: keel recover --all"))
+            }
+        }
+        "recover" => parse_session_command("recover", &arguments[1..])
+            .map(|session_id| Command::Recover { session_id }),
         "status" => parse_status(&arguments[1..]),
         "audit" => parse_audit(&arguments[1..]),
         "report" => parse_report(&arguments[1..]),
+        "export" => parse_export(&arguments[1..]),
         "floor" => parse_floor(&arguments[1..]),
         "help" | "-h" | "--help" => Ok(Command::Help),
         unknown => Err(CliError::new(format!("unknown command: {unknown}"))),
@@ -480,8 +530,7 @@ fn requests_help(arguments: &[OsString]) -> bool {
 
 fn parse_mux(arguments: &[OsString]) -> Result<RunRequest, CliError> {
     let mut workspace = None;
-    let mut mux_arguments = Vec::with_capacity(arguments.len() + 1);
-    mux_arguments.push(OsString::from("claude"));
+    let mut mux_arguments = Vec::with_capacity(arguments.len());
     let mut index = 0;
     let mut passthrough = false;
     while index < arguments.len() {
@@ -502,7 +551,16 @@ fn parse_mux(arguments: &[OsString]) -> Result<RunRequest, CliError> {
         }
         index += 1;
     }
-    let mut request = parse_run(&mux_arguments)?;
+    // Claude is the default harness rather than a prepended one: options after
+    // a harness belong to it, so a prepended `claude` would hand every Keel
+    // option that only precedes a harness, such as `--profile`, to Claude.
+    let mut request = parse_run_with_default(&mux_arguments, Some("claude"))?;
+    if request.harness != "claude" {
+        return Err(CliError::new(format!(
+            "keel mux runs claude, not `{}`; pass Claude's arguments after --",
+            request.harness
+        )));
+    }
     request.mux = true;
     request.keep_alive = true;
     request.workspace = workspace;
@@ -546,20 +604,32 @@ fn parse_report(arguments: &[OsString]) -> Result<Command, CliError> {
 
 #[allow(clippy::too_many_lines)]
 fn parse_run(arguments: &[OsString]) -> Result<RunRequest, CliError> {
+    parse_run_with_default(arguments, None)
+}
+
+#[allow(clippy::too_many_lines)] // one flat match over every run option
+fn parse_run_with_default(
+    arguments: &[OsString],
+    default_harness: Option<&str>,
+) -> Result<RunRequest, CliError> {
     let mut provenance = ProvenanceMode::Floor;
     let mut isolation = IsolationMode::Vm;
     let mut reuse_connections = false;
+    let mut record_targets = false;
+    let mut ephemeral_workspace = false;
+    let mut schemas = None;
     let mut cpus = DEFAULT_VM_CPUS;
     let mut memory_gib = DEFAULT_VM_MEMORY_GIB;
     let mux = false;
     let mut keep_alive = false;
+    let mut idle_timeout_hours = None;
     let mut allow = Vec::new();
     let mut policy = None;
     let mut session_id = None;
     let mut harness = None;
     let mut harness_args = Vec::new();
     let mut model = None;
-    let mut triage = TriageArguments::default();
+    let mut scoped = ScopeArguments::default();
     let mut auth = None;
     let mut model_budget = ModelBudgetArguments::default();
     let mut index = 0;
@@ -592,7 +662,28 @@ fn parse_run(arguments: &[OsString]) -> Result<RunRequest, CliError> {
                     isolation = parse_isolation(&next_utf8(arguments, &mut index, "--isolation")?)?;
                 }
                 "--reuse-connections" => reuse_connections = true,
+                "--record-targets" => record_targets = true,
+                "--schemas" => {
+                    schemas = Some(PathBuf::from(next_utf8(
+                        arguments,
+                        &mut index,
+                        "--schemas",
+                    )?));
+                }
+                "--ephemeral-workspace" => ephemeral_workspace = true,
                 "--keep-alive" => keep_alive = true,
+                "--idle-timeout" => {
+                    let value = next_utf8(arguments, &mut index, "--idle-timeout")?;
+                    idle_timeout_hours = Some(
+                        value
+                            .parse::<u64>()
+                            .ok()
+                            .filter(|hours| *hours <= 720)
+                            .ok_or_else(|| {
+                                CliError::new("--idle-timeout must be hours from 0 to 720")
+                            })?,
+                    );
+                }
                 "--cpus" => {
                     let value = next_utf8(arguments, &mut index, "--cpus")?;
                     cpus = parse_cpus(&value)?;
@@ -617,7 +708,7 @@ fn parse_run(arguments: &[OsString]) -> Result<RunRequest, CliError> {
                 option @ ("--model-token-budget" | "--model-cost-budget") => {
                     parse_model_budget_option(option, arguments, &mut index, &mut model_budget)?;
                 }
-                option if harness.is_none() && triage.parse(option, arguments, &mut index)? => {}
+                option if harness.is_none() && scoped.parse(option, arguments, &mut index)? => {}
                 option if option.starts_with('-') && harness.is_none() => {
                     return Err(CliError::new(format!("unknown run option: {option}")));
                 }
@@ -628,7 +719,9 @@ fn parse_run(arguments: &[OsString]) -> Result<RunRequest, CliError> {
         index += 1;
     }
 
-    let harness = harness.ok_or_else(|| CliError::new("keel run requires a harness"))?;
+    let harness = harness
+        .or_else(|| default_harness.map(str::to_owned))
+        .ok_or_else(|| CliError::new("keel run requires a harness"))?;
     validate_label(&harness, "harness")?;
     allow.sort();
     allow.dedup();
@@ -636,20 +729,25 @@ fn parse_run(arguments: &[OsString]) -> Result<RunRequest, CliError> {
         session_id: session_id.unwrap_or_else(new_session_id),
         provenance,
         reuse_connections,
+        record_targets,
+        ephemeral_workspace,
         cpus,
         memory_gib,
         isolation,
         mux,
         keep_alive,
+        idle_timeout_hours,
         allow,
         policy,
         policy_bundle_hash: None,
+        extraction_schemas_hash: None,
+        schemas,
         workspace: None,
         harness,
         harness_args,
         model,
         auth,
-        triage: triage.finish()?,
+        scoped: scoped.finish()?,
         model_token_budget: model_budget.tokens.unwrap_or(DEFAULT_MODEL_TOKEN_BUDGET),
         model_cost_budget_microusd: model_budget
             .cost_microusd
@@ -1574,6 +1672,42 @@ fn parse_status(arguments: &[OsString]) -> Result<Command, CliError> {
     }
 }
 
+fn parse_export(arguments: &[OsString]) -> Result<Command, CliError> {
+    let usage =
+        || CliError::new("usage: keel export SESSION [SESSION ...] [--out FILE] [--otlp URL]");
+    let mut sessions = Vec::new();
+    let (mut out, mut otlp) = (None, None);
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = utf8(&arguments[index], "export argument")?;
+        match argument.as_str() {
+            "--out" | "--otlp" => {
+                index += 1;
+                let value = arguments.get(index).ok_or_else(usage)?;
+                if argument == "--out" {
+                    out = Some(PathBuf::from(value));
+                } else {
+                    otlp = Some(utf8(value, "--otlp")?);
+                }
+            }
+            option if option.starts_with('-') => return Err(usage()),
+            session => {
+                validate_session_id(session)?;
+                sessions.push(session.to_owned());
+            }
+        }
+        index += 1;
+    }
+    if sessions.is_empty() {
+        return Err(usage());
+    }
+    Ok(Command::Export {
+        sessions,
+        out,
+        otlp,
+    })
+}
+
 fn parse_audit(arguments: &[OsString]) -> Result<Command, CliError> {
     match arguments {
         [operation, audit, key] if operation == "verify" => Ok(Command::AuditVerify {
@@ -1759,10 +1893,17 @@ pub struct EnforcementReport {
     pub timestamp_ms: u64,
     /// Boundary name and its reported `state: detail`, sorted by name.
     pub boundaries: Vec<(String, String)>,
-    /// `active`, `closed`, or `interrupted`.
+    /// `active`, `closed`, `closed-unclean`, `stale`, `recovered`, or
+    /// `recovered-unclean`.
     pub state: &'static str,
     /// One-line admission manifest summary, when the chain records one.
     pub admitted: Option<String>,
+    /// One-line teardown summary, when the chain records one.
+    pub teardown: Option<String>,
+    /// One-line summary of the supervisor's verified post-seal receipt.
+    pub receipt: Option<String>,
+    /// One-line summary of crash recovery, when it has run.
+    pub recovery: Option<String>,
 }
 
 /// Whether a chain is sealed (`closed`), still written by a live trusted
@@ -1809,6 +1950,221 @@ fn manifest_group(records: &[AuditRecord]) -> String {
         text(&manifest["model"]["provider"]),
         text(&manifest["kernel_release"]),
     )
+}
+
+/// Whether a chain's teardown record verified every postcondition, and one
+/// line describing it, if the chain records one.
+fn teardown_summary(records: &[AuditRecord]) -> Option<(bool, String)> {
+    use std::fmt::Write as _;
+
+    let fields = &records
+        .iter()
+        .rev()
+        .find(|record| record.payload.event == "kernel.run-teardown")?
+        .payload
+        .fields;
+    let ok = fields.get("ok").is_some_and(|ok| ok == "true");
+    let mut line = format!(
+        "{} after {}",
+        if ok { "verified" } else { "incomplete" },
+        fields.get("stop_reason").map_or("-", String::as_str)
+    );
+    if fields
+        .get("escalated")
+        .is_some_and(|escalated| escalated == "true")
+    {
+        line.push_str(", backend needed SIGKILL");
+    }
+    for (key, value) in fields {
+        if let Some(check) = key.strip_prefix("check.")
+            && value.starts_with("unmet: ")
+        {
+            let kind = check.split_once('.').map_or(check, |(_, kind)| kind);
+            let _ = write!(line, "; {kind} {value}");
+        }
+    }
+    Some((ok, line))
+}
+
+/// Sessions whose latest chain is unsealed, whose writer is gone, and that
+/// `keel recover` has not yet processed.
+#[must_use]
+pub fn stale_sessions() -> Vec<String> {
+    stale_sessions_older_than(std::time::Duration::ZERO)
+}
+
+/// Stale sessions whose chain has not changed for at least `grace`. A cheap
+/// pre-filter skips chains already recovered, receipted, sealed, or recently
+/// written; only the rest are authenticated in full. Skipping is the safe
+/// direction for a cheap test to err in.
+#[must_use]
+pub fn stale_sessions_older_than(grace: std::time::Duration) -> Vec<String> {
+    let Ok(root) = state_root() else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(root.join("sessions")) else {
+        return Vec::new();
+    };
+    let mut stale = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|session| {
+            let candidate = session_directory(session)
+                .and_then(|directory| latest_audit_chain(&directory))
+                .is_ok_and(|chain| may_be_stale(&chain, grace));
+            candidate
+                && session_enforcement_state(session, None)
+                    .is_ok_and(|report| report.state == "stale")
+        })
+        .collect::<Vec<_>>();
+    stale.sort();
+    stale
+}
+
+fn may_be_stale(chain: &Path, grace: std::time::Duration) -> bool {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    if ["recovery.json", "receipt.json"]
+        .iter()
+        .any(|extension| chain.with_extension(extension).exists())
+    {
+        return false;
+    }
+    let quiet = fs::metadata(chain)
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|modified| modified.elapsed().is_ok_and(|elapsed| elapsed >= grace));
+    let mut tail = Vec::new();
+    let sealed = fs::File::open(chain).is_ok_and(|mut file| {
+        file.seek(SeekFrom::End(-4096))
+            .or_else(|_| file.seek(SeekFrom::Start(0)))
+            .and_then(|_| file.read_to_end(&mut tail))
+            .is_ok_and(|_| {
+                String::from_utf8_lossy(&tail)
+                    .lines()
+                    .last()
+                    .is_some_and(|line| line.contains("\"audit.sealed\""))
+            })
+    });
+    quiet && !sealed
+}
+
+/// Recovers every stale session quiet for at least `grace` through the
+/// trusted runtime, returning how many were recovered and each failure.
+///
+/// # Errors
+///
+/// Returns an error only when the runtime cannot be started.
+pub fn reconcile_crashed_sessions(
+    runtime: &Path,
+    grace: std::time::Duration,
+) -> Result<(usize, Vec<String>), CliError> {
+    let mut recovered = 0;
+    let mut failures = Vec::new();
+    for session in stale_sessions_older_than(grace) {
+        let output = ProcessCommand::new(runtime)
+            .arg("recover")
+            .arg("--socket")
+            .arg(session_directory(&session)?.join("attach.sock"))
+            .output()
+            .map_err(|error| CliError::new(format!("cannot run recovery: {error}")))?;
+        if output.status.success() {
+            recovered += 1;
+        } else {
+            let reason = String::from_utf8_lossy(&output.stderr);
+            failures.push(format!("{session}: {}", visible(reason.trim())));
+        }
+    }
+    Ok((recovered, failures))
+}
+
+/// One line for the record `keel recover` wrote for a crashed chain. It is
+/// unsigned and describes what recovery observed, not the state at the crash.
+fn recovery_summary(audit: &Path) -> Option<(bool, String)> {
+    use std::fmt::Write as _;
+
+    let bytes = fs::read(audit.with_extension("recovery.json")).ok()?;
+    let record = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+    let Some(record) = record
+        .filter(|record| record["chain"].as_str() == audit.file_name().and_then(OsStr::to_str))
+    else {
+        return Some((false, "unreadable record".to_owned()));
+    };
+    let ok = record["ok"].as_bool() == Some(true);
+    let checks = record["checks"].as_object().cloned().unwrap_or_default();
+    let mut line = format!(
+        "{} {} resource(s) at {} (unsigned; observed at recovery)",
+        if ok { "released" } else { "incomplete:" },
+        checks.len(),
+        record["recovered_ms"].as_u64().unwrap_or(0)
+    );
+    for (check, outcome) in &checks {
+        let outcome = outcome.as_str().unwrap_or("-");
+        if !outcome.starts_with("ok") {
+            let kind = check
+                .split_once('.')
+                .map_or(check.as_str(), |(_, kind)| kind);
+            let _ = write!(line, "; {kind} {outcome}");
+        }
+    }
+    Some((ok, line))
+}
+
+/// One line for the receipt the session supervisor wrote after the seal,
+/// verified against the key the chain's teardown record names. A receipt that
+/// does not verify is an error, as a modified chain is.
+fn receipt_summary(
+    audit: &Path,
+    records: &[AuditRecord],
+    seal_hash: Option<[u8; 32]>,
+) -> Result<Option<(bool, String)>, CliError> {
+    use std::fmt::Write as _;
+
+    let path = audit.with_extension("receipt.json");
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(CliError::new(format!("{}: {error}", path.display()))),
+    };
+    let rejected = |reason: String| CliError::new(format!("{}: {reason}", path.display()));
+    let receipt: TeardownReceipt =
+        serde_json::from_slice(&bytes).map_err(|error| rejected(error.to_string()))?;
+    let key = records
+        .iter()
+        .rev()
+        .find(|record| record.payload.event == "kernel.run-teardown")
+        .and_then(|record| record.payload.fields.get("supervisor_key"))
+        .ok_or_else(|| rejected("its chain names no supervisor key".to_owned()))?;
+    let key = RunKey::from_hex(key).map_err(|error| rejected(error.to_string()))?;
+    receipt
+        .verify(&key, seal_hash)
+        .map_err(|error| rejected(error.to_string()))?;
+    if audit.file_name().and_then(OsStr::to_str) != Some(receipt.chain.as_str()) {
+        return Err(rejected("names another chain".to_owned()));
+    }
+    let changed = audit
+        .parent()
+        .map_or_else(Vec::new, |directory| receipt.changed_files(directory));
+    let ok = receipt.ok && changed.is_empty();
+    let mut line = format!(
+        "{} after {}",
+        if receipt.ok { "verified" } else { "incomplete" },
+        receipt.stop_reason
+    );
+    if receipt.escalated {
+        line.push_str(", runtime needed SIGKILL");
+    }
+    for (check, outcome) in &receipt.checks {
+        if !outcome.starts_with("ok") {
+            let kind = check
+                .split_once('.')
+                .map_or(check.as_str(), |(_, kind)| kind);
+            let _ = write!(line, "; {kind} {outcome}");
+        }
+    }
+    for name in changed {
+        let _ = write!(line, "; {name} changed since teardown");
+    }
+    Ok(Some((ok, line)))
 }
 
 /// One line describing a chain's admission manifest, if it records one.
@@ -1867,7 +2223,18 @@ pub fn session_enforcement_state(
     // seal.
     let (records, status) = read_verified_prefix(&audit, &key)
         .map_err(|error| CliError::new(format!("{}: {error}", audit.display())))?;
-    let state = session_state(&audit, status.sealed);
+    let teardown = teardown_summary(&records);
+    let receipt = receipt_summary(&audit, &records, status.seal_hash)?;
+    let recovery = recovery_summary(&audit);
+    let state = match (session_state(&audit, status.sealed), &teardown, &receipt) {
+        ("closed", Some((false, _)), _) | ("closed", _, Some((false, _))) => "closed-unclean",
+        ("interrupted", _, _) => match &recovery {
+            None => "stale",
+            Some((true, _)) => "recovered",
+            Some((false, _)) => "recovered-unclean",
+        },
+        (state, _, _) => state,
+    };
     let admitted = manifest_summary(&records);
     let record = records
         .iter()
@@ -1897,6 +2264,9 @@ pub fn session_enforcement_state(
             .collect(),
         state,
         admitted,
+        teardown: teardown.map(|(_, line)| line),
+        receipt: receipt.map(|(_, line)| line),
+        recovery: recovery.map(|(_, line)| line),
     })
 }
 
@@ -1940,7 +2310,7 @@ pub fn format_enforcement_report(report: &EnforcementReport) -> String {
     use std::fmt::Write as _;
 
     let mut output = format!(
-        "session: {}\nstate: {}\naudit: {}\nadmitted: {}\nphase: {} at {}\n",
+        "session: {}\nstate: {}\naudit: {}\nadmitted: {}\nteardown: {}\nreceipt: {}\nrecovery: {}\nphase: {} at {}\n",
         visible(&report.session_id),
         report.state,
         visible(&report.audit.display().to_string()),
@@ -1950,6 +2320,9 @@ pub fn format_enforcement_report(report: &EnforcementReport) -> String {
                 .as_deref()
                 .unwrap_or("no manifest (run predates admission records)")
         ),
+        visible(report.teardown.as_deref().unwrap_or("not recorded")),
+        visible(report.receipt.as_deref().unwrap_or("none")),
+        visible(report.recovery.as_deref().unwrap_or("none")),
         visible(&report.phase),
         report.timestamp_ms
     );
@@ -2239,6 +2612,7 @@ pub fn axes_report(sessions: &[String]) -> Result<String, CliError> {
     let mut judged = 0_usize;
     for (session, records) in sessions {
         let admitted = manifest_summary(&records);
+        let teardown = teardown_summary(&records);
         let group = manifest_group(&records);
         let mut actions = BTreeMap::<u64, BTreeMap<String, String>>::new();
         for record in records {
@@ -2259,6 +2633,9 @@ pub fn axes_report(sessions: &[String]) -> Result<String, CliError> {
         let _ = writeln!(output, "\n{}", visible(&session));
         if let Some(admitted) = admitted {
             let _ = writeln!(output, "  admitted: {}", visible(&admitted));
+        }
+        if let Some((_, teardown)) = teardown {
+            let _ = writeln!(output, "  teardown: {}", visible(&teardown));
         }
         summary.render(&mut output);
         let entry = groups.entry(group).or_default();
@@ -2499,6 +2876,9 @@ pub fn context_report(sessions: &[String]) -> Result<String, CliError> {
         let _ = writeln!(output, "\n{}", visible(&session));
         if let Some(admitted) = manifest_summary(&records) {
             let _ = writeln!(output, "  admitted: {}", visible(&admitted));
+        }
+        if let Some((_, teardown)) = teardown_summary(&records) {
+            let _ = writeln!(output, "  teardown: {}", visible(&teardown));
         }
         summary.render(&mut output);
     }
@@ -2863,6 +3243,9 @@ pub fn start_persistent_runtime(runtime: &Path, request: &RunRequest) -> Result<
             .env("KEEL_TERMINAL_ROWS", rows)
             .env("KEEL_TERMINAL_COLUMNS", columns);
     }
+    if let Some(hours) = request.idle_timeout_hours {
+        command.env("KEEL_IDLE_TIMEOUT_SECS", (hours * 3600).to_string());
+    }
     let child = command
         .arg("serve")
         .arg("--request")
@@ -2947,6 +3330,20 @@ pub fn write_runtime_request_in(
     directory: &Path,
 ) -> Result<PathBuf, CliError> {
     fs::create_dir_all(directory).map_err(|error| CliError::new(error.to_string()))?;
+    let mut request = request.clone();
+    if let Some(schemas) = &request.schemas {
+        // The bundle is copied into the session, where trusted admission
+        // reads it, and pinned by hash in the request it checks it against.
+        let bytes = fs::read(schemas).map_err(|error| {
+            CliError::new(format!("cannot read {}: {error}", schemas.display()))
+        })?;
+        let extraction = directory.join("extraction");
+        fs::create_dir_all(&extraction).map_err(|error| CliError::new(error.to_string()))?;
+        fs::write(extraction.join("schemas.json"), &bytes)
+            .map_err(|error| CliError::new(error.to_string()))?;
+        request.extraction_schemas_hash = Some(keel_compile::extraction_bundle_hash(&bytes));
+    }
+    let request = &request;
     let path = directory.join(format!("run-request-{}.json", std::process::id()));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -2971,7 +3368,7 @@ pub fn write_runtime_request_in(
 /// Returns concise command help.
 #[must_use]
 pub const fn help() -> &'static str {
-    "usage:\n  keel setup\n  keel doctor\n  keel mux [--workspace PATH] [RUN_OPTIONS] [-- CLAUDE_ARGS...]\n  keel run [--isolation vm|vm-v8|v8-sandboxed] [--provenance floor|gate-context] [--cpus N] [--memory GIB] [--reuse-connections] [--keep-alive] [--allow CAPABILITY] [--policy POLICY.json] [--continue SESSION] [--model MODEL] [--auth api-key|bedrock|openrouter] [--profile triage --scope RULE|--scope-file FILE|--report REPORT [--exclude RULE]] [--model-token-budget N] [--model-cost-budget USD] HARNESS [ARGS...]\n  keel policy compile POLICY.md --output DRAFT.json [--translation RESULT.json]\n  keel policy compile --text TEXT --output DRAFT.json [--translation RESULT.json]\n  keel policy accept DRAFT.json --output POLICY.json\n  keel policy show POLICY.json\n  keel policy diff OLD.json NEW.json\n  keel attach SESSION\n  keel stop SESSION\n  keel status SESSION [--audit AUDIT.ndjson]\n  keel audit verify AUDIT.ndjson RUN_KEY_FILE\n  keel report AUDIT.ndjson RUN_KEY_FILE [AUDIT.ndjson RUN_KEY_FILE ...]\n  keel report --axes [SESSION ...]\n  keel report --context [SESSION ...]\n  keel floor show SESSION [--state FLOOR.json]\n  keel floor lift SESSION [RANK]\n\ncapabilities:\n  egress:HOST\n  push:branch\n  push:ref:refs/heads/PATTERN\n  pr:create\n  pr:target:BRANCH\n  github:read-private-issues\n  deny:force-push\n  isolation:v8-sandboxed\n  workspace:public\n"
+    "usage:\n  keel setup\n  keel doctor\n  keel mux [--workspace PATH] [RUN_OPTIONS] [-- CLAUDE_ARGS...]\n  keel run [--isolation vm|vm-v8|v8-sandboxed] [--provenance floor|gate-context] [--cpus N] [--memory GIB] [--reuse-connections] [--record-targets] [--ephemeral-workspace] [--schemas BUNDLE.json] [--keep-alive] [--idle-timeout HOURS] [--allow CAPABILITY] [--policy POLICY.json] [--continue SESSION] [--model MODEL] [--auth api-key|bedrock|openrouter] [--profile scoped --scope RULE|none|--scope-file FILE|--report REPORT [--exclude RULE]] [--model-token-budget N] [--model-cost-budget USD] HARNESS [ARGS...]\n  keel policy compile POLICY.md --output DRAFT.json [--translation RESULT.json]\n  keel policy compile --text TEXT --output DRAFT.json [--translation RESULT.json]\n  keel policy accept DRAFT.json --output POLICY.json\n  keel policy show POLICY.json\n  keel policy diff OLD.json NEW.json\n  keel attach SESSION\n  keel stop SESSION\n  keel recover SESSION | --all\n  keel status SESSION [--audit AUDIT.ndjson]\n  keel audit verify AUDIT.ndjson RUN_KEY_FILE\n  keel report AUDIT.ndjson RUN_KEY_FILE [AUDIT.ndjson RUN_KEY_FILE ...]\n  keel report --axes [SESSION ...]\n  keel report --context [SESSION ...]\n  keel export SESSION [SESSION ...] [--out FILE] [--otlp URL]\n  keel floor show SESSION [--state FLOOR.json]\n  keel floor lift SESSION [RANK]\n\ncapabilities:\n  egress:HOST\n  push:branch\n  push:ref:refs/heads/PATTERN\n  pr:create\n  pr:target:BRANCH\n  github:read-private-issues\n  deny:force-push\n  isolation:v8-sandboxed\n  workspace:public\n  workspace:own\n"
 }
 
 #[cfg(test)]
@@ -3296,6 +3693,27 @@ mod tests {
     }
 
     #[test]
+    fn mux_accepts_scope_options_with_or_without_the_harness_name() {
+        for trailing in [&[][..], &["claude"][..], &["claude", "--", "--verbose"][..]] {
+            let mut arguments = vec!["mux", "--profile", "scoped", "--scope", "*.target.example"];
+            arguments.extend_from_slice(trailing);
+            let Command::Run(request) = parse_args(args(&arguments)).unwrap() else {
+                panic!("expected mux run request");
+            };
+            assert_eq!(request.harness, "claude");
+            assert_eq!(request.scoped.profile.as_deref(), Some("scoped"));
+            assert_eq!(request.scoped.scope, ["*.target.example"]);
+            let expected: &[&str] = if trailing.len() == 3 {
+                &["--verbose"]
+            } else {
+                &[]
+            };
+            assert_eq!(request.harness_args, expected);
+        }
+        assert!(parse_args(args(&["mux", "codex"])).is_err());
+    }
+
+    #[test]
     fn managed_workspace_is_initialized_and_existing_paths_resolve_to_the_worktree() {
         let root = std::env::temp_dir().join(format!(
             "keel-managed-workspace-{}-{}",
@@ -3381,11 +3799,11 @@ mod tests {
     }
 
     #[test]
-    fn triage_runs_declare_scope_or_propose_it_from_the_report() {
+    fn scoped_runs_declare_scope_or_propose_it_from_the_report() {
         let Command::Run(request) = parse_args(args(&[
             "run",
             "--profile",
-            "triage",
+            "scoped",
             "--scope",
             "*.target.example",
             "--exclude",
@@ -3395,15 +3813,15 @@ mod tests {
         .unwrap() else {
             panic!("expected run request");
         };
-        assert_eq!(request.triage.profile.as_deref(), Some("triage"));
-        assert_eq!(request.triage.scope, ["*.target.example"]);
-        assert_eq!(request.triage.exclude, ["admin.target.example"]);
+        assert_eq!(request.scoped.profile.as_deref(), Some("scoped"));
+        assert_eq!(request.scoped.scope, ["*.target.example"]);
+        assert_eq!(request.scoped.exclude, ["admin.target.example"]);
         let wire = serde_json::to_value(&request).unwrap();
-        assert_eq!(wire["profile"], "triage");
+        assert_eq!(wire["profile"], "scoped");
         assert_eq!(wire["scope"][0], "*.target.example");
 
         let directory =
-            std::env::temp_dir().join(format!("keel-triage-cli-{}", std::process::id()));
+            std::env::temp_dir().join(format!("keel-scoped-cli-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let report = directory.join("report.md");
         std::fs::write(
@@ -3419,7 +3837,7 @@ mod tests {
         )
         .unwrap();
         let parse = |extra: &[&str]| {
-            let mut arguments = vec!["run", "--profile", "triage"];
+            let mut arguments = vec!["run", "--profile", "scoped"];
             arguments.extend_from_slice(extra);
             arguments.push("claude");
             parse_args(args(&arguments))
@@ -3428,7 +3846,7 @@ mod tests {
             panic!("expected run request");
         };
         assert_eq!(
-            proposed.triage.scope,
+            proposed.scoped.scope,
             [
                 "api.target.example:8443",
                 "app.target.example",
@@ -3438,11 +3856,30 @@ mod tests {
         let Command::Run(filed) = parse(&["--scope-file", rules.to_str().unwrap()]).unwrap() else {
             panic!("expected run request");
         };
-        assert_eq!(filed.triage.scope, ["*.target.example"]);
-        assert_eq!(filed.triage.exclude, ["admin.target.example"]);
-        assert!(parse(&[]).is_err(), "triage needs a scope");
+        assert_eq!(filed.scoped.scope, ["*.target.example"]);
+        assert_eq!(filed.scoped.exclude, ["admin.target.example"]);
+        assert!(parse(&[]).is_err(), "a scoped run needs a scope");
         assert!(parse_args(args(&["run", "--scope", "a.example", "claude"])).is_err());
         assert!(parse_args(args(&["run", "--profile", "recon", "claude"])).is_err());
+        let Command::Run(offline) = parse(&["--scope", "none"]).unwrap() else {
+            panic!("expected run request");
+        };
+        assert_eq!(offline.scoped.scope, ["none"]);
+        let Command::Run(recorded) = parse(&["--scope", "none", "--record-targets"]).unwrap()
+        else {
+            panic!("expected run request");
+        };
+        assert!(recorded.record_targets);
+        assert!(!offline.record_targets);
+        let renamed = parse_args(args(&[
+            "run",
+            "--profile",
+            "triage",
+            "--scope",
+            "a.example",
+            "claude",
+        ]));
+        assert!(renamed.is_err_and(|error| error.to_string().contains("--profile scoped")));
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3744,8 +4181,15 @@ mod tests {
                 session_id: "session-1".to_owned()
             }
         );
+        assert_eq!(
+            parse_args(args(&["recover", "session-1"])).unwrap(),
+            Command::Recover {
+                session_id: "session-1".to_owned()
+            }
+        );
         assert!(parse_args(args(&["attach", "../escape"])).is_err());
         assert!(parse_args(args(&["stop"])).is_err());
+        assert!(parse_args(args(&["recover", "../escape"])).is_err());
     }
 
     #[test]
@@ -3888,6 +4332,27 @@ mod tests {
     }
 
     #[test]
+    fn idle_timeout_is_bounded_hours() {
+        let Command::Run(request) = parse_args(args(&[
+            "run",
+            "--keep-alive",
+            "--idle-timeout",
+            "4",
+            "claude",
+        ]))
+        .unwrap() else {
+            panic!("expected run request");
+        };
+        assert_eq!(request.idle_timeout_hours, Some(4));
+        let Command::Run(request) = parse_args(args(&["run", "claude"])).unwrap() else {
+            panic!("expected run request");
+        };
+        assert_eq!(request.idle_timeout_hours, None);
+        assert!(parse_args(args(&["run", "--idle-timeout", "721", "claude"])).is_err());
+        assert!(parse_args(args(&["run", "--idle-timeout", "soon", "claude"])).is_err());
+    }
+
+    #[test]
     fn parses_only_valid_status_requests() {
         assert_eq!(
             parse_args(args(&["status", "session-1"])).unwrap(),
@@ -3932,6 +4397,171 @@ mod tests {
         let contents = fs::read_to_string(&audit).unwrap();
         fs::write(&audit, contents.replace("absent", "active")).unwrap();
         assert!(super::session_enforcement_state("session-1", Some(&audit)).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The supervisor's receipt is accepted only when the key the chain's
+    /// teardown record names signed it for this chain's seal, and the files
+    /// it kept still match.
+    #[test]
+    fn status_verifies_the_supervisor_receipt_against_its_chain() {
+        use std::fmt::Write as _;
+
+        let root = scratch_dir("receipt");
+        let supervisor = RunKey::new([5; 32]);
+        let audit = root.join("audit-1-b-1.ndjson");
+        let run_key = RunKey::new([4; 32]);
+        run_key.write_new(&audit.with_extension("key")).unwrap();
+        let writer = AuditWriter::spawn(
+            &audit,
+            "session-1",
+            run_key,
+            Redactor::new(Vec::<String>::new()).unwrap(),
+        )
+        .unwrap();
+        for (event, fields) in [
+            (
+                "kernel.enforcement-state",
+                vec![("phase", "shutdown".to_owned())],
+            ),
+            (
+                "kernel.run-teardown",
+                vec![
+                    ("ok", "true".to_owned()),
+                    ("stop_reason", "shutdown".to_owned()),
+                    ("supervisor_key", supervisor.public_hex()),
+                ],
+            ),
+        ] {
+            writer
+                .record(AuditPayload {
+                    timestamp_ms: 1,
+                    event: event.to_owned(),
+                    action_id: None,
+                    fields: fields
+                        .into_iter()
+                        .map(|(key, value)| (key.to_owned(), value))
+                        .collect(),
+                })
+                .unwrap();
+        }
+        writer.shutdown().unwrap();
+        fs::write(root.join("floor.json"), "{}").unwrap();
+        let seal = keel_audit::inspect_file(&audit, &RunKey::new([4; 32]))
+            .unwrap()
+            .seal_hash
+            .unwrap();
+        let mut receipt = keel_audit::TeardownReceipt {
+            version: 1,
+            run_id: "session-1".to_owned(),
+            chain: "audit-1-b-1.ndjson".to_owned(),
+            chain_tip: seal.iter().fold(String::new(), |mut text, byte| {
+                let _ = write!(text, "{byte:02x}");
+                text
+            }),
+            stop_reason: "stop".to_owned(),
+            escalated: false,
+            started_ms: 1,
+            finished_ms: 2,
+            checks: BTreeMap::from([("0.attach-socket".to_owned(), "ok: attach.sock".to_owned())]),
+            retained: BTreeMap::from([(
+                "floor.json".to_owned(),
+                "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a".to_owned(),
+            )]),
+            ok: false,
+            signature: String::new(),
+        };
+        receipt.sign(&supervisor).unwrap();
+        let receipt_path = audit.with_extension("receipt.json");
+        fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+
+        let report = super::session_enforcement_state("session-1", Some(&audit)).unwrap();
+        assert_eq!(report.state, "closed");
+        assert!(format_enforcement_report(&report).contains("receipt: verified after stop\n"));
+
+        fs::write(root.join("floor.json"), "{\"floor\":0}").unwrap();
+        let report = super::session_enforcement_state("session-1", Some(&audit)).unwrap();
+        assert_eq!(report.state, "closed-unclean");
+        assert_eq!(
+            report.receipt.as_deref(),
+            Some("verified after stop; floor.json changed since teardown")
+        );
+
+        receipt.stop_reason = "exited".to_owned();
+        fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        assert!(super::session_enforcement_state("session-1", Some(&audit)).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A crashed chain is `stale` until `keel recover` records what it
+    /// released, and `recovered-unclean` if anything stayed behind.
+    #[test]
+    fn a_crashed_chain_is_stale_until_recovered() {
+        let root = scratch_dir("stale");
+        let audit = write_enforcement_chain(&root, "audit-4194303-a-1");
+        let text = fs::read_to_string(&audit).unwrap();
+        let lines = text.lines().collect::<Vec<_>>();
+        fs::write(&audit, format!("{}\n", lines[..lines.len() - 1].join("\n"))).unwrap();
+
+        let report = super::session_enforcement_state("session-1", Some(&audit)).unwrap();
+        assert_eq!(report.state, "stale");
+        assert!(format_enforcement_report(&report).contains("recovery: none\n"));
+
+        let record = audit.with_extension("recovery.json");
+        fs::write(
+            &record,
+            r#"{"version":1,"chain":"audit-4194303-a-1.ndjson","records":2,"recovered_ms":9,"checks":{"0.scratch":"ok: /tmp/x"},"ok":true}"#,
+        )
+        .unwrap();
+        let report = super::session_enforcement_state("session-1", Some(&audit)).unwrap();
+        assert_eq!(report.state, "recovered");
+        assert_eq!(
+            report.recovery.as_deref(),
+            Some("released 1 resource(s) at 9 (unsigned; observed at recovery)")
+        );
+
+        fs::write(
+            &record,
+            r#"{"version":1,"chain":"audit-4194303-a-1.ndjson","records":2,"recovered_ms":9,"checks":{"0.backend-group":"unmet: still has members: pgid 7"},"ok":false}"#,
+        )
+        .unwrap();
+        let report = super::session_enforcement_state("session-1", Some(&audit)).unwrap();
+        assert_eq!(report.state, "recovered-unclean");
+        assert!(
+            report
+                .recovery
+                .unwrap()
+                .ends_with("; backend-group unmet: still has members: pgid 7")
+        );
+
+        fs::write(&record, r#"{"chain":"audit-1-other.ndjson"}"#).unwrap();
+        let report = super::session_enforcement_state("session-1", Some(&audit)).unwrap();
+        assert_eq!(
+            report.state, "recovered-unclean",
+            "a record for another chain does not count"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Automatic recovery runs on every `keel run`, so its cheap pre-filter
+    /// must skip sealed, recovered, receipted, and recently written chains.
+    #[test]
+    fn the_stale_prefilter_skips_what_needs_no_recovery() {
+        let root = scratch_dir("prefilter");
+        let audit = write_enforcement_chain(&root, "audit-4194303-a-1");
+        let none = std::time::Duration::ZERO;
+        assert!(!super::may_be_stale(&audit, none), "sealed");
+
+        let text = fs::read_to_string(&audit).unwrap();
+        let lines = text.lines().collect::<Vec<_>>();
+        fs::write(&audit, format!("{}\n", lines[..lines.len() - 1].join("\n"))).unwrap();
+        assert!(super::may_be_stale(&audit, none));
+        assert!(
+            !super::may_be_stale(&audit, std::time::Duration::from_hours(1)),
+            "written within the grace period"
+        );
+        fs::write(audit.with_extension("recovery.json"), "{}").unwrap();
+        assert!(!super::may_be_stale(&audit, none), "already recovered");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4175,6 +4805,40 @@ mod axes_tests {
         assert_eq!(summary.blocks["assistant, not emitted by the model"], 1);
         assert_eq!(summary.blocks["tool result, bound to a model tool call"], 1);
         assert_eq!(summary.blocks["system"], 2);
+    }
+
+    #[test]
+    fn teardown_records_are_summarized_with_unmet_postconditions() {
+        let mut record = context_record("request", "", "[]");
+        record.payload.event = "kernel.run-teardown".to_owned();
+        record.payload.fields = fields(&[
+            ("ok", "false"),
+            ("stop_reason", "shutdown"),
+            ("escalated", "true"),
+            ("check.0.backend-group", "ok: pgid 42"),
+            (
+                "check.1.scratch",
+                "unmet: still present: /tmp/keel-runtime-1-0",
+            ),
+        ]);
+        assert_eq!(
+            super::teardown_summary(&[record.clone()]),
+            Some((
+                false,
+                "incomplete after shutdown, backend needed SIGKILL; scratch unmet: still present: /tmp/keel-runtime-1-0"
+                    .to_owned()
+            ))
+        );
+        record.payload.fields = fields(&[
+            ("ok", "true"),
+            ("stop_reason", "exited"),
+            ("escalated", "false"),
+        ]);
+        assert_eq!(
+            super::teardown_summary(&[record]),
+            Some((true, "verified after exited".to_owned()))
+        );
+        assert_eq!(super::teardown_summary(&[]), None);
     }
 
     #[test]

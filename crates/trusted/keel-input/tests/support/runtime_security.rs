@@ -178,7 +178,7 @@ fn runtime_sandbox_allows_expected_metadata_and_denies_outside_reads() {
         &workspace,
         &components,
         Path::new("/dev/null"),
-        &scratch,
+        [&scratch, Path::new("/dev/null")],
         Path::new("/tmp/keel-test-broker.sock"),
         Some(18_081),
     );
@@ -231,6 +231,51 @@ fn runtime_sandbox_allows_expected_metadata_and_denies_outside_reads() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn runtime_sandbox_writes_only_its_guest_events_file_in_the_session() {
+    let _sandbox_guard = SANDBOX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let scratch = trusted_scratch("sandbox-guest-events-test").expect("scratch");
+    let session = trusted_scratch("sandbox-session-test").expect("session");
+    let guest_events = session.join("guest-1-0.ndjson");
+    let audit = session.join("audit-1-0.ndjson");
+    let workspace = std::env::current_dir()
+        .expect("workspace")
+        .canonicalize()
+        .expect("canonical workspace");
+    let profile = runtime_sandbox_profile(
+        [
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/touch"),
+            Path::new("/bin/cat"),
+            Path::new("/nonexistent/keel-git-helpers"),
+        ],
+        Path::new("/nonexistent/keel-git-data"),
+        &workspace,
+        Path::new("/nonexistent/keel-components"),
+        Path::new("/dev/null"),
+        [&scratch, &guest_events],
+        Path::new("/tmp/keel-test-broker.sock"),
+        None,
+    );
+    let touch = |path: &Path| {
+        Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", &profile])
+            .arg("/usr/bin/touch")
+            .arg(path)
+            .status()
+            .expect("sandbox-exec")
+            .success()
+    };
+    assert!(touch(&guest_events), "the guest-events file is writable");
+    assert!(!touch(&audit), "no other session file is writable");
+    assert!(!audit.exists());
+    fs::remove_dir_all(session).expect("remove session");
+    fs::remove_dir_all(scratch).expect("remove scratch");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn runtime_sandbox_cannot_bind_ip_listeners() {
     let _sandbox_guard = SANDBOX_TEST_LOCK
         .lock()
@@ -250,7 +295,7 @@ fn runtime_sandbox_cannot_bind_ip_listeners() {
         &std::env::current_dir().expect("workspace"),
         Path::new("/usr/bin"),
         Path::new("/dev/null"),
-        &scratch,
+        [&scratch, Path::new("/dev/null")],
         Path::new("/tmp/keel-test-broker.sock"),
         Some(proxy_port),
     );
@@ -303,7 +348,7 @@ fn runtime_sandbox_connects_only_to_the_assigned_v8_proxy_port() {
         &std::env::current_dir().expect("workspace"),
         Path::new("/usr/bin"),
         Path::new("/dev/null"),
-        &scratch,
+        [&scratch, Path::new("/dev/null")],
         Path::new("/tmp/keel-test-broker.sock"),
         Some(allowed_port),
     );
@@ -360,7 +405,7 @@ fn runtime_sandbox_connects_only_to_the_assigned_broker_socket() {
         &std::env::current_dir().expect("workspace"),
         Path::new("/usr/bin"),
         Path::new("/dev/null"),
-        &scratch,
+        [&scratch, Path::new("/dev/null")],
         &broker,
         Some(18_081),
     );

@@ -79,10 +79,11 @@ An untrusted component can still contain important correctness logic. “Untrust
 
 ## 4. Trusted crates
 
-Keel keeps the hand-written first-party trusted Rust surface small and enforces a
-hard 16,000-line aggregate ceiling in CI. Per-crate limits are review ratchets:
-moving or adding capacity requires a recorded decision. The `tokei` count includes
-inline tests and trusted binaries as well as production library code.
+Keel keeps the hand-written first-party trusted Rust surface small. CI holds each
+trusted crate to a line ratchet: growing a crate past its number fails until the
+number is raised, with the reason in the commit. The trusted total, about 15,300
+lines, is reported rather than capped. The `tokei` count includes inline tests and
+trusted binaries as well as production library code.
 
 | Crate | Responsibility |
 | --- | --- |
@@ -93,7 +94,7 @@ inline tests and trusted binaries as well as production library code.
 | keel-secrets | Secret handles, sentinel replacement, scoped credential use, zeroization |
 | keel-input | Secure-attention handling and trusted approval interaction |
 
-The ceiling is a reviewability mechanism, not evidence that these crates are bug-free. Dependency versions are pinned and CI checks the intended dependency boundary.
+The ratchet is a reviewability mechanism, not evidence that these crates are bug-free. Dependency versions are pinned and CI checks the intended dependency boundary.
 
 ## 5. Untrusted crates
 
@@ -163,6 +164,11 @@ sandbox (DECISIONS D35), proxies every request through the guest egress relay,
 and has its background calls to Google services disabled. Screenshots,
 downloads, and HAR files go to a self-ignoring `.keel-browser/` directory in
 the workspace.
+
+The workspace is shared over virtiofs read-write by default. For detonating
+untrusted code, `--ephemeral-workspace` shares it read-only and layers a tmpfs
+overlay inside the guest, so the workload reads the files but every write stays
+in guest RAM and never reaches the host; the run manifest records the choice.
 
 Inside the guest, a second confinement layer wraps everything the operator's
 terminal runs: tmux, the harness, and every tool it starts. Virtiofs presents
@@ -404,7 +410,7 @@ and continuity evidence, but the session directory is unsigned and untrusted;
 a new or continued run never imports that file as authorization and begins
 again with the rank-0 direct-workspace observation.
 
-Keel also records **payload provenance** in shadow. At admission, trusted
+Keel also enforces **payload provenance** (PLAN D81). At admission, trusted
 code indexes the committed `HEAD` tree with the hardened host Git as winnowed
 fingerprints: text blobs are private and credential-shaped paths secret,
 unless the operator declares `workspace:public`. Every decrypted non-model
@@ -412,16 +418,24 @@ request target and body is scanned against that index and judged against its
 destination's clearance. The workspace's own GitHub origin may receive
 private content, the model endpoint anything, and every other host only
 public content. The resulting `FlowVerdict` is stamped with the action and
-audited as `flow`; no decision reads it yet. It detects verbatim and
-escape-encoded copies, not paraphrase or compression.
+audited as `flow`. A leak above clearance adds the `payload:flow` gate reason,
+and admitted secret content is denied outright (`deny:payload-secret`). It
+detects verbatim and escape-encoded copies, not paraphrase or compression.
 
-The integrity direction is recorded the same way. After each complete model
-response, trusted code records the line fingerprints of every string the
-model placed in a tool call. For a push that changes a dependency manifest or
-CI configuration, or updates the default branch, `keel-gitd` sends the diff,
-and the kernel counts added lines the model never wrote. The resulting
-`IntegrityVerdict` is stamped, audited as `integrity`, and shown at the gate.
-The diff is computed by untrusted `keel-gitd`, as its push flags already are.
+The integrity direction is checked on pushes, which the kernel derives
+itself. `keel-gitd` hands over the exact receive-pack body; the kernel binds
+the push permit to that body's digest, indexes the pack with the hardened host
+Git in a fresh repository whose only other objects are a private bare copy of
+the admitted branch in the broker's own directory, and reads only objects the
+copy lacks. The body's own ref commands replace the relay's list, and the
+default-branch and protected-path flags can only be raised. On the default
+branch every pushed file is protected; elsewhere manifests and CI paths are. A
+line there that is neither committed at the admitted `HEAD` nor written by the
+model in a tool call is unaccounted, and adds `payload:integrity`; a pack that
+does not resolve against the private copy is uninspectable and adds it too.
+Pushed blobs are also judged for flow against the remote. A payload violation
+on an action outside the envelope at a floor below 2 requires the typed
+challenge.
 
 Provenance is conservative metadata, not semantic understanding. Git author
 text is not authentication. The scalar is session-wide and cannot tell when
@@ -512,15 +526,27 @@ The verifier reports a sealed complete stream separately from an authenticated
 but unsealed prefix, and names the retired signature format instead of treating
 it as generic corruption. Gate events state whether a trusted operator prompt
 was actually presented; deny-only decisions are not counted as prompt fatigue.
-Denial events also record the typed origin, opaque canonical-scope digest,
+An action commits to its exact target with a hash by default; a run admitted
+with `--record-targets` also writes each network action's method, host, port,
+and query-free path in plain text, through the same redactor, for incident
+response. Denial events also record the typed origin, opaque canonical-scope digest,
 whether the denial counted toward repeated-behavior review, and the recent
 same-scope count. Model reservation events name their run-local reservation and
 terminal outcome (`released-unsent`, `settled-actual`, `committed-observed`,
 `committed-conservative`, or `overrun`) without recording response content.
 The audit design provides local tamper evidence relative to the key and verifier.
 It is not remote attestation, cannot prove that a compromised host recorded
-reality, and does not yet provide fully verified crash recovery and teardown
-receipts.
+reality. Teardown receipts cover persistent sessions whose supervisor
+survives; crash recovery records are unsigned observations.
+
+In a microVM run, the guest's PID 1 also streams its own account of the run
+over a dedicated vsock port: process execs and exits from the kernel's
+process-events connector, and file writes from fanotify on the workload's
+writable mounts. The VZ backend stamps each bounded, validated line with host
+time and appends it to `guest-*.ndjson`, the one session file the trusted
+launcher lets the untrusted runtime write. These events are guest claims: they
+are outside the audit chain and never reach a decision. `keel export` joins
+them with the authenticated audit chain into OpenTelemetry traces.
 
 Session state also records enforcement boundaries, provenance floors, budgets,
 runtime identity, and continuation metadata. Because the session directory is
@@ -540,12 +566,13 @@ The current lifecycle is:
 4. Create session state, audit material, relays, and the isolation boundary.
 5. Run the workload while mediating protected actions.
 6. Detach, continue, or request cooperative stop according to mux and run
-   options. A persistent stop waits for broker shutdown and reports a forced
+   options. A persistent stop returns only after the supervisor's signed
+   teardown receipt is durable, and reports an unmet check or a forced
    fallback as failure.
 7. Close relays, write the terminal audit seal, finalize local evidence, and
    report audit locations.
 
-A canonical pre-boot admission manifest and cryptographically verified teardown receipt are planned, not current guarantees.
+Before step 5, trusted `keel-input` records `kernel.run-admitted`, a canonical manifest of what the run was admitted with, and refuses the run if it cannot ([`admission_manifest.rs`](../crates/trusted/keel-input/tests/admission_manifest.rs)). The manifest's artifact digests are evidence rather than enforcement. For a persistent session, the supervisor signs a teardown receipt after the seal with a key the chain's `kernel.run-teardown` record names, binding the seal digest, its serve-side checks, and the digests of `floor.json` and `attach.exit` ([`serve_receipt.rs`](../crates/trusted/keel-input/tests/support/serve_receipt.rs)). Each run also records the host resources it creates in the chain, so `keel recover` can release exactly what a crashed run's authenticated record names and write an unsigned recovery record ([`crash_recovery.rs`](../crates/trusted/keel-input/tests/support/crash_recovery.rs)).
 
 ## 14. Source layout
 
@@ -576,7 +603,22 @@ Top-level planning records preserve project history. Local .phase0 and .phase1 d
 
 ## 15. Invariants and verification
 
-Repository checks enforce the intended crate partition, trusted-code ceiling, dependency restrictions, forbidden patterns, and scenario tests. The CI suite currently groups these as invariants I1 through I12.
+Repository checks in [`ci/check_invariants.py`](../ci/check_invariants.py) enforce the intended crate partition, trusted-code ratchets, dependency restrictions, and forbidden patterns:
+
+| Invariant | Checks |
+| --- | --- |
+| I1 | Each trusted crate's first-party Rust stays within its line ratchet; the total is reported |
+| I2 | Every trusted crate root forbids unsafe code |
+| I3 | Trusted crates do not depend on untrusted crates |
+| I4 | Trusted direct dependencies match the per-crate allowlist in [`trusted-dependencies.toml`](../ci/trusted-dependencies.toml), and trusted code has no runtime-loading markers |
+| I5 | `Stamped` has private fields and a compile-fail construction test |
+| I6 | Only the offline compiler carries policy oracles; no untrusted live decision path exists |
+| I7 | Credential and signing-key types are opaque, non-serializable, and zeroized |
+| I8 | Startup-validated channels require exactly one declared gate class |
+| I9 | Only `keel-input` owns operator stdin; the renderer rejects TTY inheritance |
+| I10 | Policy bundles require matching caller, manifest, and content hashes |
+| I11 | Every protected kernel state is rejected before policy and gate evaluation |
+| I12 | Production Git invocations use hardened, non-interactive configuration |
 
 Run:
 
@@ -591,24 +633,31 @@ These checks are necessary evidence for the architecture. They are not a formal 
 
 ## 16. Implemented versus planned
 
-Implemented today:
+Implemented today, with the tests that exercise each item. The headless end-to-end suite in [`ci/e2e.py`](../ci/e2e.py) and the manual runbook in [E2E](E2E.md) cover the same paths against a real VM.
 
-- VZ microVM execution for Claude and V8 workloads;
-- lower-assurance host V8 sandbox with an explicit grant;
-- trusted action stamping and structural denials;
-- Cedar policy enforcement;
-- provenance floors and inherited write labels;
-- trusted approvals through secure attention;
-- request, rate, cost, and loop constraints;
-- credential-aware Anthropic and Bedrock relays;
-- authenticated hash-chained audit records;
-- persistent mux sessions;
-- differential natural-language policy compilation and artifact acceptance.
+| Capability | Evidence |
+| --- | --- |
+| VZ microVM execution for Claude and V8 workloads, with no ordinary guest networking | `hostile_curl_requests_cross_the_runtime_and_fail_closed` in [`keel-vz-spike.rs`](../crates/untrusted/keel-isolate/src/bin/keel-vz-spike.rs) |
+| Second confinement layer inside the guest: no capabilities, Landlock, seccomp, bounded cgroup | `confinement_preflight_requires_every_layer` in [`keel-mcp`](../crates/untrusted/keel-mcp/src/lib.rs) |
+| Lower-assurance host V8 sandbox with an explicit grant | [`v8_runtime.rs`](../crates/untrusted/keel-isolate/tests/v8_runtime.rs), [`runtime_security.rs`](../crates/trusted/keel-input/tests/support/runtime_security.rs) |
+| Trusted action stamping and structural denials | I5 and I11; the [kernel unit suite](../crates/trusted/keel-kernel/tests/support/unit.rs) |
+| Cedar policy enforcement | [`primary_scenario.rs`](../crates/trusted/keel-policy/tests/primary_scenario.rs), [`stateful_rules.rs`](../crates/trusted/keel-policy/tests/stateful_rules.rs), [`runtime_broker.rs`](../crates/trusted/keel-input/tests/runtime_broker.rs) |
+| Provenance floors and inherited write labels | [`provenance_gate.rs`](../crates/trusted/keel-kernel/tests/provenance_gate.rs), [`push_provenance.rs`](../crates/trusted/keel-kernel/tests/push_provenance.rs), [`write_inheritance.rs`](../crates/trusted/keel-provenance/tests/write_inheritance.rs) |
+| Guest process origin on MCP connections and pushes | `a_pull_request_carries_the_guest_origin_of_its_mcp_connection` in [`keel-mcp`](../crates/untrusted/keel-mcp/src/lib.rs) |
+| Trusted approvals through secure attention, with exact `A` and bounded `G` | [`secure_attention.rs`](../crates/trusted/keel-input/tests/secure_attention.rs), [`egress_grant_scope.rs`](../crates/trusted/keel-kernel/tests/egress_grant_scope.rs) |
+| Request, rate, cost, and loop constraints | [`model_budget.rs`](../crates/trusted/keel-kernel/tests/model_budget.rs), [`model_lifecycle.rs`](../crates/trusted/keel-secrets/tests/support/model_lifecycle.rs) |
+| Credential-aware Anthropic, Bedrock, and OpenRouter relays | [`credential_scope.rs`](../crates/trusted/keel-secrets/tests/support/credential_scope.rs), [`openrouter.rs`](../crates/trusted/keel-secrets/tests/openrouter.rs), [`model_auth.rs`](../crates/trusted/keel-secrets/tests/model_auth.rs) |
+| Operator-declared run scope (`--profile scoped`), including `--scope none` | [`scope.rs`](../crates/trusted/keel-provenance/tests/scope.rs), [`scoped_run.rs`](../crates/trusted/keel-input/tests/scoped_run.rs), [`scoped_provider.rs`](../crates/trusted/keel-input/tests/scoped_provider.rs) |
+| Canonical admission manifest recorded before the workload starts | [`admission_manifest.rs`](../crates/trusted/keel-input/tests/admission_manifest.rs) |
+| Authenticated hash-chained audit records with a terminal seal | [`verification_status.rs`](../crates/trusted/keel-audit/tests/verification_status.rs) and the [`keel-audit`](../crates/trusted/keel-audit/src/lib.rs) unit tests |
+| Checked teardown, signed stop receipt, and crash recovery from in-chain resource records | [`teardown.rs`](../crates/trusted/keel-input/tests/support/teardown.rs), [`run_teardown.rs`](../crates/trusted/keel-audit/tests/run_teardown.rs), [`serve_receipt.rs`](../crates/trusted/keel-input/tests/support/serve_receipt.rs), [`crash_recovery.rs`](../crates/trusted/keel-input/tests/support/crash_recovery.rs) |
+| Persistent mux sessions | [`mux_command.rs`](../crates/trusted/keel-input/tests/mux_command.rs), [`session_runtime.rs`](../crates/trusted/keel-input/tests/support/session_runtime.rs), [`session_status.rs`](../crates/trusted/keel-input/tests/session_status.rs) |
+| Differential natural-language policy compilation and artifact acceptance | `draft_is_differentially_verified_and_hash_bound` in [`keel-compile`](../crates/untrusted/keel-compile/src/policy.rs); I10 |
 
 Planned:
 
-- canonical pre-boot run admission;
-- verified teardown, crash recovery, and stale-session reconciliation;
+- enforcement from the admission manifest, such as staging admitted artifacts privately;
+- an opt-in launchd reaper, teardown receipts for foreground runs, and fault-injection tests for teardown and recovery;
 - Linux KVM and Cloud Hypervisor support;
 - a distributed evaluation and reinforcement-learning substrate;
 - stronger packaging, release reproducibility, and evaluation evidence.

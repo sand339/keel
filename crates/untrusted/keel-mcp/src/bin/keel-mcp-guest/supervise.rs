@@ -63,6 +63,7 @@ pub fn supervise(command: &[String]) -> ! {
     if let Err(error) = serve_attribution() {
         eprintln!("[keel-init] attribution service unavailable: {error}");
     }
+    super::observe::start();
     let status = Command::new(&command[0])
         .args(&command[1..])
         .spawn()
@@ -193,7 +194,7 @@ fn socket_owner(inode: &str) -> Option<u32> {
     })
 }
 
-fn parent_of(pid: u32) -> Option<u32> {
+pub fn parent_of(pid: u32) -> Option<u32> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // The command name may contain spaces and parentheses; fields resume
     // after the last closing parenthesis.
@@ -205,7 +206,7 @@ fn parent_of(pid: u32) -> Option<u32> {
         .ok()
 }
 
-fn describe(pid: u32) -> Process {
+pub fn describe(pid: u32) -> Process {
     let exe = fs::read_link(format!("/proc/{pid}/exe"))
         .map(|path| path.display().to_string())
         .unwrap_or_default();

@@ -18,7 +18,6 @@ Remaining deliverables:
 
 - decide the published history and authorship; the release tree itself has been scrubbed of personal and employer references;
 - make setup and doctor output actionable on a clean Apple silicon machine;
-- pin the guest's Alpine package set so the guest image is reproducible;
 - run the complete CI suite on the release commit, and repeat the secret, dependency, and license review there;
 - add a minimal end-to-end demonstration that produces verifiable audit evidence.
 
@@ -41,7 +40,7 @@ The admission record will bind the authority-bearing inputs before a workload st
 - provider, credential handle, destinations, and budgets;
 - provenance mode and starting floor.
 
-The teardown path will terminate the full run process group, close relays, reconcile stale sessions, preserve intended evidence, remove transient control material, and emit a durable receipt describing verified postconditions.
+Checked teardown (D71–D73), a signed supervisor receipt behind a two-stage `keel stop` (D74), and operator-invoked crash recovery from in-chain resource records (D75) are implemented. Detached sessions stop after an idle limit, and `keel run` and `keel attach` recover crashed sessions first (D76). What remains on the teardown side: an opt-in launchd reaper for hosts where Keel goes unused, receipts for foreground runs and for early-error exits, closing relays and dropping connection pools with recorded checks, zeroizing Keel-owned secret buffers, and fault-injection tests.
 
 Exit criteria:
 
@@ -179,6 +178,16 @@ The first increment, a shadow per-block digest log of every model request and
 response with `keel report --context` (D54), is implemented. It measures
 whether per-turn ranks would differ from the session floor before the larger
 trusted spend.
+
+**Revised order (D79).** A cheaper baseline comes first: an operator-declared
+workspace rank bound to the accepted `HEAD`, with re-acceptance when `HEAD`
+moves and an exact-`HEAD` workspace (W4a); payload checks moved to
+enforcement on a trusted push diff; restart with an operator-written handoff
+in place of taint decay; schema-bounded extraction for reading untrusted
+input without dropping the floor; and lockfile inheritance, `npm ci` first
+(W4b, built as D85). Per-turn provenance, and the exit criteria above, are then built only
+if they beat that baseline on real sessions; dropping them is an acceptable
+outcome. See the [design revision](design/guest-confinement-attribution-and-turn-provenance.md#80-w4a-and-w4b-a-declared-rank-floor-d79).
 
 ## Explicit non-goals
 

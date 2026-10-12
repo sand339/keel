@@ -332,6 +332,77 @@ own GitHub origin is cleared for private content and the model endpoint for
 everything. The field is recorded in shadow and blocks nothing; it detects
 verbatim copies, not paraphrased or re-encoded content.
 
+### Declare your own repository
+
+By default the workspace is rank 0, because the guest reads it directly, so
+the provenance floor sits at 0 and every rank-2 action escalates. For a
+repository you own and whose committed state you trust, declare it:
+
+~~~sh
+keel run --allow workspace:own claude
+~~~
+
+The trusted admission screen shows the `HEAD` it would accept and how it
+relates to the last one you accepted for this workspace: a first acceptance,
+unchanged, a number of new commits, or diverged history. Commit messages are
+not shown, because an earlier run may have written them; review new commits
+with Git before typing `APPROVE`. Input typed before the screen appears is
+discarded.
+
+The guest then works in a clean clone of that `HEAD` in the session
+directory: no other branch, stash, untracked, or ignored file (such as
+`node_modules`) is visible, and the floor starts at rank 2. It drops only when
+content arrives from outside, such as a web page, an MCP result, or an issue.
+To reset it, start a new run. Your working directory is not modified; when the
+run ends, Keel prints how to fetch the agent's commits:
+
+~~~sh
+git fetch ~/.keel/sessions/SESSION/workspace HEAD:keel/SESSION
+~~~
+
+A committed `package-lock.json` (lockfile version 2 or 3) extends this to
+installs. Each package it pins by `https` URL and `sha512` integrity keeps
+rank 2 when fetched, and admission shows how many there are:
+
+~~~sh
+keel run --allow workspace:own --allow egress:registry.npmjs.org claude
+~~~
+
+Run `npm ci --no-audit --no-fund` in the guest. Keel holds back each pinned
+tarball until it has hashed the whole body, and only then delivers it.
+Anything else lowers the floor as before: a body that differs from the pin,
+an unpinned package, registry metadata, or the audit endpoint. `npm install`
+fetches metadata, so use `npm ci`. Install scripts of pinned packages run at
+rank 2. Pin only dependencies you are willing to run with that authority.
+
+### Read untrusted content without lowering the floor
+
+A raw issue or web page lowers the floor. Extraction reads it for the agent and
+hands back only fields an admitted schema allows. Write a schema bundle:
+
+~~~json
+[{"version": 1, "name": "issue-triage", "fields": {
+  "kind": {"enum": ["bug", "feature", "question"]},
+  "severity": {"enum": ["low", "medium", "high"]},
+  "files": {"list": {"item": {"path": true}, "max": 8}}
+}}]
+~~~
+
+Field types are `enum`, bounded `integer`, `boolean`, `path` (a file in the
+committed tree), `issue`, and `list` of those; there is no free text. Run with
+it:
+
+~~~sh
+keel run --schemas schemas.json --allow workspace:own claude
+~~~
+
+The admission screen lists each schema and its bandwidth in bits. The agent
+then calls the `keel_extract` tool with `issue:N`, `pull:N`, or
+`url:https://HOST/PATH` and a schema name. A small model reads the source in a
+separate, credential-free helper; the agent receives only the validated
+fields, and the floor does not drop. The fetch is still an egress effect:
+an unadmitted host asks for approval.
+
 ## 6. Use a policy
 
 Keel can compile a constrained natural-language policy outside the trusted computing base. Compilation produces a draft; drafts cannot authorize a run until accepted.
@@ -468,9 +539,22 @@ keel stop SESSION
 Persistent attachment accepts approvals only from a foreground terminal peer
 authenticated by the trusted supervisor. Background, terminal-less, and raw
 socket clients are rejected before their input reaches the session.
-`keel stop` requests cooperative shutdown and waits for the broker to write its
-terminal audit seal. A forced-timeout fallback is reported as an error rather
-than pretending the session stopped cleanly.
+`keel stop` requests cooperative shutdown and returns only once the session
+supervisor has sealed the run's audit, ended the runtime's process group,
+removed its socket, pid, and request files, checked each is gone, and written
+a signed teardown receipt (`audit-*.receipt.json`) beside the chain. It prints
+the receipt path, names any unmet check, and exits nonzero if one is unmet or
+the stop needed a forced timeout. Running it again after the session has
+stopped reports the latest receipt.
+
+A detached session that produces no output for 12 hours stops itself the
+same way, with `idle` as the receipt's stop reason. A pending approval nobody
+is attached to answer counts as idle. Change the limit per session, or
+disable it with `0`:
+
+~~~sh
+keel run --keep-alive --idle-timeout 4 claude    # hours, 0 to 720
+~~~
 
 ## 9. Provenance modes and floors
 
@@ -520,22 +604,38 @@ later classified observation.
 `floor.json` is a non-authoritative status snapshot. Editing it cannot authorize
 a run, and `floor lift` no longer edits it directly.
 
-## 10. Reproduce a report (triage profile)
+## 10. Scoped runs
 
-Run a reproduction confined to the hosts you declare:
+`--profile scoped` confines a run to the hosts you declare. Two common uses:
 
-~~~sh
-keel mux --profile triage --scope '*.target.example' --scope api.target.example:8443 \
-    --exclude admin.target.example
-keel mux --profile triage --scope-file target-scope.txt
-keel mux --profile triage --report report.md     # proposes the report's URL hosts
-~~~
+- **Reproducing a report** against its target, with the target's hosts as the
+  scope:
+
+  ~~~sh
+  keel mux --profile scoped --scope '*.target.example' --scope api.target.example:8443 \
+      --exclude admin.target.example
+  keel mux --profile scoped --scope-file target-scope.txt
+  keel mux --profile scoped --report report.md     # proposes the report's URL hosts
+  ~~~
+
+- **Validating a finding in code**, in the repository as the workspace, with
+  no outside host at all, or only the package registries a build needs:
+
+  ~~~sh
+  keel mux --workspace ~/src/app --profile scoped --scope none
+  keel mux --workspace ~/src/app --profile scoped --scope registry.npmjs.org
+  ~~~
+
+  The application can run inside the guest and be reached on `localhost`,
+  which never leaves the VM, by the agent, the browser, or you.
 
 Rules:
 
 - `*.host` matches subdomains only; list the apex `host` on its own;
 - a rule without a port matches 443 and 80;
 - `--exclude` always wins;
+- `none` admits no host beyond the run's own and cannot be combined with
+  other rules;
 - a scope file has one rule per line, `!rule` for exclusions, `#` for
   comments.
 
@@ -545,8 +645,8 @@ report links to, including documentation links. Everything outside the scope
 and the run's own hosts (the model endpoint, for example) is refused without a
 prompt, and the audit records each refusal as `kernel:out-of-scope`.
 
-Triage runs use only approved model providers, by default Anthropic and
-Bedrock. Set `KEEL_TRIAGE_PROVIDERS=bedrock` to narrow the list.
+Scoped runs use only approved model providers, by default Anthropic and
+Bedrock. Set `KEEL_SCOPED_PROVIDERS=bedrock` to narrow the list.
 
 ### The guest browser
 
@@ -576,7 +676,7 @@ in `.keel-browser/` in your workspace, visible on the Mac immediately; the
 directory ignores itself, so Git never sees it. It is created only when the
 browser is first used.
 - **Traffic and scope.** Its traffic goes through Keel like everything else,
-  so a triage scope applies to it.
+  so a run's scope applies to it.
 - **Background traffic.** Chromium's own background calls to Google are turned
   off, so they cause no prompts.
 - **Protocols.** The proxy speaks HTTP/1.1 and does not yet relay WebSockets,
@@ -617,8 +717,34 @@ keel status SESSION
 ~~~
 
 `state` is `active` while the trusted runtime is still writing the chain,
-`closed` once it is sealed, and `interrupted` when the chain is unsealed and
-its runtime is gone. `admitted` summarizes the run's admission manifest:
+`closed` once it is sealed, `closed-unclean` when it is sealed but a teardown
+check is unmet, and `stale`, `recovered`, or `recovered-unclean` when the
+chain is unsealed and its runtime is gone. `teardown` summarizes the run's in-chain teardown record. `receipt`
+summarizes the persistent-session supervisor's signed receipt, verified
+against the key the chain names; it also reports `floor.json` or
+`attach.exit` changed since teardown. A receipt that does not verify makes
+`keel status` fail, as an edited chain does. A chain left unsealed by a
+crash is `stale` until recovered:
+
+~~~sh
+keel recover SESSION
+~~~
+
+Recovery reads the crashed run's authenticated chain, ends its recorded
+backend process group if it is still running, removes its scratch and broker
+directories, and writes an unsigned `audit-*.recovery.json` describing what
+it found. It refuses to signal a group that contains anything other than Keel
+components or to remove a path the run did not name. Status then reports
+`recovered` or `recovered-unclean`, and `keel doctor` lists sessions still
+awaiting recovery.
+
+`keel run` and `keel attach` also recover, before they start, every crashed
+session whose chain has not changed for 15 minutes, and print one line if
+they did; the grace keeps a fresh crash's scratch directory for inspection.
+Set `KEEL_RECOVERY_GRACE_MINUTES` to change it, or `KEEL_AUTO_RECOVER=off` to
+disable it. `keel recover --all` recovers every crashed session now.
+
+`admitted` summarizes the run's admission manifest:
 harness, model, provider, guest kernel, policy bundle, and manifest digest.
 The full manifest is the `kernel.run-admitted` record at the start of the
 audit chain.
@@ -684,6 +810,75 @@ For each finished, sealed session, it counts:
 Keel records only digests, sizes, and positions, never block content. The log
 changes no decision; it measures whether per-turn context ranks would ever
 differ from the session floor.
+
+### Recording request targets
+
+By default the audit log commits to each action's target with a hash, keeping
+private hosts and URLs out of the record. To investigate untrusted code, add
+`--record-targets` so each network action also writes its method, host, port,
+and query-free path in readable form:
+
+~~~sh
+keel run --profile scoped --scope none --record-targets claude -p '...'
+~~~
+
+The admission screen lists `record-targets:` and the manifest records the
+choice. Targets still pass through the secret redactor. Pair it with `--scope
+none` to see exactly which hosts refused code tried to reach.
+
+### Detonating untrusted code (ephemeral workspace)
+
+By default the workspace is shared read-write, so what the workload writes
+lands on your Mac. To run something you do not trust, add
+`--ephemeral-workspace`: the workspace is shared read-only and a tmpfs overlay
+is layered on top inside the VM, so the workload reads the files but every
+write stays in guest RAM and vanishes at shutdown. The host directory is never
+modified.
+
+~~~sh
+keel run --ephemeral-workspace --profile scoped --scope none claude -p '...'
+~~~
+
+Pair it with `--scope none` (no outside host) and `--record-targets` (readable
+refused hosts) for a first-look detonation. Writes still cost guest memory, so
+raise `--memory` for a workload that writes a lot. The run manifest records
+`ephemeral_workspace`, so the audit evidence states whether writes could reach
+the host.
+
+### Guest events and OpenTelemetry export
+
+In a microVM run, the guest's PID 1 reports what happens inside the VM:
+every process exec and exit, with its executable, leading arguments, working
+directory, and parent, and every file closed after writing on the workload's
+writable mounts (`/workspace`, `/tmp`, `/root`, `/var/tmp`). The host stamps
+each event with its own clock and writes it to `guest-*.ndjson` beside the
+run's audit chain. These are the guest's claims, not audited records: they are
+not hash-chained or signed, they decide nothing, and a compromised guest could
+report anything.
+
+`keel export` turns sessions into OpenTelemetry traces (OTLP/JSON):
+
+~~~sh
+keel export SESSION > trace.json                    # to standard output
+keel export SESSION --out trace.json
+keel export SESSION --otlp http://localhost:4318    # to an OTLP/HTTP collector
+~~~
+
+It authenticates each audit chain first and records whether it was sealed.
+Each run is one trace:
+
+- `keel.run`, the root span, carries the admission manifest's harness,
+  isolation, provider, model, and profile, with floor changes and enforcement
+  state as events;
+- `keel.action CLASS` spans cover each mediated action, including the operator's
+  decision time, and are errors when denied;
+- `keel.model.request` spans carry each model request's reserved and actual
+  usage;
+- `guest.process NAME` spans form the guest's process tree, with file writes as
+  events, and carry `keel.trust = guest-claim`.
+
+Only `http://` collectors are supported; run a local OpenTelemetry Collector to
+forward elsewhere.
 
 The report separates gate decisions from prompts a human could actually see.
 It also shows automatic deny-only decisions, prompt share by rule, decision
@@ -755,6 +950,27 @@ work in the guest by design. Examples are container runtimes, `strace`, `gdb`,
 and `ping`. Writes outside the workspace, `/tmp`, `/var/tmp`, and `/root` are
 also refused.
 
+### keel stop says the supervisor is gone without a teardown receipt
+
+The session's supervisor died, so nothing checked its teardown, and its run's
+backend may still be running. Run `keel recover SESSION`, then `keel status
+SESSION`, which should report `recovered`.
+
+### keel stop reports teardown incomplete
+
+A teardown check failed; the message names it and the receipt path. A
+`runtime-group still has members` check means a process outlived both
+`SIGTERM` and `SIGKILL`; find it with
+`ps -A -o pid,pgid,comm | awk '$2 == PGID'` before starting another session
+in the same workspace.
+
+### keel doctor warns that crashed sessions await recovery
+
+A trusted runtime was killed, or the host crashed, before the run sealed its
+audit. Doctor prints how many and the three most recent; `keel status
+SESSION` reports each as `stale`. Run `keel recover SESSION` for each. Recovery refuses a
+process group with non-Keel members; a `recovered-unclean` status names it.
+
 ### KEEL_KERNEL or KEEL_INITRAMFS is not set
 
 Run keel setup, then keel doctor. Use the installed launcher so it can load the generated configuration.
@@ -764,6 +980,13 @@ Run keel setup, then keel doctor. Use the installed launcher so it can load the 
 Alpine removes superseded kernel packages from its CDN. Bump the version,
 release, and digest together in spikes/fetch-guest-kernel.sh after checking
 the new kernel's configuration and booting it, then rerun keel setup.
+
+### A locked guest package download fails
+
+Setup reports `cannot download locked package`. Alpine has replaced that
+version, usually with a security update. Run `spikes/lock-guest-packages.sh`,
+review the diff of `spikes/guest-packages.lock`, then rerun keel setup and
+keel doctor.
 
 ### Linking fails with "tapi error: malformed file ... unknown architecture"
 

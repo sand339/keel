@@ -4,7 +4,8 @@
 pub use keel_provenance::ProvenanceEvent;
 use keel_provenance::{
     ClassifiedResult, Confidentiality, DenialOrigin, DenialScope, FloorObservation, IntentFlags,
-    ModelOutputIndex, PayloadIndex, Rank, SessionFacts, SourceRef, TaskAdmission,
+    LockfilePins, ModelOutputIndex, PayloadIndex, PushedBlob, Rank, SchemaRegistry, SessionFacts,
+    SourceRef, TaskAdmission, derive_push, is_protected_path, receive_pack_commands,
 };
 use nix::{
     errno::Errno,
@@ -16,7 +17,7 @@ use ring::{
     rand::{SecureRandom, SystemRandom},
 };
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     error::Error,
     fmt, fs,
     hash::{DefaultHasher, Hash, Hasher},
@@ -321,6 +322,41 @@ impl IntegrityVerdict {
         }
     }
 
+    /// Judges the blobs a push adds, derived by trusted code from the pushed
+    /// pack: on the default branch every file, elsewhere only protected
+    /// paths. A line is added when it is not committed at the admitted
+    /// `HEAD`, and unaccounted when the model did not write it either.
+    #[must_use]
+    pub fn of_push(
+        blobs: &[PushedBlob],
+        default_branch: bool,
+        admitted: &ModelOutputIndex,
+        model_output: &ModelOutputIndex,
+    ) -> Self {
+        let (mut checked, mut added, mut unaccounted) = (false, 0_u32, 0_u32);
+        for blob in blobs
+            .iter()
+            .filter(|blob| default_branch || is_protected_path(&blob.path))
+        {
+            checked = true;
+            let Some(text) = &blob.text else {
+                return Self::Uninspectable;
+            };
+            for line in text.lines() {
+                if admitted.accounts_for(line) == Some(false) {
+                    added = added.saturating_add(1);
+                    let written = model_output.accounts_for(line) == Some(true);
+                    unaccounted = unaccounted.saturating_add(u32::from(!written));
+                }
+            }
+        }
+        if checked {
+            Self::Lines { added, unaccounted }
+        } else {
+            Self::NotChecked
+        }
+    }
+
     /// Judges the lines a protected diff adds against the model's output.
     #[must_use]
     pub fn of_diff(diff: &str, model_output: &ModelOutputIndex) -> Self {
@@ -450,6 +486,21 @@ pub enum FlowVerdict {
 }
 
 impl FlowVerdict {
+    /// Orders verdicts so the most serious of several payloads is kept.
+    #[must_use]
+    pub const fn severity(self) -> u8 {
+        match self {
+            Self::NotChecked => 0,
+            Self::Clean => 1,
+            Self::Cleared(_) => 2,
+            Self::Leak {
+                label: Confidentiality::Secret,
+                ..
+            } => 4,
+            Self::Leak { .. } => 3,
+        }
+    }
+
     /// Stable audit spelling.
     #[must_use]
     pub fn describe(self) -> String {
@@ -469,6 +520,66 @@ impl FlowVerdict {
             } => format!("{}-to-{}:{fragments}", name(label), name(clearance)),
         }
     }
+}
+
+/// What the extraction helper's model request must look like (PLAN D83):
+/// exactly one forced tool, the admitted schema's, and one user text block
+/// whose SHA-256 is the digest of the fetched body.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtractionRule {
+    /// The only tool, forced.
+    pub tool: serde_json::Value,
+    /// SHA-256 of the fetched body the model must be given, and nothing else.
+    pub content_digest: [u8; 32],
+}
+
+/// What a run admitted for quarantine extraction (PLAN D83).
+#[derive(Debug)]
+pub struct ExtractionConfig {
+    /// The operator-accepted schemas.
+    pub registry: SchemaRegistry,
+    /// File paths in the admitted tree, for `path` values.
+    pub admitted_paths: BTreeSet<String>,
+    /// The repository `issue:` and `pull:` sources read from, if admitted.
+    pub github_repository: Option<String>,
+    /// The model the helper calls.
+    pub model: String,
+}
+
+/// One extraction from its request to its validated result.
+#[derive(Debug)]
+struct ExtractionJob {
+    id: u64,
+    host: String,
+    path: String,
+    schema: String,
+    fetched: Option<[u8; 32]>,
+    candidate: Option<serde_json::Value>,
+}
+
+/// Jobs waiting for, held by, and finished by the extraction helper. One is
+/// active at a time, so every request on the helper's channel binds to it.
+#[derive(Debug, Default)]
+struct Extractions {
+    next_id: u64,
+    queue: VecDeque<ExtractionJob>,
+    active: Option<ExtractionJob>,
+    done: BTreeMap<u64, Result<serde_json::Value, String>>,
+}
+
+/// What the kernel needs to inspect a push itself, from the exact bytes its
+/// permit binds, instead of trusting the relay's diff (PLAN D81).
+#[derive(Debug)]
+pub struct PushInspection {
+    /// A private bare repository of admitted history the guest cannot write;
+    /// a thin pack resolves against it and nothing else.
+    pub base: PathBuf,
+    /// A kernel-private directory for per-push indexes.
+    pub scratch: PathBuf,
+    /// `refs/heads/NAME` of the remote's default branches.
+    pub default_branches: Vec<String>,
+    /// Every line committed at the admitted `HEAD`.
+    pub admitted_lines: ModelOutputIndex,
 }
 
 /// Admitted confidential content and the destinations cleared to receive it.
@@ -1435,6 +1546,9 @@ pub struct AuditEvent {
     pub target_kind: &'static str,
     /// SHA-256 commitment to the exact action class and target.
     pub target_hash: [u8; 32],
+    /// A network target's method, host, port, and query-free path. The audit
+    /// writes it only for a run admitted with target recording (PLAN D69).
+    pub target_detail: Option<String>,
     /// Final outcome.
     pub outcome: AuditOutcome,
     /// Task-envelope verdict stamped by the kernel.
@@ -1549,6 +1663,28 @@ pub trait AuditSink: Send {
     /// # Errors
     /// Returns an error when durable recording fails.
     fn record_enforcement_state(&mut self, _event: EnforcementStateEvent) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Records how a run ended and what its teardown established.
+    /// # Errors
+    /// Returns an error when durable recording fails.
+    fn record_run_teardown(&mut self, _event: RunTeardownEvent) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Records a host resource the run created, so recovery after a crash
+    /// can release exactly what the authenticated chain names.
+    /// # Errors
+    /// Returns an error when durable recording fails.
+    fn record_run_resource(&mut self, _event: RunResourceEvent) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Records one quarantine extraction and what became of it.
+    /// # Errors
+    /// Returns an error when durable recording fails.
+    fn record_extraction(&mut self, _event: ExtractionEvent) -> Result<(), String> {
         Ok(())
     }
 
@@ -1943,6 +2079,7 @@ impl<P: Policy> Kernel<P> {
                 "this action class always requires operator approval",
             ));
         }
+        payload_violations(action, &mut violations);
         Ok(violations)
     }
 
@@ -2457,6 +2594,51 @@ fn unix_time_ms() -> u64 {
         })
 }
 
+/// Payload checks judge the effect's own bytes (PLAN D81): content admitted
+/// as secret never leaves for a sink below it, confidential content headed
+/// above its clearance escalates, and lines in protected places that neither
+/// the admitted `HEAD` nor the model accounts for escalate.
+fn payload_violations(action: &Action, violations: &mut Vec<Violation>) {
+    match action.stamped.flow {
+        FlowVerdict::Leak {
+            label: Confidentiality::Secret,
+            fragments,
+            ..
+        } => violations.push(Violation::new(
+            "deny:payload-secret",
+            format!("{fragments} fragment(s) of admitted secret content would leave this run"),
+        )),
+        FlowVerdict::Leak {
+            clearance,
+            fragments,
+            ..
+        } => violations.push(Violation::new(
+            "payload:flow",
+            format!(
+                "{fragments} fragment(s) of the private repository are headed to a destination \
+                 cleared only for {clearance:?} content"
+            ),
+        )),
+        _ => {}
+    }
+    match action.stamped.integrity {
+        IntegrityVerdict::Lines { added, unaccounted } if unaccounted > 0 => {
+            violations.push(Violation::new(
+                "payload:integrity",
+                format!(
+                    "{unaccounted} of {added} line(s) added to protected places are neither \
+                     committed at the admitted HEAD nor written by the model"
+                ),
+            ));
+        }
+        IntegrityVerdict::Uninspectable => violations.push(Violation::new(
+            "payload:integrity",
+            "the pushed content could not be fully inspected",
+        )),
+        _ => {}
+    }
+}
+
 /// Code the workload could have written does not push or open pull requests
 /// on the operator's authority without the operator seeing it.
 fn push_origin_violation(action: &Action, violations: &mut Vec<Violation>) {
@@ -2471,7 +2653,7 @@ fn push_origin_violation(action: &Action, violations: &mut Vec<Violation>) {
 }
 
 /// Matches an action against the operator-admitted task envelope.
-/// Whether a triage run's admitted scope covers `host:port`.
+/// Whether a scoped run's admitted scope covers `host:port`.
 fn in_scope(intent: &IntentFlags, host: &str, port: u16) -> bool {
     intent
         .scope
@@ -2608,6 +2790,16 @@ fn inherently_gated(action: &Action) -> bool {
 }
 
 fn approval_method(action: &Action) -> ApprovalMethod {
+    // Outside the envelope, carrying a payload violation, with low-ranked
+    // content able to have steered it: only the challenge overrides.
+    let mut payload = Vec::new();
+    payload_violations(action, &mut payload);
+    if !payload.is_empty()
+        && matches!(action.stamped.intent, IntentVerdict::Outside(_))
+        && action.stamped.session.floor < 2
+    {
+        return ApprovalMethod::Challenge;
+    }
     match (&action.asserted.class, &action.asserted.target) {
         (
             ActionClass::GitPush,
@@ -2679,6 +2871,18 @@ fn record(
             class: action.asserted.class,
             target_kind: action.asserted.target.kind(),
             target_hash: action_target_hash(action),
+            target_detail: match &action.asserted.target {
+                Target::Network {
+                    host,
+                    port,
+                    method,
+                    path,
+                } => Some(format!(
+                    "{method} {host}:{port}{}",
+                    path.split(['?', '#']).next().unwrap_or_default()
+                )),
+                _ => None,
+            },
             outcome,
             intent: action.stamped.intent.as_str(),
             flow: action.stamped.flow.describe(),
@@ -2921,6 +3125,29 @@ const EGRESS_HOST_RULE: &str = "intent:egress-host";
 const ADMISSION_EGRESS_RULE: &str = "admission:egress";
 /// Private broker protocol marker for external MCP actions.
 pub const EXTERNAL_BROKER_MAGIC: &[u8] = b"KEEL-EXTERNAL-V1\0";
+/// A guest-side request for a schema-bounded extraction (PLAN D83): a source
+/// and a schema name, each a u16-length-prefixed string. The reply is
+/// [`EXTRACT_OK`] with a u32-length-prefixed canonical JSON result, or
+/// [`EXTRACT_REFUSED`] with a u16-length-prefixed reason.
+pub const EXTRACT_MAGIC: &[u8] = b"KEEL-EXTRACT-V1\0";
+/// The extraction helper asks for its next job. Accepted only on the
+/// helper's own socket. The reply is [`EXTRACT_IDLE`], or [`EXTRACT_JOB`]
+/// with a u64 job id, the fetch host, path, and model as u16-length-prefixed
+/// strings, and the forced tool as u32-length-prefixed JSON.
+pub const EXTRACT_JOB_MAGIC: &[u8] = b"KEEL-EXTRACT-JOB-V1\0";
+/// The extraction helper reports its job done: a u64 job id. The kernel takes
+/// the result from its own reassembly of the model's tool call.
+pub const EXTRACT_DONE_MAGIC: &[u8] = b"KEEL-EXTRACT-DONE-V1\0";
+/// A validated extraction follows.
+pub const EXTRACT_OK: u8 = b'A';
+/// The extraction was refused; a reason follows.
+pub const EXTRACT_REFUSED: u8 = b'D';
+/// A job follows.
+pub const EXTRACT_JOB: u8 = b'J';
+/// No job is waiting.
+pub const EXTRACT_IDLE: u8 = b'N';
+const EXTRACTION_WAIT: Duration = Duration::from_mins(3);
+const MAX_EXTRACTIONS_QUEUED: usize = 8;
 
 /// Kernel-broker response: policy or structural denial.
 pub const EGRESS_DENIED: u8 = b'D';
@@ -3009,6 +3236,56 @@ pub struct ModelUsageEvent {
     pub actual_tokens: u64,
     /// Cost computed from trusted usage and the pinned tariff.
     pub actual_cost_microusd: u64,
+}
+
+/// What releasing one run resource established.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TeardownCheck {
+    /// Resource kind, such as `backend-group` or `scratch`.
+    pub kind: &'static str,
+    /// Secret-free identifier of the resource.
+    pub detail: String,
+    /// The postcondition that does not hold, if any.
+    pub unmet: Option<String>,
+}
+
+/// How a run ended and what releasing its resources established, audited
+/// immediately before the chain is sealed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunTeardownEvent {
+    /// `exited`, `shutdown`, or `error`.
+    pub stop_reason: &'static str,
+    /// Whether ending the backend needed `SIGKILL`.
+    pub escalated: bool,
+    /// One entry per released resource.
+    pub checks: Vec<TeardownCheck>,
+    /// Hex Ed25519 public key of the supervising `serve` process, which signs
+    /// the post-seal teardown receipt; `None` for an unsupervised run.
+    pub supervisor_key: Option<String>,
+}
+
+/// One quarantine extraction, without the content it read (PLAN D83).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtractionEvent {
+    /// The schema the result was validated against.
+    pub schema: String,
+    /// The fetched source, as host and path.
+    pub source: String,
+    /// SHA-256 of the fetched body the model was given.
+    pub fetched: Option<[u8; 32]>,
+    /// SHA-256 of the canonical result delivered to the guest.
+    pub result: Option<[u8; 32]>,
+    /// `ok`, or why the extraction was refused.
+    pub outcome: String,
+}
+
+/// One host resource a run created, audited as soon as it exists.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunResourceEvent {
+    /// `scratch`, `broker-dir`, or `backend-group`.
+    pub kind: &'static str,
+    /// Absolute path, or `pgid N`.
+    pub detail: String,
 }
 
 /// The canonical admission manifest of one run, audited before its workload
@@ -3235,6 +3512,19 @@ pub trait EgressRequestAuthorizer: Send {
     /// of its complete, successful response, for the shadow digest log.
     fn observe_model_context(&mut self, _response: bool, _blocks: Vec<ContextBlock>) {}
 
+    /// The exact shape a model request on this connection must have, for the
+    /// extraction helper's channel (PLAN D83); `None` everywhere else.
+    fn extraction_rule(&mut self) -> Option<ExtractionRule> {
+        None
+    }
+
+    /// Shows the decoded body of a complete non-model response.
+    fn observe_response_body(&mut self, _body: &[u8]) {}
+
+    /// Shows the input of each tool call in a complete, successful model
+    /// response.
+    fn observe_tool_calls(&mut self, _inputs: &[serde_json::Value]) {}
+
     /// Atomically commits the already-authorized request at the first external
     /// network operation. A peer disconnect that wins this handoff makes the
     /// request permanently unsendable, including requests admitted without a
@@ -3252,6 +3542,22 @@ pub trait EgressRequestAuthorizer: Send {
     /// # Errors
     /// Returns an error when provenance cannot be durably recorded.
     fn record_response(&mut self) -> Result<(), String>;
+
+    /// Whether the accepted lockfile pins the authorized request's response
+    /// (W4b). Trusted termination then holds the whole response back and
+    /// reports its body's SHA-512 before any of it reaches the guest.
+    fn response_is_pinned(&mut self) -> bool {
+        false
+    }
+
+    /// [`Self::record_response`] for a held-back pinned response: a body
+    /// whose SHA-512 is the pinned one keeps the declared rank; any other
+    /// lowers the floor as an unpinned response would.
+    /// # Errors
+    /// Returns an error when provenance cannot be durably recorded.
+    fn record_pinned_response(&mut self, _body_sha512: [u8; 64]) -> Result<(), String> {
+        self.record_response()
+    }
 
     /// Marks the current model reservation as possibly spent immediately
     /// before the first upstream write attempt.
@@ -3375,7 +3681,7 @@ pub struct KernelBroker {
     ca_certificate_pem: Option<String>,
     state: Arc<Mutex<BrokerState>>,
     stop: Arc<AtomicBool>,
-    shutdown_boundaries: Arc<Mutex<Vec<EnforcementBoundary>>>,
+    shutdown_handoff: Arc<Mutex<ShutdownHandoff>>,
     thread: Option<JoinHandle<Result<BrokerReport, String>>>,
 }
 
@@ -3543,10 +3849,20 @@ impl KernelBroker {
             listener
                 .set_nonblocking(true)
                 .map_err(|error| error.to_string())?;
-            Ok::<_, String>(listener)
+            // The extraction helper's own channel (PLAN D83). Requests are
+            // typed by the socket they arrive on, and only the helper's
+            // sandbox may connect to this one.
+            let extract_path = root.join("extract.sock");
+            let extract = UnixListener::bind(&extract_path).map_err(|error| error.to_string())?;
+            fs::set_permissions(&extract_path, fs::Permissions::from_mode(0o600))
+                .map_err(|error| error.to_string())?;
+            extract
+                .set_nonblocking(true)
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>((listener, extract))
         })();
-        let listener = match setup {
-            Ok(listener) => listener,
+        let (listener, extract_listener) = match setup {
+            Ok(listeners) => listeners,
             Err(error) => {
                 let _ = fs::remove_file(&socket_path);
                 let _ = fs::remove_dir(&root);
@@ -3555,8 +3871,9 @@ impl KernelBroker {
         };
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
-        let shutdown_boundaries = Arc::new(Mutex::new(Vec::new()));
-        let thread_boundaries = Arc::clone(&shutdown_boundaries);
+        let shutdown_handoff = Arc::new(Mutex::new(ShutdownHandoff::default()));
+        let thread_handoff = Arc::clone(&shutdown_handoff);
+        let thread_root = root.clone();
         let state = Arc::new(Mutex::new(BrokerState::new(
             session_id,
             allowed_hosts,
@@ -3587,10 +3904,11 @@ impl KernelBroker {
             .name("keel-kernel-broker".to_owned())
             .spawn(move || {
                 broker_loop(
-                    &listener,
+                    [&listener, &extract_listener],
                     &thread_state,
                     diagnostics.as_deref(),
-                    &thread_boundaries,
+                    &thread_handoff,
+                    &thread_root,
                     &thread_stop,
                 )
             }) {
@@ -3607,7 +3925,7 @@ impl KernelBroker {
             ca_certificate_pem,
             state,
             stop,
-            shutdown_boundaries,
+            shutdown_handoff,
             thread: Some(thread),
         })
     }
@@ -3637,6 +3955,45 @@ impl KernelBroker {
         Ok(())
     }
 
+    /// Admits quarantine extraction for this run (PLAN D83).
+    /// # Errors
+    /// Returns an error when the broker state is unavailable.
+    pub fn set_extraction(&self, config: ExtractionConfig) -> Result<(), String> {
+        self.state
+            .lock()
+            .map_err(|_| "kernel broker state is unavailable".to_owned())?
+            .extraction = Some(config);
+        Ok(())
+    }
+
+    /// Sets the registry artifacts the accepted lockfile pins (W4b).
+    /// # Errors
+    /// Returns an error when the broker state is unavailable.
+    pub fn set_lockfile_pins(&self, pins: LockfilePins) -> Result<(), String> {
+        self.state
+            .lock()
+            .map_err(|_| "kernel broker state is unavailable".to_owned())?
+            .lockfile_pins = pins;
+        Ok(())
+    }
+
+    /// The extraction helper's own socket, which only its sandbox may reach.
+    #[must_use]
+    pub fn extract_socket_path(&self) -> PathBuf {
+        self.root.join("extract.sock")
+    }
+
+    /// Configures trusted inspection of every push from its own bytes.
+    /// # Errors
+    /// Returns an error when the broker state is unavailable.
+    pub fn set_push_inspection(&self, inspection: PushInspection) -> Result<(), String> {
+        self.state
+            .lock()
+            .map_err(|_| "kernel broker state is unavailable".to_owned())?
+            .push_inspection = Some(Arc::new(inspection));
+        Ok(())
+    }
+
     /// Durably records this run's admission manifest. Call before any
     /// workload process exists; an error must refuse the run.
     /// # Errors
@@ -3647,6 +4004,17 @@ impl KernelBroker {
             .map_err(|_| "kernel broker state is unavailable".to_owned())?
             .audit
             .record_run_admitted(event)
+    }
+
+    /// Durably records a host resource the run created.
+    /// # Errors
+    /// Returns an error when the state is unavailable or recording fails.
+    pub fn record_run_resource(&self, event: RunResourceEvent) -> Result<(), String> {
+        self.state
+            .lock()
+            .map_err(|_| "kernel broker state is unavailable".to_owned())?
+            .audit
+            .record_run_resource(event)
     }
 
     /// Returns a cloneable in-process control path to this exact live kernel.
@@ -3670,13 +4038,28 @@ impl KernelBroker {
     /// Returns an error when the boundary handoff, broker, audit, or cleanup
     /// fails.
     pub fn shutdown_with_boundaries(
-        mut self,
+        self,
         boundaries: Vec<EnforcementBoundary>,
     ) -> Result<BrokerReport, String> {
+        self.shutdown_with_teardown(boundaries, None)
+    }
+
+    /// Stops the broker after attaching boundaries and, when given, the run's
+    /// teardown record, to which the broker adds its own socket's removal.
+    /// # Errors
+    /// Returns an error when the handoff, broker, audit, or cleanup fails.
+    pub fn shutdown_with_teardown(
+        mut self,
+        boundaries: Vec<EnforcementBoundary>,
+        teardown: Option<RunTeardownEvent>,
+    ) -> Result<BrokerReport, String> {
         *self
-            .shutdown_boundaries
+            .shutdown_handoff
             .lock()
-            .map_err(|_| "kernel shutdown boundaries are unavailable".to_owned())? = boundaries;
+            .map_err(|_| "kernel shutdown handoff is unavailable".to_owned())? = ShutdownHandoff {
+            boundaries,
+            teardown,
+        };
         self.stop.store(true, Ordering::Release);
         let report = self
             .thread
@@ -3694,7 +4077,8 @@ impl KernelBroker {
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(error.to_string()),
         }
-        match fs::remove_dir(&self.root) {
+        // Recursive: the directory may hold the private push base.
+        match fs::remove_dir_all(&self.root) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.to_string()),
@@ -4485,6 +4869,22 @@ impl AuditSink for CountingAudit {
         self.sink.record_enforcement_state(event)
     }
 
+    // Not counted, for the same reason.
+    fn record_run_teardown(&mut self, event: RunTeardownEvent) -> Result<(), String> {
+        self.sink.record_run_teardown(event)
+    }
+
+    // Not counted, for the same reason.
+    fn record_run_resource(&mut self, event: RunResourceEvent) -> Result<(), String> {
+        self.sink.record_run_resource(event)
+    }
+
+    fn record_extraction(&mut self, event: ExtractionEvent) -> Result<(), String> {
+        self.sink.record_extraction(event)?;
+        self.events += 1;
+        Ok(())
+    }
+
     fn is_durable(&self) -> bool {
         self.sink.is_durable()
     }
@@ -4522,6 +4922,13 @@ struct BrokerState {
     payload: Option<Arc<PayloadPolicy>>,
     /// Lines the model emitted in tool calls, for push integrity verdicts.
     model_output: ModelOutputIndex,
+    /// Trusted push inspection, configured when push authority is admitted.
+    push_inspection: Option<Arc<PushInspection>>,
+    pushes_inspected: u64,
+    /// Admitted extraction schemas and the jobs using them.
+    extraction: Option<ExtractionConfig>,
+    extractions: Extractions,
+    lockfile_pins: LockfilePins,
     /// Context block digests already described in the digest log.
     context_described: HashSet<[u8; 8]>,
 }
@@ -4692,6 +5099,11 @@ impl BrokerState {
             pending_effects: Vec::new(),
             payload: None,
             model_output: ModelOutputIndex::default(),
+            push_inspection: None,
+            pushes_inspected: 0,
+            extraction: None,
+            extractions: Extractions::default(),
+            lockfile_pins: LockfilePins::default(),
             context_described: HashSet::new(),
         })
     }
@@ -4965,7 +5377,7 @@ impl BrokerState {
             },
             declared_cost: None,
         };
-        // A triage run refuses everything its scope and admitted hosts do not
+        // A scoped run refuses everything its scope and admitted hosts do not
         // cover, without a prompt: a browser cannot wait on one per request.
         let out_of_scope = self.kernel.session.facts.intent.scope.is_some()
             && !self
@@ -5198,15 +5610,16 @@ impl BrokerState {
         let cancelled = Arc::new(AtomicBool::new(false));
         self.run_locked(
             &cancelled,
-            |state| state.begin_git(asserted, body_digest, None, &cancelled),
+            |state| state.begin_git(asserted, body_digest, &[], None, &cancelled),
             |state, begun, outcome| state.finish_git(begun, outcome, &cancelled),
         )
     }
 
     fn begin_git(
         &mut self,
-        asserted: Asserted,
+        mut asserted: Asserted,
         body_digest: [u8; 32],
+        body: &[u8],
         origin: Option<ReportedOrigin>,
         cancelled: &Arc<AtomicBool>,
     ) -> Result<Begun<GitContext>, Option<u64>> {
@@ -5217,12 +5630,20 @@ impl BrokerState {
             Target::Git { remote, .. } => git_remote_scope(remote),
             _ => None,
         };
-        let integrity = match &asserted.target {
-            Target::Git {
-                manifest_diff: Some(diff),
-                ..
-            } => IntegrityVerdict::of_diff(diff, &self.model_output),
-            _ => IntegrityVerdict::NotChecked,
+        let (integrity, flow) = match self.push_inspection.clone() {
+            Some(inspection) => self.inspect_push(&inspection, &mut asserted, body),
+            // Without admitted push authority there is no private base; the
+            // relay's diff is the only account of the change, as before D81.
+            None => match &asserted.target {
+                Target::Git {
+                    manifest_diff: Some(diff),
+                    ..
+                } => (
+                    IntegrityVerdict::of_diff(diff, &self.model_output),
+                    FlowVerdict::NotChecked,
+                ),
+                _ => (IntegrityVerdict::NotChecked, FlowVerdict::NotChecked),
+            },
         };
         self.kernel
             .begin_reported(
@@ -5230,9 +5651,9 @@ impl BrokerState {
                 "vertex",
                 asserted,
                 RelayFacts {
+                    flow,
                     origin,
                     integrity,
-                    ..RelayFacts::default()
                 },
                 &mut self.audit,
             )
@@ -5296,6 +5717,167 @@ impl BrokerState {
             );
         }
         Some(processed.action_id)
+    }
+
+    /// Queues one extraction after checking that the run admitted its schema
+    /// and that its source is one the run may read.
+    fn enqueue_extraction(&mut self, source: &str, schema: &str) -> Result<u64, String> {
+        let config = self
+            .extraction
+            .as_ref()
+            .ok_or("this run admitted no extraction schemas")?;
+        if config.registry.get(schema).is_none() {
+            return Err(format!("the extraction schema `{schema}` was not admitted"));
+        }
+        let (host, path) = extraction_source(source, config.github_repository.as_deref())?;
+        if self.extractions.queue.len() >= MAX_EXTRACTIONS_QUEUED {
+            return Err("too many extractions are already waiting".to_owned());
+        }
+        self.extractions.next_id += 1;
+        let id = self.extractions.next_id;
+        self.extractions.queue.push_back(ExtractionJob {
+            id,
+            host,
+            path,
+            schema: schema.to_owned(),
+            fetched: None,
+            candidate: None,
+        });
+        Ok(id)
+    }
+
+    /// Hands the helper the next job, which becomes the one every request on
+    /// its channel binds to until it reports the job done.
+    fn next_extraction_job(&mut self) -> Option<(u64, String, String, String, serde_json::Value)> {
+        if self.extractions.active.is_some() {
+            return None;
+        }
+        let config = self.extraction.as_ref()?;
+        let job = self.extractions.queue.pop_front()?;
+        let tool = extraction_tool(config.registry.get(&job.schema)?);
+        let reply = (
+            job.id,
+            job.host.clone(),
+            job.path.clone(),
+            config.model.clone(),
+            tool,
+        );
+        self.extractions.active = Some(job);
+        Some(reply)
+    }
+
+    /// Finishes the active job: the result is the kernel's own reassembly of
+    /// the model's tool call, validated against the schema and the admitted
+    /// tree, and only after the source was fetched on this channel.
+    fn finish_extraction(&mut self, id: u64) -> bool {
+        let Some(job) = self.extractions.active.take_if(|job| job.id == id) else {
+            return false;
+        };
+        let outcome = (|| {
+            let config = self
+                .extraction
+                .as_ref()
+                .ok_or("extraction is not admitted")?;
+            job.fetched
+                .ok_or("the source was never fetched on the helper's channel")?;
+            let candidate = job
+                .candidate
+                .as_ref()
+                .ok_or("the model returned no tool call")?;
+            config
+                .registry
+                .get(&job.schema)
+                .ok_or("the schema is not admitted")?
+                .validate(candidate, &config.admitted_paths)
+                .map_err(|error| error.to_string())
+        })();
+        let event = ExtractionEvent {
+            schema: job.schema.clone(),
+            source: format!("{}{}", job.host, job.path),
+            fetched: job.fetched,
+            result: outcome
+                .as_ref()
+                .ok()
+                .map(|result| sha256(result.to_string().as_bytes())),
+            outcome: outcome
+                .as_ref()
+                .map_or_else(|error| format!("refused: {error}"), |_| "ok".to_owned()),
+        };
+        // Unaudited, the result is not delivered.
+        let outcome = self.audit.record_extraction(event).and(outcome);
+        while self.extractions.done.len() >= MAX_EXTRACTIONS_QUEUED {
+            self.extractions.done.pop_first();
+        }
+        self.extractions.done.insert(id, outcome);
+        true
+    }
+
+    /// Derives a push from its own bytes. The refs it updates replace the
+    /// relay's list, and the default-branch and protected flags can only be
+    /// raised. A pack that does not resolve against the private base is
+    /// uninspectable and treated as touching protected content.
+    fn inspect_push(
+        &mut self,
+        inspection: &PushInspection,
+        asserted: &mut Asserted,
+        body: &[u8],
+    ) -> (IntegrityVerdict, FlowVerdict) {
+        self.pushes_inspected += 1;
+        let scratch = inspection
+            .scratch
+            .join(format!("push-{}", self.pushes_inspected));
+        let derived = derive_push(body, &inspection.base, &scratch);
+        let _ = fs::remove_dir_all(&scratch);
+        let Target::Git {
+            remote,
+            refs,
+            is_default_branch,
+            touches_manifest,
+            ..
+        } = &mut asserted.target
+        else {
+            return (IntegrityVerdict::Uninspectable, FlowVerdict::NotChecked);
+        };
+        if let Ok((updates, _)) = receive_pack_commands(body)
+            && updates.iter().all(|update| valid_git_ref(&update.name))
+        {
+            *refs = updates.iter().map(|update| update.name.clone()).collect();
+            *is_default_branch |= updates
+                .iter()
+                .any(|update| inspection.default_branches.contains(&update.name));
+        }
+        let Ok(content) = derived else {
+            *touches_manifest = true;
+            return (IntegrityVerdict::Uninspectable, FlowVerdict::NotChecked);
+        };
+        *touches_manifest |= content
+            .blobs
+            .iter()
+            .any(|blob| is_protected_path(&blob.path));
+        let integrity = IntegrityVerdict::of_push(
+            &content.blobs,
+            *is_default_branch,
+            &inspection.admitted_lines,
+            &self.model_output,
+        );
+        let flow = match (&self.payload, git_remote_scope(remote)) {
+            (Some(policy), Some((host, path))) => content
+                .blobs
+                .iter()
+                .filter_map(|blob| blob.text.as_deref())
+                .map(|text| {
+                    policy.judge(
+                        &host,
+                        &format!("{path}/git-receive-pack"),
+                        text.as_bytes(),
+                        &self.kernel.policy.model_host,
+                    )
+                })
+                .max_by_key(|verdict| verdict.severity())
+                .unwrap_or(FlowVerdict::Clean),
+            _ => FlowVerdict::NotChecked,
+        };
+        (integrity, flow)
     }
 
     /// Records the relay's claim about an authorized push. Returns whether the
@@ -5428,6 +6010,7 @@ impl BrokerState {
         host: String,
         method: &str,
         path: String,
+        pinned_sha512: Option<[u8; 64]>,
     ) -> Result<(), String> {
         // A model response is the harness's own turn, not content the harness went
         // and fetched, so it does not move the floor. Which host that is depends on
@@ -5447,7 +6030,12 @@ impl BrokerState {
         // remote's own text, so it ranks as operator data rather than not
         // counting at all: the floor records that the remote spoke, and every
         // action that needs rank 2 still proceeds without a second approval.
-        let rank = if self.is_push_report(&host, method, &path) {
+        // An artifact whose digest the accepted lockfile pins is content the
+        // operator accepted, fetched; it keeps the declared rank (W4b).
+        let pinned = pinned_sha512.is_some_and(|digest| {
+            method == "GET" && self.lockfile_pins.get(&host, &path) == Some(&digest)
+        });
+        let rank = if pinned || self.is_push_report(&host, method, &path) {
             Rank::OperatorData
         } else {
             Rank::UntrustedContent
@@ -5479,6 +6067,53 @@ impl BrokerState {
 
 /// Splits an HTTPS Git remote into the host and repository path that a
 /// smart-HTTP request for it carries.
+/// The forced tool an extraction's model call must use.
+fn extraction_tool(schema: &keel_provenance::ExtractionSchema) -> serde_json::Value {
+    serde_json::json!({
+        "name": "extract",
+        "description": "Record what the document says in exactly these fields. Nothing else can be returned.",
+        "input_schema": schema.input_schema(),
+    })
+}
+
+/// Resolves an extraction source to the one host and path the helper may
+/// fetch: `issue:N` or `pull:N` on the admitted repository, or an `https`
+/// URL whose host the ordinary egress rules then judge.
+fn extraction_source(source: &str, repository: Option<&str>) -> Result<(String, String), String> {
+    let numbered = |prefix: &str, kind: &str| {
+        let number = source
+            .strip_prefix(prefix)?
+            .parse::<u64>()
+            .ok()
+            .filter(|number| (1..=10_000_000).contains(number))?;
+        Some(repository.map(|repository| {
+            (
+                "api.github.com".to_owned(),
+                format!("/repos/{repository}/{kind}/{number}"),
+            )
+        }))
+    };
+    if let Some(found) = numbered("issue:", "issues").or_else(|| numbered("pull:", "pulls")) {
+        return found.ok_or_else(|| "this run admitted no GitHub repository".to_owned());
+    }
+    let url = source
+        .strip_prefix("url:https://")
+        .ok_or("an extraction source is issue:N, pull:N, or url:https://HOST/PATH")?;
+    let (host, path) = url
+        .split_once('/')
+        .map_or((url, "/".to_owned()), |(host, path)| {
+            (host, format!("/{path}"))
+        });
+    validate_dns_name(host)?;
+    if path.len() > 2_048
+        || path.contains('#')
+        || path.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err("an extraction URL path is malformed".to_owned());
+    }
+    Ok((host.to_owned(), path))
+}
+
 fn git_remote_scope(remote: &str) -> Option<(String, String)> {
     let (host, path) = remote.strip_prefix("https://")?.split_once('/')?;
     let path = path.trim_end_matches('/');
@@ -5655,12 +6290,71 @@ struct BrokerRequestAuthorizer {
     context: Vec<ContextBlock>,
     /// The action that authorized the latest model request.
     model_action: Option<u64>,
+    /// Whether this connection arrived on the extraction helper's channel.
+    extractor: bool,
 }
 
 /// How long a model request waits for in-flight reservations to settle.
 const MODEL_BUDGET_WAIT: Duration = Duration::from_secs(30);
 
 impl BrokerRequestAuthorizer {
+    fn record_ranked_response(&mut self, pinned_sha512: Option<[u8; 64]>) -> Result<(), String> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err("origin disconnected before response delivery".to_owned());
+        }
+        let (method, path) = self
+            .authorized_request
+            .take()
+            .ok_or_else(|| "egress response has no authorized request".to_owned())?;
+        // The helper's fetch reaches only the helper, never the guest, so it
+        // does not lower the guest's floor; the extraction is audited instead.
+        if !self.extractor {
+            self.state
+                .lock()
+                .map_err(|_| "kernel broker state is unavailable".to_owned())?
+                .observe_egress_response(self.target.host.clone(), &method, path, pinned_sha512)?;
+        }
+        self.send_handoff.response_recorded(&self.cancelled)?;
+        // Authorization and the cancellation handoff precede DNS/TCP/TLS and
+        // request forwarding. Keep a newly minted reusable grant provisional
+        // until trusted transport has an upstream response ready for the live
+        // origin. Any setup or forwarding failure then drops this authorizer
+        // and revokes only the grant created by this exact action.
+        self.uncommitted_grant_action = None;
+        Ok(())
+    }
+
+    /// On the helper's channel a fetch must be the active job's source, and a
+    /// model call must follow that fetch (PLAN D83). The fetched body's digest
+    /// is recorded just after delivery, so a model call waits briefly for it.
+    fn bind_extraction_request(&self, method: &str, path: &str) -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| "kernel broker state is unavailable".to_owned())?;
+            let job = state
+                .extractions
+                .active
+                .as_ref()
+                .ok_or("no extraction job is active")?;
+            if self.target.host != state.kernel.policy.model_host {
+                return (method == "GET" && self.target.host == job.host && path == job.path)
+                    .then_some(())
+                    .ok_or_else(|| "an extraction fetch must be its job's source".to_owned());
+            }
+            if job.fetched.is_some() {
+                return Ok(());
+            }
+            drop(state);
+            if Instant::now() >= deadline {
+                return Err("an extraction model call must follow its fetch".to_owned());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Waits, outside the state lock, while this request would fit once the
     /// reservations already in flight settle. A harness sends small helper
     /// requests beside its main one; refusing the main request only because a
@@ -5716,10 +6410,51 @@ impl EgressRequestAuthorizer for BrokerRequestAuthorizer {
     }
 
     fn observe_model_output(&mut self, arguments: &[String]) {
+        if self.extractor {
+            return;
+        }
         if let Ok(mut state) = self.state.lock() {
             for argument in arguments {
                 state.model_output.add(argument);
             }
+        }
+    }
+
+    fn extraction_rule(&mut self) -> Option<ExtractionRule> {
+        if !self.extractor {
+            return None;
+        }
+        let state = self.state.lock().ok()?;
+        let job = state.extractions.active.as_ref()?;
+        let schema = state.extraction.as_ref()?.registry.get(&job.schema)?;
+        Some(ExtractionRule {
+            tool: extraction_tool(schema),
+            content_digest: job.fetched?,
+        })
+    }
+
+    fn observe_response_body(&mut self, body: &[u8]) {
+        if !self.extractor {
+            return;
+        }
+        if let Ok(mut state) = self.state.lock()
+            && self.target.host != state.kernel.policy.model_host
+            && let Some(job) = state.extractions.active.as_mut()
+            && job.fetched.is_none()
+        {
+            job.fetched = Some(sha256(body));
+        }
+    }
+
+    fn observe_tool_calls(&mut self, inputs: &[serde_json::Value]) {
+        if !self.extractor {
+            return;
+        }
+        if let Ok(mut state) = self.state.lock()
+            && self.target.host == state.kernel.policy.model_host
+            && let Some(job) = state.extractions.active.as_mut()
+        {
+            job.candidate = inputs.first().cloned();
         }
     }
 
@@ -5752,6 +6487,9 @@ impl EgressRequestAuthorizer for BrokerRequestAuthorizer {
         }
         if self.model_reservation.is_some() {
             return Err("previous model reservation has no terminal outcome".to_owned());
+        }
+        if self.extractor {
+            self.bind_extraction_request(method, path)?;
         }
         if let Some(request) = &model_budget {
             self.await_model_budget(request);
@@ -5797,25 +6535,22 @@ impl EgressRequestAuthorizer for BrokerRequestAuthorizer {
     }
 
     fn record_response(&mut self) -> Result<(), String> {
-        if self.cancelled.load(Ordering::Acquire) {
-            return Err("origin disconnected before response delivery".to_owned());
-        }
-        let (method, path) = self
-            .authorized_request
-            .take()
-            .ok_or_else(|| "egress response has no authorized request".to_owned())?;
-        self.state
-            .lock()
-            .map_err(|_| "kernel broker state is unavailable".to_owned())?
-            .observe_egress_response(self.target.host.clone(), &method, path)?;
-        self.send_handoff.response_recorded(&self.cancelled)?;
-        // Authorization and the cancellation handoff precede DNS/TCP/TLS and
-        // request forwarding. Keep a newly minted reusable grant provisional
-        // until trusted transport has an upstream response ready for the live
-        // origin. Any setup or forwarding failure then drops this authorizer
-        // and revokes only the grant created by this exact action.
-        self.uncommitted_grant_action = None;
-        Ok(())
+        self.record_ranked_response(None)
+    }
+
+    fn response_is_pinned(&mut self) -> bool {
+        let (Some((method, path)), false) = (&self.authorized_request, self.extractor) else {
+            return false;
+        };
+        method == "GET"
+            && self
+                .state
+                .lock()
+                .is_ok_and(|state| state.lockfile_pins.get(&self.target.host, path).is_some())
+    }
+
+    fn record_pinned_response(&mut self, body_sha512: [u8; 64]) -> Result<(), String> {
+        self.record_ranked_response(Some(body_sha512))
     }
 
     fn mark_model_request_send_attempted(&mut self) -> Result<(), String> {
@@ -5972,7 +6707,10 @@ impl Drop for PeerMonitor {
 
 enum BrokerRequest {
     Egress(EgressRequest),
-    Git(Asserted, [u8; 32]),
+    Git(Asserted, [u8; 32], Vec<u8>),
+    Extract { source: String, schema: String },
+    ExtractJob,
+    ExtractDone(u64),
     GitReport(GitOutcomeReport),
     External(Asserted),
 }
@@ -5985,45 +6723,80 @@ struct GitOutcomeReport {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[derive(Default)]
+struct ShutdownHandoff {
+    boundaries: Vec<EnforcementBoundary>,
+    teardown: Option<RunTeardownEvent>,
+}
+
+/// Removes the broker's socket and private directory, including the private
+/// push base and indexes inside it, once no client can connect, and reports
+/// whether both are gone.
+fn release_broker_socket(root: &Path) -> TeardownCheck {
+    let socket = root.join("actions.sock");
+    let removed = [fs::remove_file(&socket), fs::remove_dir_all(root)]
+        .into_iter()
+        .filter_map(Result::err)
+        .find(|error| error.kind() != ErrorKind::NotFound);
+    let unmet = match (removed, fs::symlink_metadata(root)) {
+        (Some(error), _) => Some(format!("cannot remove: {error}")),
+        (None, Err(error)) if error.kind() == ErrorKind::NotFound => None,
+        (None, _) => Some("still present".to_owned()),
+    };
+    TeardownCheck {
+        kind: "broker-socket",
+        detail: root.display().to_string(),
+        unmet,
+    }
+}
+
 fn broker_loop(
-    listener: &UnixListener,
+    listeners: [&UnixListener; 2],
     state: &Arc<Mutex<BrokerState>>,
     diagnostics: Option<&Path>,
-    shutdown_boundaries: &Mutex<Vec<EnforcementBoundary>>,
+    shutdown_handoff: &Mutex<ShutdownHandoff>,
+    root: &Path,
     stop: &Arc<AtomicBool>,
 ) -> Result<BrokerReport, String> {
     let mut bridges = Vec::new();
     while !stop.load(Ordering::Acquire) {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                if bridges.len() >= MAX_BROKER_CLIENTS {
-                    let mut stream = stream;
-                    let _ = stream.write_all(&[EGRESS_DENIED]);
-                    let _ = stream.flush();
-                } else {
-                    let state = Arc::clone(state);
-                    let diagnostics = diagnostics.map(Path::to_path_buf);
-                    let shutdown = Arc::clone(stop);
-                    let client = thread::Builder::new()
-                        .name("keel-broker-client".to_owned())
-                        .spawn(move || {
-                            if let Ok(Some(bridge)) = handle_broker_connection(
-                                stream,
-                                &state,
-                                diagnostics.as_deref(),
-                                &shutdown,
-                            ) {
-                                let _ = bridge.join();
-                            }
-                        })
-                        .map_err(|error| error.to_string())?;
-                    bridges.push(client);
+        let mut idle = true;
+        for (index, listener) in listeners.iter().enumerate() {
+            let extractor = index == 1;
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    idle = false;
+                    if bridges.len() >= MAX_BROKER_CLIENTS {
+                        let mut stream = stream;
+                        let _ = stream.write_all(&[EGRESS_DENIED]);
+                        let _ = stream.flush();
+                    } else {
+                        let state = Arc::clone(state);
+                        let diagnostics = diagnostics.map(Path::to_path_buf);
+                        let shutdown = Arc::clone(stop);
+                        let client = thread::Builder::new()
+                            .name("keel-broker-client".to_owned())
+                            .spawn(move || {
+                                if let Ok(Some(bridge)) = handle_broker_connection(
+                                    stream,
+                                    &state,
+                                    diagnostics.as_deref(),
+                                    &shutdown,
+                                    extractor,
+                                ) {
+                                    let _ = bridge.join();
+                                }
+                            })
+                            .map_err(|error| error.to_string())?;
+                        bridges.push(client);
+                    }
                 }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.to_string()),
             }
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(20));
-            }
-            Err(error) => return Err(error.to_string()),
+        }
+        if idle {
+            thread::sleep(Duration::from_millis(20));
         }
         let mut index = 0;
         while index < bridges.len() {
@@ -6043,11 +6816,16 @@ fn broker_loop(
         .map_err(|_| "kernel broker state is unavailable".to_owned())?;
     state.close_unreported_pushes();
     state.close_model_reservations()?;
-    let extra = shutdown_boundaries
-        .lock()
-        .map_err(|_| "kernel shutdown boundaries are unavailable".to_owned())?
-        .clone();
-    state.record_enforcement_state_with("shutdown", extra)?;
+    let handoff = std::mem::take(
+        &mut *shutdown_handoff
+            .lock()
+            .map_err(|_| "kernel shutdown handoff is unavailable".to_owned())?,
+    );
+    state.record_enforcement_state_with("shutdown", handoff.boundaries)?;
+    if let Some(mut teardown) = handoff.teardown {
+        teardown.checks.push(release_broker_socket(root));
+        state.audit.record_run_teardown(teardown)?;
+    }
     let report = BrokerReport {
         audit_events: state.audit.events,
         denied_actions: u64::from(state.kernel.session().denied_actions()),
@@ -6064,6 +6842,7 @@ fn handle_broker_connection(
     state: &Arc<Mutex<BrokerState>>,
     diagnostics: Option<&Path>,
     shutdown: &Arc<AtomicBool>,
+    extractor: bool,
 ) -> Result<Option<JoinHandle<()>>, String> {
     // Sockets accepted from a non-blocking listener inherit O_NONBLOCK, and a
     // read timeout does not clear it. The broker protocol and the trusted proxy
@@ -6077,21 +6856,59 @@ fn handle_broker_connection(
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|error| error.to_string())?;
-    let Ok((origin, request)) = read_broker_request(&mut stream) else {
+    // Requests are typed by channel: the helper's socket carries only its
+    // jobs and its own egress, and the main socket never carries a job.
+    let request = read_broker_request(&mut stream)
+        .ok()
+        .filter(|(_, request)| {
+            let helper = matches!(
+                request,
+                BrokerRequest::ExtractJob | BrokerRequest::ExtractDone(_)
+            );
+            if extractor {
+                helper || matches!(request, BrokerRequest::Egress(_))
+            } else {
+                !helper
+            }
+        });
+    let Some((origin, request)) = request else {
         stream
             .write_all(&[EGRESS_DENIED])
             .map_err(|error| error.to_string())?;
         stream.flush().map_err(|error| error.to_string())?;
         return Ok(None);
     };
-    if let BrokerRequest::Git(asserted, body_digest) = request {
+    match request {
+        BrokerRequest::Extract { source, schema } => {
+            return serve_extraction(&mut stream, state, shutdown, &source, &schema).map(|()| None);
+        }
+        BrokerRequest::ExtractJob => {
+            return serve_extraction_job(&mut stream, state, shutdown).map(|()| None);
+        }
+        BrokerRequest::ExtractDone(id) => {
+            let finished = state
+                .lock()
+                .is_ok_and(|mut state| state.finish_extraction(id));
+            stream
+                .write_all(&[if finished {
+                    EXTRACT_OK
+                } else {
+                    EXTRACT_REFUSED
+                }])
+                .and_then(|()| stream.flush())
+                .map_err(|error| error.to_string())?;
+            return Ok(None);
+        }
+        _ => {}
+    }
+    if let BrokerRequest::Git(asserted, body_digest, body) = request {
         let monitor = PeerMonitor::start(&stream, shutdown)?;
         let cancelled = &monitor.cancelled;
         let authorized = run_unlocked(
             state,
             cancelled,
             || Ok(()),
-            |state| state.begin_git(asserted, body_digest, origin, cancelled),
+            |state| state.begin_git(asserted, body_digest, &body, origin, cancelled),
             |state, begun, outcome| state.finish_git(begun, outcome, cancelled),
         )
         .unwrap_or(None);
@@ -6144,7 +6961,7 @@ fn handle_broker_connection(
         return Ok(None);
     }
     let BrokerRequest::Egress(request) = request else {
-        unreachable!("Git and external requests return above");
+        unreachable!("Git, external, and extraction requests return above");
     };
     let monitor = PeerMonitor::start(&stream, shutdown)?;
     if monitor.cancelled.load(Ordering::Acquire) {
@@ -6219,6 +7036,7 @@ fn handle_broker_connection(
                     origin,
                     context: Vec::new(),
                     model_action: None,
+                    extractor,
                 };
                 let forward = session.forward(stream, &mut authorizer);
                 let close = authorizer.close_open_model_reservation();
@@ -6232,6 +7050,119 @@ fn handle_broker_connection(
         return Ok(Some(bridge));
     }
     Ok(None)
+}
+
+/// Queues a guest's extraction and answers with only its validated result.
+/// The raw source never reaches this connection: the helper fetches it on
+/// its own channel.
+fn serve_extraction(
+    stream: &mut UnixStream,
+    state: &Arc<Mutex<BrokerState>>,
+    shutdown: &Arc<AtomicBool>,
+    source: &str,
+    schema: &str,
+) -> Result<(), String> {
+    let queued = state
+        .lock()
+        .map_err(|_| "kernel broker state is unavailable".to_owned())
+        .and_then(|mut state| state.enqueue_extraction(source, schema));
+    let outcome = match queued {
+        Err(error) => Err(error),
+        Ok(id) => {
+            let monitor = PeerMonitor::start(stream, shutdown)?;
+            let deadline = Instant::now() + EXTRACTION_WAIT;
+            loop {
+                let result = state
+                    .lock()
+                    .map_err(|_| "kernel broker state is unavailable".to_owned())?
+                    .extractions
+                    .done
+                    .remove(&id);
+                if let Some(result) = result {
+                    break result;
+                }
+                if monitor.cancelled.load(Ordering::Acquire)
+                    || shutdown.load(Ordering::Acquire)
+                    || Instant::now() >= deadline
+                {
+                    if let Ok(mut state) = state.lock() {
+                        state.extractions.queue.retain(|job| job.id != id);
+                    }
+                    break Err("the extraction did not finish".to_owned());
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    let mut reply = Vec::new();
+    match outcome {
+        Ok(result) => {
+            let result = result.to_string();
+            reply.push(EXTRACT_OK);
+            reply.extend_from_slice(
+                &u32::try_from(result.len())
+                    .map_err(|error| error.to_string())?
+                    .to_be_bytes(),
+            );
+            reply.extend_from_slice(result.as_bytes());
+        }
+        Err(reason) => {
+            let reason = reason.chars().take(512).collect::<String>();
+            reply.push(EXTRACT_REFUSED);
+            reply.extend_from_slice(&u16::try_from(reason.len()).unwrap_or(0).to_be_bytes());
+            reply.extend_from_slice(reason.as_bytes());
+        }
+    }
+    stream
+        .write_all(&reply)
+        .and_then(|()| stream.flush())
+        .map_err(|error| error.to_string())
+}
+
+/// Hands the extraction helper its next job, waiting briefly for one.
+fn serve_extraction_job(
+    stream: &mut UnixStream,
+    state: &Arc<Mutex<BrokerState>>,
+    shutdown: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let job = loop {
+        let job = state
+            .lock()
+            .map_err(|_| "kernel broker state is unavailable".to_owned())?
+            .next_extraction_job();
+        if job.is_some() || shutdown.load(Ordering::Acquire) || Instant::now() >= deadline {
+            break job;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    let mut reply = Vec::new();
+    match job {
+        None => reply.push(EXTRACT_IDLE),
+        Some((id, host, path, model, tool)) => {
+            reply.push(EXTRACT_JOB);
+            reply.extend_from_slice(&id.to_be_bytes());
+            for field in [host, path, model] {
+                reply.extend_from_slice(
+                    &u16::try_from(field.len())
+                        .map_err(|error| error.to_string())?
+                        .to_be_bytes(),
+                );
+                reply.extend_from_slice(field.as_bytes());
+            }
+            let tool = tool.to_string();
+            reply.extend_from_slice(
+                &u32::try_from(tool.len())
+                    .map_err(|error| error.to_string())?
+                    .to_be_bytes(),
+            );
+            reply.extend_from_slice(tool.as_bytes());
+        }
+    }
+    stream
+        .write_all(&reply)
+        .and_then(|()| stream.flush())
+        .map_err(|error| error.to_string())
 }
 
 /// Appends one bounded, control-character-free bridge failure line.
@@ -6289,13 +7220,29 @@ fn read_typed_request(stream: &mut UnixStream, marker: &[u8]) -> Result<BrokerRe
     }
     if marker == GIT_BROKER_MAGIC {
         return read_git_request(stream)
-            .map(|(asserted, digest)| BrokerRequest::Git(asserted, digest));
+            .map(|(asserted, digest, body)| BrokerRequest::Git(asserted, digest, body));
     }
     if marker == GIT_REPORT_MAGIC {
         return read_git_report(stream).map(BrokerRequest::GitReport);
     }
     if marker == EXTERNAL_BROKER_MAGIC {
         return read_external_request(stream).map(BrokerRequest::External);
+    }
+    if marker == EXTRACT_MAGIC {
+        return Ok(BrokerRequest::Extract {
+            source: read_bounded_string(stream, 2_100, "extraction source")?,
+            schema: read_bounded_string(stream, 64, "extraction schema")?,
+        });
+    }
+    if marker == EXTRACT_JOB_MAGIC {
+        return Ok(BrokerRequest::ExtractJob);
+    }
+    if marker == EXTRACT_DONE_MAGIC {
+        let mut id = [0_u8; 8];
+        stream
+            .read_exact(&mut id)
+            .map_err(|error| error.to_string())?;
+        return Ok(BrokerRequest::ExtractDone(u64::from_be_bytes(id)));
     }
     Err("invalid broker request marker".to_owned())
 }
@@ -6355,7 +7302,8 @@ fn read_egress_request(stream: &mut UnixStream) -> Result<EgressRequest, String>
     })
 }
 
-fn read_git_request(stream: &mut UnixStream) -> Result<(Asserted, [u8; 32]), String> {
+fn read_git_request(stream: &mut UnixStream) -> Result<(Asserted, [u8; 32], Vec<u8>), String> {
+    const MAX_PUSH_BODY: usize = 32 * 1024 * 1024;
     const MAX_REMOTE_LENGTH: usize = 4_096;
     const MAX_REFS: usize = 256;
     const MAX_REF_LENGTH: usize = 1_024;
@@ -6420,6 +7368,23 @@ fn read_git_request(stream: &mut UnixStream) -> Result<(Asserted, [u8; 32]), Str
     stream
         .read_exact(&mut body_digest)
         .map_err(|error| error.to_string())?;
+    // The receive-pack body itself, so the permit binds bytes the kernel has
+    // inspected rather than a digest the relay computed.
+    let mut length = [0_u8; 4];
+    stream
+        .read_exact(&mut length)
+        .map_err(|error| error.to_string())?;
+    let length = usize::try_from(u32::from_be_bytes(length)).map_err(|error| error.to_string())?;
+    if !(1..=MAX_PUSH_BODY).contains(&length) {
+        return Err("Git push body length is outside its bound".to_owned());
+    }
+    let mut body = vec![0_u8; length];
+    stream
+        .read_exact(&mut body)
+        .map_err(|error| error.to_string())?;
+    if sha256_bytes(&body) != body_digest {
+        return Err("Git push body does not match its digest".to_owned());
+    }
     Ok((
         Asserted {
             class: ActionClass::GitPush,
@@ -6434,6 +7399,7 @@ fn read_git_request(stream: &mut UnixStream) -> Result<(Asserted, [u8; 32]), Str
             declared_cost: None,
         },
         body_digest,
+        body,
     ))
 }
 

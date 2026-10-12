@@ -46,7 +46,7 @@ mod macos {
         io::{self, Read as _, Write},
         net::Shutdown,
         os::fd::{FromRawFd, OwnedFd},
-        os::unix::net::UnixStream,
+        os::unix::{fs::OpenOptionsExt as _, net::UnixStream},
         path::{Path, PathBuf},
         sync::{
             Arc, Mutex,
@@ -141,10 +141,12 @@ mod macos {
         _egress_listener: Retained<VZVirtioSocketListener>,
         _git_listener: Retained<VZVirtioSocketListener>,
         _terminal_listener: Retained<VZVirtioSocketListener>,
+        _telemetry_listener: Retained<VZVirtioSocketListener>,
         _mcp_delegate: Retained<VsockDelegate>,
         _egress_delegate: Retained<VsockDelegate>,
         _git_delegate: Retained<VsockDelegate>,
         _terminal_delegate: Retained<VsockDelegate>,
+        _telemetry_delegate: Retained<VsockDelegate>,
     }
 
     impl VsockServices {
@@ -157,30 +159,37 @@ mod macos {
             let (egress_tx, egress_rx) = mpsc::sync_channel(SERVICE_QUEUE_DEPTH);
             let (git_tx, git_rx) = mpsc::sync_channel(SERVICE_QUEUE_DEPTH);
             let (terminal_tx, terminal_rx) = mpsc::sync_channel(1);
+            let (telemetry_tx, telemetry_rx) = mpsc::sync_channel(1);
             let mcp_delegate = VsockDelegate::new(mcp_tx);
             let egress_delegate = VsockDelegate::new(egress_tx);
             let git_delegate = VsockDelegate::new(git_tx);
             let terminal_delegate = VsockDelegate::new(terminal_tx);
+            let telemetry_delegate = VsockDelegate::new(telemetry_tx);
             // SAFETY: listeners are configured before the VM starts and are
             // retained for the complete VM lifetime.
             let mcp_listener = unsafe { VZVirtioSocketListener::new() };
             let egress_listener = unsafe { VZVirtioSocketListener::new() };
             let git_listener = unsafe { VZVirtioSocketListener::new() };
             let terminal_listener = unsafe { VZVirtioSocketListener::new() };
+            let telemetry_listener = unsafe { VZVirtioSocketListener::new() };
             unsafe {
                 mcp_listener.setDelegate(Some(ProtocolObject::from_ref(&*mcp_delegate)));
                 egress_listener.setDelegate(Some(ProtocolObject::from_ref(&*egress_delegate)));
                 git_listener.setDelegate(Some(ProtocolObject::from_ref(&*git_delegate)));
                 terminal_listener.setDelegate(Some(ProtocolObject::from_ref(&*terminal_delegate)));
+                telemetry_listener
+                    .setDelegate(Some(ProtocolObject::from_ref(&*telemetry_delegate)));
             }
             spawn_service("egress", egress_rx, run_egress);
             spawn_service("Git", git_rx, move |fd| run_git(fd, git_service.as_deref()));
+            spawn_service("telemetry", telemetry_rx, record_guest_events);
 
             let setup_vm = QueueBound(vm.clone());
             let setup_mcp_listener = QueueBound(mcp_listener.clone());
             let setup_egress_listener = QueueBound(egress_listener.clone());
             let setup_git_listener = QueueBound(git_listener.clone());
             let setup_terminal_listener = QueueBound(terminal_listener.clone());
+            let setup_telemetry_listener = QueueBound(telemetry_listener.clone());
             queue.exec_sync(move || unsafe {
                 if let Some(device) = setup_vm.socketDevices().firstObject() {
                     let device: Retained<VZVirtioSocketDevice> = Retained::cast_unchecked(device);
@@ -188,6 +197,10 @@ mod macos {
                     device.setSocketListener_forPort(&setup_egress_listener, EGRESS_VSOCK_PORT);
                     device.setSocketListener_forPort(&setup_git_listener, GIT_VSOCK_PORT);
                     device.setSocketListener_forPort(&setup_terminal_listener, TERMINAL_VSOCK_PORT);
+                    device.setSocketListener_forPort(
+                        &setup_telemetry_listener,
+                        keel_mcp::telemetry::TELEMETRY_VSOCK_PORT,
+                    );
                 }
             });
 
@@ -197,10 +210,12 @@ mod macos {
                     _egress_listener: egress_listener,
                     _git_listener: git_listener,
                     _terminal_listener: terminal_listener,
+                    _telemetry_listener: telemetry_listener,
                     _mcp_delegate: mcp_delegate,
                     _egress_delegate: egress_delegate,
                     _git_delegate: git_delegate,
                     _terminal_delegate: terminal_delegate,
+                    _telemetry_delegate: telemetry_delegate,
                 },
                 mcp_rx,
                 terminal_rx,
@@ -264,6 +279,7 @@ mod macos {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // VM configuration has many independent inputs
     fn build_configuration(
         kernel: &Path,
         initramfs: &Path,
@@ -272,6 +288,7 @@ mod macos {
         cpus: usize,
         rootfs: Option<&Path>,
         memory_gib: usize,
+        ephemeral_workspace: bool,
     ) -> Result<Retained<VZVirtualMachineConfiguration>, Box<dyn Error + Send + Sync>> {
         // SAFETY: all Objective-C objects are retained for the resulting
         // configuration and setters receive correctly typed objects.
@@ -282,7 +299,11 @@ mod macos {
             bootloader.setInitialRamdiskURL(Some(&file_url(initramfs)));
             let mut command_line = "console=hvc0 panic=-1 reboot=k".to_owned();
             if workspace.is_some() {
-                command_line.push_str(" keel.workspace=virtiofs");
+                command_line.push_str(if ephemeral_workspace {
+                    " keel.workspace=overlay"
+                } else {
+                    " keel.workspace=virtiofs"
+                });
             }
             if control.is_some() {
                 command_line.push_str(" keel.control=virtiofs");
@@ -343,7 +364,7 @@ mod macos {
 
             let mut directory_devices = Vec::new();
             for (path, tag, read_only) in [
-                (workspace, "keel-workspace", false),
+                (workspace, "keel-workspace", ephemeral_workspace),
                 (control, "keel-control", true),
             ] {
                 let Some(path) = path else {
@@ -866,6 +887,39 @@ mod macos {
         });
     }
 
+    /// Appends the guest's event stream to the one session file the trusted
+    /// launcher lets this process write. Without it, the stream is drained.
+    fn record_guest_events(fd: OwnedFd) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let stream = UnixStream::from(fd);
+        stream.set_nonblocking(false)?;
+        let now_ms = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| {
+                    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+                })
+        };
+        let reader = io::BufReader::new(stream);
+        let stats = match env::var_os("KEEL_GUEST_EVENTS") {
+            Some(path) => {
+                let file = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .mode(0o600)
+                    .open(path)?;
+                keel_mcp::telemetry::record_events(reader, io::BufWriter::new(file), now_ms)?
+            }
+            None => keel_mcp::telemetry::record_events(reader, io::sink(), now_ms)?,
+        };
+        if stats.rejected > 0 || stats.over_limit > 0 {
+            eprintln!(
+                "keel-vz: guest events: {} recorded, {} rejected, {} over the size limit",
+                stats.recorded, stats.rejected, stats.over_limit
+            );
+        }
+        Ok(())
+    }
+
     fn relay_terminal(fd: OwnedFd) -> io::Result<()> {
         let mut output = UnixStream::from(fd);
         output.set_nonblocking(false)?;
@@ -908,12 +962,13 @@ mod macos {
         cpus: usize,
         rootfs: Option<OsString>,
         memory_gib: usize,
+        ephemeral_workspace: bool,
     }
 
     fn parse_launch_arguments(
         mut args: impl Iterator<Item = OsString>,
     ) -> Result<LaunchArguments, Box<dyn Error + Send + Sync>> {
-        let usage = "usage: keel-vz-spike KERNEL INITRAMFS [WORKSPACE [CONTROL]] [--cpus N] [--memory GIB] [--rootfs IMAGE]";
+        let usage = "usage: keel-vz-spike KERNEL INITRAMFS [WORKSPACE [CONTROL]] [--cpus N] [--memory GIB] [--rootfs IMAGE] [--ephemeral-workspace]";
         let kernel = args.next().ok_or(usage)?;
         let initramfs = args.next().ok_or(usage)?;
         let mut workspace = None;
@@ -922,7 +977,12 @@ mod macos {
         let mut cpus_set = false;
         let mut rootfs = None;
         let mut memory_gib = None;
+        let mut ephemeral_workspace = false;
         while let Some(argument) = args.next() {
+            if argument == "--ephemeral-workspace" {
+                ephemeral_workspace = true;
+                continue;
+            }
             if argument == "--memory" {
                 if memory_gib.is_some() {
                     return Err("--memory may only be specified once".into());
@@ -965,6 +1025,7 @@ mod macos {
         Ok(LaunchArguments {
             kernel,
             initramfs,
+            ephemeral_workspace,
             workspace,
             control,
             cpus,
@@ -1011,6 +1072,7 @@ mod macos {
             arguments.cpus,
             arguments.rootfs.as_deref().map(Path::new),
             arguments.memory_gib,
+            arguments.ephemeral_workspace,
         )?;
         let queue = DispatchQueue::new("dev.keel.phase0.vm", None);
         // SAFETY: VZ requires VM creation with a validated configuration and
@@ -1143,9 +1205,26 @@ mod macos {
                     cpus: 6,
                     rootfs: None,
                     memory_gib: 2,
+                    ephemeral_workspace: false,
                 }
             );
+
+            let ephemeral = parse_launch_arguments(
+                ["kernel", "initramfs", "workspace", "--ephemeral-workspace"]
+                    .into_iter()
+                    .map(OsString::from),
+            )
+            .unwrap();
+            assert!(ephemeral.ephemeral_workspace);
+            assert_eq!(
+                ephemeral.workspace.as_deref(),
+                Some(OsString::from("workspace").as_os_str())
+            );
         }
+
+        /// The origin frame a guest relay sends before any egress bytes.
+        const TEST_ORIGIN: &[u8] =
+            br#"{"known":true,"workspace_code":false,"chain":[{"exe":"/usr/bin/curl","argv":["curl"]}]}"#;
 
         fn request_through_kernel(
             request: &[u8],
@@ -1158,7 +1237,13 @@ mod macos {
             )
             .unwrap();
             let (mut guest, host) = UnixStream::pair().unwrap();
+            keel_conn::write_origin_frame(&mut guest, TEST_ORIGIN).unwrap();
             guest.write_all(request).unwrap();
+            // Never half-close: the kernel reads a closed write side as the
+            // origin leaving, and cancels before any decision.
+            guest
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
             run_egress_with_kernel(host.into(), Some(broker.socket_path())).unwrap();
             let mut response = String::new();
             guest.read_to_string(&mut response).unwrap();
@@ -1168,6 +1253,7 @@ mod macos {
         #[test]
         fn egress_connect_is_classified_and_denied() {
             let (mut guest, host) = UnixStream::pair().unwrap();
+            keel_conn::write_origin_frame(&mut guest, TEST_ORIGIN).unwrap();
             guest
                 .write_all(b"CONNECT Docs.Example:443 HTTP/1.1\r\n\r\n")
                 .unwrap();
@@ -1186,6 +1272,7 @@ mod macos {
             host.set_nonblocking(true).unwrap();
             let exchange = thread::spawn(move || {
                 thread::sleep(Duration::from_millis(20));
+                keel_conn::write_origin_frame(&mut guest, TEST_ORIGIN).unwrap();
                 guest
                     .write_all(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n\r\n")
                     .unwrap();
@@ -1202,12 +1289,15 @@ mod macos {
 
         #[test]
         fn hostile_curl_requests_cross_the_runtime_and_fail_closed() {
+            // Plain HTTP setup is local; the request itself is judged after
+            // it, escalated to the operator, and here denied. The guest sees
+            // only a dropped connection; the denial is counted.
             let (response, report) = request_through_kernel(
-                b"CONNECT evil.example:443 HTTP/1.1\r\nHost: evil.example:443\r\n\r\n",
+                b"GET http://evil.example/ HTTP/1.1\r\nHost: evil.example\r\n\r\n",
                 BTreeSet::new(),
             );
-            assert!(response.starts_with("HTTP/1.1 403 Forbidden\r\n"));
-            assert_eq!(report.audit_events, 1);
+            assert!(response.is_empty());
+            assert_eq!(report.session_facts.escalated_actions, 1);
             assert_eq!(report.denied_actions, 1);
             assert_eq!(report.execution_failures, 0);
 

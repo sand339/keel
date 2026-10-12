@@ -10,6 +10,24 @@ pub use policy::{
 };
 
 use ring::digest::{SHA256, digest};
+
+/// The hash a run request pins for an extraction schema bundle (PLAN D83),
+/// in the `keel-extraction-v1` domain that trusted admission checks.
+#[must_use]
+pub fn extraction_bundle_hash(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    digest(
+        &SHA256,
+        &[b"keel-extraction-v1\0".as_slice(), bytes].concat(),
+    )
+    .as_ref()
+    .iter()
+    .fold(String::new(), |mut text, byte| {
+        let _ = write!(text, "{byte:02x}");
+        text
+    })
+}
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,

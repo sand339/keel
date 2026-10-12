@@ -3,17 +3,19 @@
 
 use keel_audit::{AuditWriter, KernelAudit, Redactor, RunKey};
 pub use keel_kernel::{
-    ApprovalMethod, GateController, GatePayload, GateReason, PendingApproval, TerminalGate,
-    terminal_gate_channel,
+    ApprovalMethod, GateController, GatePayload, GateReason, PendingApproval, RunTeardownEvent,
+    TeardownCheck, TerminalGate, terminal_gate_channel,
 };
 use keel_kernel::{
-    BrokerReport, EnforcementBoundary, EnforcementState, Gate, KernelBroker, KernelBrokerControl,
-    ModelBudgetLimits, PayloadPolicy, ProvenanceMode,
+    BrokerReport, EnforcementBoundary, EnforcementState, ExtractionConfig, Gate, KernelBroker,
+    KernelBrokerControl, ModelBudgetLimits, PayloadPolicy, ProvenanceMode, PushInspection,
+    RunResourceEvent,
 };
 use keel_policy::{ArtifactHash, StatefulPolicy};
 use keel_provenance::{
-    FloorState, IntentFlags, PayloadIndex, PersistedMode, Scope, SessionFacts, SourceRef,
-    TaskAdmission, trusted_git_command,
+    FloorState, IntentFlags, MAX_BUNDLE_BYTES, ModelOutputIndex, PayloadIndex, PersistedMode,
+    SchemaRegistry, Scope, SessionFacts, SourceRef, TaskAdmission, committed_paths,
+    trusted_git_command,
 };
 use keel_secrets::{GitCredentialScope, GitHubAuthorities, SystemEgressConnector};
 use ring::digest::{Context as DigestContext, SHA256};
@@ -26,6 +28,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 mod manifest;
+mod own_workspace;
 
 static AUDIT_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// The secure-attention byte reserved by the Phase 0 terminal spike.
@@ -34,6 +37,7 @@ const MAX_CHALLENGE: usize = 16;
 const MAX_REQUEST_FILE: usize = 1024 * 1024;
 
 #[derive(Deserialize)]
+#[allow(clippy::struct_excessive_bools)] // flat view of independent run flags
 struct RunRequestView {
     session_id: String,
     provenance: String,
@@ -42,9 +46,16 @@ struct RunRequestView {
     #[serde(default)]
     reuse_connections: bool,
     #[serde(default)]
+    record_targets: bool,
+    #[serde(default)]
+    ephemeral_workspace: bool,
+    #[serde(default)]
     mux: bool,
     #[serde(default)]
     policy_bundle_hash: Option<String>,
+    /// Hash of the extraction schema bundle copied into the session (D83).
+    #[serde(default)]
+    extraction_schemas_hash: Option<String>,
     model_token_budget: Option<u64>,
     model_cost_budget_microusd: Option<u64>,
     #[serde(default)]
@@ -67,19 +78,19 @@ fn default_isolation() -> String {
     "vm".to_owned()
 }
 
-/// A triage run's declared scope. The operator admits it, and the run's
+/// A scoped run's declared scope. The operator admits it, and the run's
 /// provider, on the trusted terminal before anything starts.
-fn triage_scope(request: &RunRequestView) -> Result<Option<Scope>, String> {
+fn run_scope(request: &RunRequestView) -> Result<Option<Scope>, String> {
     match request.profile.as_deref() {
         None => Ok(None),
-        Some("triage") => Scope::parse(&request.scope, &request.exclude).map(Some),
+        Some("scoped") => Scope::parse(&request.scope, &request.exclude).map(Some),
         Some(other) => Err(format!("unknown run profile `{other}`")),
     }
 }
 
-/// Refuses a triage run whose model provider is not on the approved list,
+/// Refuses a scoped run whose model provider is not on the approved list,
 /// because the model endpoint receives the report and everything the run sees.
-fn approved_for_triage(
+fn approved_for_scoped_run(
     provider: &keel_secrets::ModelProvider,
     scope: Option<&Scope>,
 ) -> Result<(), String> {
@@ -87,7 +98,7 @@ fn approved_for_triage(
         return Ok(());
     }
     let approved =
-        std::env::var("KEEL_TRIAGE_PROVIDERS").unwrap_or_else(|_| "anthropic,bedrock".to_owned());
+        std::env::var("KEEL_SCOPED_PROVIDERS").unwrap_or_else(|_| "anthropic,bedrock".to_owned());
     if approved
         .split(',')
         .any(|name| name.trim() == provider.name())
@@ -95,7 +106,7 @@ fn approved_for_triage(
         Ok(())
     } else {
         Err(format!(
-            "triage runs use only approved model providers ({approved}), not {}",
+            "scoped runs use only approved model providers ({approved}), not {}",
             provider.name()
         ))
     }
@@ -117,6 +128,7 @@ fn parse_model_budget(request: &RunRequestView) -> Result<(ModelBudgetLimits, bo
 
 /// Trusted subset of one runtime request.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)] // independent run flags, not a state machine
 pub struct RuntimeIntent {
     session_id: String,
     egress_hosts: BTreeSet<String>,
@@ -126,6 +138,8 @@ pub struct RuntimeIntent {
     state_directory: PathBuf,
     provenance: ProvenanceMode,
     reuse_connections: bool,
+    record_targets: bool,
+    ephemeral_workspace: bool,
     mux: bool,
     isolation: String,
     policy_bundle_hash: Option<String>,
@@ -138,8 +152,12 @@ pub struct RuntimeIntent {
     model: Option<String>,
     cpus: Option<u64>,
     memory_gib: Option<u64>,
-    /// A triage run's operator-declared scope.
+    /// A scoped run's operator-declared scope.
     scope: Option<Scope>,
+    /// `workspace:own`: the `HEAD` the operator is asked to accept at rank 2.
+    own_workspace: Option<own_workspace::OwnWorkspace>,
+    /// Admitted extraction schemas and their bundle hash (PLAN D83).
+    extraction: Option<(SchemaRegistry, String)>,
 }
 
 impl RuntimeIntent {
@@ -169,12 +187,12 @@ impl RuntimeIntent {
             return Err("runtime request contains an invalid session id".to_owned());
         }
         let (model_budget_limits, mut task_authority) = parse_model_budget(&request)?;
-        let scope = triage_scope(&request)?;
+        let scope = run_scope(&request)?;
         let (mut egress_hosts, capabilities) =
             parse_capabilities(request.allow, &mut task_authority)?;
         let mut model_host = String::new();
         let mut model_tariff = None;
-        task_authority |= scope.is_some();
+        task_authority |= scope.is_some() || request.record_targets;
         match request.isolation.as_str() {
             "vm" if request.harness == "v8" => {
                 return Err("the v8 harness cannot run in plain vm mode".to_owned());
@@ -212,7 +230,7 @@ impl RuntimeIntent {
                 ));
                 task_authority = true;
             }
-            approved_for_triage(&provider, scope.as_ref())?;
+            approved_for_scoped_run(&provider, scope.as_ref())?;
             model_host = provider.host;
             egress_hosts.insert(model_host.clone());
             if let Some(region) = provider.region {
@@ -233,13 +251,38 @@ impl RuntimeIntent {
             .ok_or_else(|| "runtime request has no state directory".to_owned())?
             .canonicalize()
             .map_err(|error| error.to_string())?;
+        let extraction = request
+            .extraction_schemas_hash
+            .as_deref()
+            .map(|hash| load_extraction_schemas(&state_directory, hash))
+            .transpose()?;
+        task_authority |= extraction.is_some();
+        let own_workspace = if capabilities.contains("workspace:own") {
+            // Acceptances live beside `sessions/`, outside every session
+            // directory and the workspace the guest writes.
+            let state_root = state_directory
+                .parent()
+                .filter(|sessions| sessions.file_name() == Some(std::ffi::OsStr::new("sessions")))
+                .and_then(Path::parent)
+                .ok_or("workspace:own needs a session under the Keel state directory")?;
+            let root = std::env::current_dir()
+                .and_then(|path| path.canonicalize())
+                .map_err(|error| error.to_string())?;
+            Some(own_workspace::OwnWorkspace::inspect(&root, state_root)?)
+        } else {
+            None
+        };
         Ok(Self {
+            own_workspace,
+            extraction,
             session_id: request.session_id,
             egress_hosts,
             model_host,
             capabilities,
             state_directory,
             reuse_connections: request.reuse_connections,
+            record_targets: request.record_targets,
+            ephemeral_workspace: request.ephemeral_workspace,
             mux: request.mux,
             isolation: request.isolation,
             policy_bundle_hash: request.policy_bundle_hash,
@@ -308,12 +351,23 @@ impl RuntimeIntent {
             cost % 1_000_000,
         ));
         items.extend(self.model_tariff.clone());
-        items.extend(self.scope.as_ref().map(|scope| {
-            format!(
-                "triage scope (all else refused): {}",
-                scope.describe().join(" ")
-            )
-        }));
+        items.extend(
+            self.scope
+                .as_ref()
+                .map(|scope| format!("scope (all else refused): {}", scope.describe().join(" "))),
+        );
+        if self.record_targets {
+            items.push(
+                "record-targets: request hosts and paths are written to the audit log".to_owned(),
+            );
+        }
+        if let Some(own) = &self.own_workspace {
+            items.push(own.summary());
+            items.extend(own.pins_summary());
+        }
+        if let Some((registry, _)) = &self.extraction {
+            items.extend(registry.describe());
+        }
         items.join("\r\n  ")
     }
 
@@ -359,9 +413,23 @@ impl RuntimeIntent {
         if self.model_terms_need_admission() && self.task_admission != TaskAdmission::Trusted {
             return Err("elevated model budget requires trusted task admission".to_owned());
         }
-        let workspace = std::env::current_dir()
+        let mut workspace = std::env::current_dir()
             .and_then(|path| path.canonicalize())
             .map_err(|error| error.to_string())?;
+        let source_root = workspace.clone();
+        // An own workspace is served as a clean clone of the accepted `HEAD`,
+        // so the guest reads no other branch, stash, reflog, or ignored or
+        // untracked file, none of which the acceptance covered.
+        let declared_rank = match &self.own_workspace {
+            Some(own) if self.task_admission == TaskAdmission::Trusted => {
+                let clone = self.state_directory.join("workspace");
+                own.accept_into(&clone)?;
+                workspace = clone.canonicalize().map_err(|error| error.to_string())?;
+                Some(own_workspace::OWN_RANK)
+            }
+            Some(_) => return Err("workspace:own requires trusted task admission".to_owned()),
+            None => None,
+        };
         let git_control_digest = git_control_digest(&workspace)?;
         let (push_refs, pr_targets) = (
             scoped(&self.capabilities, "push:ref:"),
@@ -394,6 +462,7 @@ impl RuntimeIntent {
         );
         let (audit, audit_path, key_path) =
             start_audit(&self.state_directory, &self.session_id, redactor)?;
+        let audit = audit.with_target_recording(self.record_targets);
         let state_path = self.state_directory.join("floor.json");
         // The session directory is prepared by the untrusted CLI. Persisted
         // floor state therefore cannot authorize a new trusted run. Begin from
@@ -401,12 +470,15 @@ impl RuntimeIntent {
         // file remains useful as non-authoritative continuity metadata only.
         let mut session_facts = SessionFacts::default();
         session_facts.target_created_by_vertex = false;
+        let (rank, path) = match (&self.own_workspace, declared_rank) {
+            (Some(own), Some(rank)) => {
+                (rank, format!("workspace://accepted-head/{}", own.commit()))
+            }
+            _ => (0, "workspace://direct-exposure".to_owned()),
+        };
         session_facts.record_floor_observation(
-            0,
-            SourceRef::File {
-                path: "workspace://direct-exposure".to_owned(),
-                author: None,
-            },
+            rank,
+            SourceRef::File { path, author: None },
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|error| error.to_string())?
@@ -454,6 +526,30 @@ impl RuntimeIntent {
             None,
         )?;
         broker.set_payload_policy(payload_policy(&workspace, public_workspace)?)?;
+        if let (Some(own), Some(_)) = (&self.own_workspace, declared_rank) {
+            broker.set_lockfile_pins(own.pins())?;
+        }
+        if let Some((registry, _)) = &self.extraction {
+            let origin = trusted_git_command()
+                .arg("-C")
+                .arg(&workspace)
+                .args(["config", "--get", "remote.origin.url"])
+                .output()
+                .map_err(|error| error.to_string())?;
+            broker.set_extraction(ExtractionConfig {
+                registry: registry.clone(),
+                admitted_paths: committed_paths(&workspace),
+                github_repository: origin_repository(&String::from_utf8_lossy(&origin.stdout)),
+                model: extraction_model()?,
+            })?;
+        }
+        if allow_git_push {
+            let private = broker
+                .socket_path()
+                .parent()
+                .ok_or("broker socket has no private directory")?;
+            broker.set_push_inspection(push_inspection(&workspace, &source_root, private)?)?;
+        }
         Ok(RuntimeBroker {
             broker,
             audit_path,
@@ -469,6 +565,7 @@ impl RuntimeIntent {
             workspace,
             git_control_digest,
             admission,
+            extraction_admitted: self.extraction.is_some(),
         })
     }
 
@@ -498,12 +595,15 @@ impl RuntimeIntent {
             "run_id": self.session_id,
             "keel_build": env!("CARGO_PKG_VERSION"),
             "policy_bundle": self.policy_bundle_hash,
+            "extraction_schemas": self.extraction.as_ref().map(|(_, hash)| hash),
             "workspace": {
                 "root": workspace.display().to_string(),
                 "head": head,
                 "dirty": dirty,
                 "origin": origin,
                 "git_control": git_control.map(|digest| manifest::hex(&digest)),
+                "declared_rank": self.own_workspace.as_ref().map(|_| own_workspace::OWN_RANK),
+                "lockfile_pins": self.own_workspace.as_ref().map(|own| own.pins().len()),
             },
             "authority": {
                 "capabilities": self.capabilities,
@@ -530,8 +630,10 @@ impl RuntimeIntent {
                 },
                 "starting_floor": 0,
                 "connection_reuse": self.reuse_connections,
+                "record_targets": self.record_targets,
+                "ephemeral_workspace": self.ephemeral_workspace,
                 "mux": self.mux,
-                "profile": self.scope.as_ref().map(|_| "triage"),
+                "profile": self.scope.as_ref().map(|_| "scoped"),
                 "scope": self.scope.as_ref().map(Scope::describe),
             },
             "admission": {
@@ -557,6 +659,8 @@ pub struct RuntimeBroker {
     git_control_digest: Option<[u8; 32]>,
     /// The admission manifest, completed with artifact digests at boot.
     admission: serde_json::Value,
+    /// Whether the run admitted quarantine extraction.
+    extraction_admitted: bool,
 }
 impl RuntimeBroker {
     /// Records the admission manifest, completed with these boot-artifact
@@ -573,6 +677,16 @@ impl RuntimeBroker {
     ) -> Result<(), String> {
         let event = manifest::finish(self.admission.clone(), artifacts, kernel_release)?;
         self.broker.record_run_admitted(event)
+    }
+    /// Durably records a host resource this run created, for crash recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record cannot be written; the run must then
+    /// release the resource and refuse to continue.
+    pub fn record_resource(&self, kind: &'static str, detail: String) -> Result<(), String> {
+        self.broker
+            .record_run_resource(RunResourceEvent { kind, detail })
     }
     /// Returns the private kernel action socket.
     #[must_use]
@@ -598,6 +712,18 @@ impl RuntimeBroker {
     pub fn github_private_repository(&self) -> Option<&str> {
         self.github_private_repository.as_deref()
     }
+    /// The extraction helper's socket, when the run admitted extraction.
+    #[must_use]
+    pub fn extract_socket_path(&self) -> Option<PathBuf> {
+        self.extraction_admitted
+            .then(|| self.broker.extract_socket_path())
+    }
+    /// Returns the workspace the run serves to its backend: the operator's
+    /// directory, or for `workspace:own` the clean clone of the accepted `HEAD`.
+    #[must_use]
+    pub fn workspace(&self) -> &Path {
+        &self.workspace
+    }
     /// Returns the authenticated audit stream path.
     #[must_use]
     pub fn audit_path(&self) -> &Path {
@@ -619,6 +745,18 @@ impl RuntimeBroker {
     ///
     /// Returns an error when broker or audit shutdown fails.
     pub fn shutdown(self) -> Result<BrokerReport, String> {
+        self.shutdown_with_teardown(None)
+    }
+    /// Stops the kernel, records the run's teardown immediately before the
+    /// seal, and durably closes the audit chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when broker or audit shutdown fails.
+    pub fn shutdown_with_teardown(
+        self,
+        teardown: Option<RunTeardownEvent>,
+    ) -> Result<BrokerReport, String> {
         let current = git_control_digest(&self.workspace);
         let changed = current.as_ref().ok() != Some(&self.git_control_digest);
         let detail = match &current {
@@ -629,9 +767,8 @@ impl RuntimeBroker {
         if changed {
             eprintln!("KEEL SECURITY WARNING: .git/config or .git/hooks changed during this run");
         }
-        let report = self
-            .broker
-            .shutdown_with_boundaries(vec![EnforcementBoundary {
+        let report = self.broker.shutdown_with_teardown(
+            vec![EnforcementBoundary {
                 name: "workspace-git-control-files",
                 state: if changed {
                     EnforcementState::Advisory
@@ -639,7 +776,9 @@ impl RuntimeBroker {
                     EnforcementState::Active
                 },
                 detail: detail.to_owned(),
-            }])?;
+            }],
+            teardown,
+        )?;
         FloorState::capture(&self.session_id, self.persisted_mode, &report.session_facts)
             .save(&self.state_path)
             .map_err(|error| error.to_string())?;
@@ -764,6 +903,7 @@ fn parse_capabilities(
                 | "deny:force-push"
                 | "isolation:v8-sandboxed"
                 | "workspace:public"
+                | "workspace:own"
         ) {
             *task_authority |= capability != "isolation:v8-sandboxed";
             capabilities.insert(capability);
@@ -781,6 +921,75 @@ fn parse_capabilities(
     Ok((egress_hosts, capabilities))
 }
 
+/// Trusted push inspection (PLAN D81): a private bare copy of the admitted
+/// branch in the broker's own directory, which neither the guest nor the
+/// backend can write, the lines committed at its `HEAD`, and every plausible
+/// default branch. A wrong default guess over-gates rather than under-gates.
+fn push_inspection(
+    workspace: &Path,
+    source: &Path,
+    private: &Path,
+) -> Result<PushInspection, String> {
+    let base = private.join("push-base.git");
+    let toplevel = trusted_git_command()
+        .arg("-C")
+        .arg(workspace)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+    let cloned = toplevel.is_some_and(|toplevel| {
+        trusted_git_command()
+            .args(["clone", "--quiet", "--bare", "--single-branch", "--no-tags"])
+            .arg(format!("file://{toplevel}"))
+            .arg(&base)
+            .status()
+            .is_ok_and(|status| status.success())
+    });
+    // No committed history to admit: an empty base, against which a
+    // self-contained push is wholly new content and a thin one cannot
+    // resolve, so it is uninspectable rather than trusted.
+    if !cloned {
+        let _ = fs::remove_dir_all(&base);
+        let initialized = trusted_git_command()
+            .args(["init", "--quiet", "--bare"])
+            .arg(&base)
+            .status()
+            .map_err(|error| error.to_string())?;
+        if !initialized.success() {
+            return Err("cannot create the private push base".to_owned());
+        }
+    }
+    let mut default_branches = vec!["refs/heads/main".to_owned(), "refs/heads/master".to_owned()];
+    for (directory, reference) in [
+        (workspace, "HEAD"),
+        (source, "HEAD"),
+        (source, "refs/remotes/origin/HEAD"),
+    ] {
+        let output = trusted_git_command()
+            .arg("-C")
+            .arg(directory)
+            .args(["symbolic-ref", "--quiet", reference])
+            .output()
+            .map_err(|error| error.to_string())?;
+        let branch = String::from_utf8_lossy(&output.stdout).trim().replacen(
+            "refs/remotes/origin/",
+            "refs/heads/",
+            1,
+        );
+        if branch.starts_with("refs/heads/") && !default_branches.contains(&branch) {
+            default_branches.push(branch);
+        }
+    }
+    Ok(PushInspection {
+        admitted_lines: ModelOutputIndex::from_git_head(&base)?,
+        base,
+        scratch: private.to_path_buf(),
+        default_branches,
+    })
+}
+
 /// Indexes the committed tree as private content, unless the operator
 /// declared the repository public, and clears the workspace's own GitHub
 /// origin to receive it.
@@ -796,19 +1005,69 @@ fn payload_policy(workspace: &Path, public: bool) -> Result<PayloadPolicy, Strin
         .args(["config", "--get", "remote.origin.url"])
         .output()
         .map_err(|error| error.to_string())?;
-    let origin = String::from_utf8_lossy(&origin.stdout);
-    let repository = origin
+    let sinks = origin_private_sinks(&String::from_utf8_lossy(&origin.stdout));
+    Ok(PayloadPolicy::new(index, sinks))
+}
+
+/// Reads the session's extraction schema bundle and admits it only if it
+/// hashes, under its own domain, to the hash the request pins.
+fn load_extraction_schemas(
+    state_directory: &Path,
+    hash: &str,
+) -> Result<(SchemaRegistry, String), String> {
+    let bytes = fs::read(state_directory.join("extraction/schemas.json"))
+        .map_err(|error| format!("cannot read the extraction schemas: {error}"))?;
+    if bytes.len() > MAX_BUNDLE_BYTES {
+        return Err("the extraction schema bundle is too large".to_owned());
+    }
+    let digest = ring::digest::digest(
+        &SHA256,
+        &[b"keel-extraction-v1\0".as_slice(), &bytes].concat(),
+    );
+    if manifest::hex(digest.as_ref()) != hash.to_ascii_lowercase() {
+        return Err("the extraction schema bundle does not match its pinned hash".to_owned());
+    }
+    let text = String::from_utf8(bytes).map_err(|error| error.to_string())?;
+    let registry = SchemaRegistry::from_bundle(&text).map_err(|error| error.to_string())?;
+    Ok((registry, hash.to_ascii_lowercase()))
+}
+
+/// The smallest model of the run's provider family, charged to its budget.
+/// `OpenRouter`'s price snapshot prices only the admitted model, so it is used.
+fn extraction_model() -> Result<String, String> {
+    let provider = keel_secrets::runtime_model_provider().map_err(|error| error.clone())?;
+    Ok(match provider.name() {
+        "bedrock" => "us.anthropic.claude-haiku-4-5-20251001-v1:0".to_owned(),
+        "openrouter" => keel_secrets::openrouter_snapshot()
+            .map(|(model, ..)| model)
+            .ok_or("OpenRouter extraction needs an admitted price snapshot")?,
+        _ => "claude-haiku-4-5".to_owned(),
+    })
+}
+
+/// `owner/name` of an HTTPS GitHub origin.
+fn origin_repository(origin_url: &str) -> Option<String> {
+    origin_url
         .trim()
         .strip_prefix("https://github.com/")
         .map(|path| path.trim_end_matches('/').trim_end_matches(".git"))
-        .filter(|path| path.split('/').count() == 2 && !path.contains(".."));
-    let sinks = repository.map_or_else(Vec::new, |repository| {
+        .filter(|path| path.split('/').count() == 2 && !path.contains(".."))
+        .map(str::to_owned)
+}
+
+/// The `(host, path prefix)` pairs cleared for private content: the Git and
+/// API paths of the workspace's own HTTPS GitHub origin, and nothing else.
+/// Every prefix ends at a path boundary, so `/owner/name-other` and
+/// `/owner/name2` are not cleared with `/owner/name`.
+#[must_use]
+pub fn origin_private_sinks(origin_url: &str) -> Vec<(String, String)> {
+    origin_repository(origin_url).map_or_else(Vec::new, |repository| {
         vec![
-            ("github.com".to_owned(), format!("/{repository}")),
+            ("github.com".to_owned(), format!("/{repository}/")),
+            ("github.com".to_owned(), format!("/{repository}.git/")),
             ("api.github.com".to_owned(), format!("/repos/{repository}/")),
         ]
-    });
-    Ok(PayloadPolicy::new(index, sinks))
+    })
 }
 
 fn scoped(capabilities: &BTreeSet<String>, prefix: &str) -> BTreeSet<String> {

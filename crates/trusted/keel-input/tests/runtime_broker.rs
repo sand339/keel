@@ -222,7 +222,11 @@ fn push(path: &Path, force: bool) -> u8 {
     stream.write_all(&1_u16.to_be_bytes()).unwrap();
     write_wire_string(&mut stream, "refs/heads/topic");
     stream.write_all(&[u8::from(force), 0, 0, 0]).unwrap();
-    stream.write_all(&[0_u8; 32]).unwrap();
+    let body = b"0000";
+    let digest = ring::digest::digest(&ring::digest::SHA256, body);
+    stream.write_all(digest.as_ref()).unwrap();
+    stream.write_all(&4_u32.to_be_bytes()).unwrap();
+    stream.write_all(body).unwrap();
     stream.flush().unwrap();
     let mut response = [0];
     stream.read_exact(&mut response).unwrap();

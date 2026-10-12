@@ -15,11 +15,12 @@ import tomllib
 ROOT = Path(__file__).resolve().parent.parent
 TRUSTED_ROOT = ROOT / "crates" / "trusted"
 UNTRUSTED_ROOT = ROOT / "crates" / "untrusted"
-# Per-crate budgets plus an explicitly unallocated reserve sum to exactly
-# TOTAL_BUDGET. Reallocating between crates or assigning reserve is a recorded
-# decision. D39 raised the hard ceiling for the measured implementation of
-# staged approval waits, scoped denial history, and conservative model-charge
-# settlement; future work still cannot consume its reserve by accident.
+# Per-crate ratchets on first-party trusted LOC. A change that grows a trusted
+# crate past its number fails CI until the number is raised here, with a
+# one-line reason in the commit. The total is reported, not capped: D65 retired
+# the 16,000-line aggregate ceiling and its reserve accounting, because lines
+# are a review-cost signal rather than a security property. The comments below
+# are the allocation history up to D64.
 CRATE_BUDGETS = {
     # D15 moved 200 lines here from keel-provenance for the enforcement-state
     # record. Provenance's budget was sized for the vertex-fork comparison that
@@ -49,12 +50,22 @@ CRATE_BUDGETS = {
     # D50: marking connection-setup legs not-applicable in the task-envelope verdict.
     # D51: guest-reported process origins carried on every mediated channel, stamped, audited, shown at the gate, and used to gate pushes and pull requests from workspace code.
     # D52: recording model tool-call output and judging lines pushed into protected places against it.
-    "keel-kernel": 5_266,
+    # D69: network target detail on audit events, for admitted target recording.
+    # D73: the run teardown record and the broker's own socket check.
+    # D74: the supervisor key field on the teardown record.
+    # D75: the run-resource event and its broker and sink plumbing.
+    # D81: trusted push inspection, the body on the Git wire, the integrity
+    # rule over derived blobs, and payload violations as gate reasons.
+    # D83: the extraction helper's channel, its job queue and frames, binding
+    # each helper request to its job, and validating the result before delivery.
+    "keel-kernel": 6_031,
     # D22, D23, D25, and D28 moved 211 unclaimed lines from this evaluator-only
     # crate.
     # D31: immutable built-in restrictions beneath accepted policy.
     # D39 changes the repeated-denial rule to consume exact-scope window facts.
-    "keel-policy": 852,
+    # D82: the extraction schema grammar, its validator, and the hash-bound bundle.
+    # D83: the extraction schema module moved to keel-provenance.
+    "keel-policy": 856,
     # D18 moved 100 lines from here to keel-secrets for explicit provider
     # selection, D20 another 100 to keel-input, D23 another 25, and D25 another
     # 30, and D28 another 3. The surplus is still the one D15 named: sized for the vertex-fork
@@ -64,7 +75,11 @@ CRATE_BUDGETS = {
     # D45: task-envelope verdicts stamped on every action and branch-scoped push and PR narrowing.
     # D47: admission-time confidentiality index and shadow payload-flow verdicts on decrypted egress.
     # D52: recording model tool-call output and judging lines pushed into protected places against it.
-    "keel-provenance": 1_321,
+    # D67: `--scope none`, a scoped run that admits no host beyond its own.
+    # D81: push derivation from the receive-pack body with host Git, and the
+    # shared tree and object readers.
+    # D83: the extraction schema grammar and validator, moved from keel-policy.
+    "keel-provenance": 2_041,
     # D22-D25 moved 160 lines of unused headroom to the kernel and input path;
     # D28 moved the remaining 3.
     # D31: public-key audit verification without persisted signing material.
@@ -75,7 +90,12 @@ CRATE_BUDGETS = {
     # D47: admission-time confidentiality index and shadow payload-flow verdicts on decrypted egress.
     # D51: guest-reported process origins carried on every mediated channel, stamped, audited, shown at the gate, and used to gate pushes and pull requests from workspace code.
     # D52: recording model tool-call output and judging lines pushed into protected places against it.
-    "keel-audit": 1_228,
+    # D69: optional plain-text target recording and its test.
+    # D73: the run teardown record, bound to the admission digest.
+    # D74: the signed supervisor teardown receipt, its verification, and the seal digest.
+    # D75: the kernel.run-resource record.
+    # D83: the kernel.extraction record.
+    "keel-audit": 1_436,
     # D16 moved 200 lines here from keel-input for the eventstream usage decoder.
     # The trusted input path is complete, so its surplus was sized for work that
     # Phase 2 has since finished. D17 then added 700 with no donor at all: SigV4
@@ -96,7 +116,11 @@ CRATE_BUDGETS = {
     # D47: admission-time confidentiality index and shadow payload-flow verdicts on decrypted egress.
     # D48: a model-only upstream idle timeout and charging interrupted model streams their observed usage bound.
     # D52: recording model tool-call output and judging lines pushed into protected places against it.
-    "keel-secrets": 3_338,
+    # D78: only custom tools reach the model provider, and content the
+    # provider would fetch (URL, file, or container sources) is refused.
+    # D83: the extraction request shape and the body and tool-call hooks.
+    # D84: AWS session tokens masked in every relayed response.
+    "keel-secrets": 3_528,
     # D20 added 100 from keel-provenance for the display seam tracker: the trusted
     # terminal owner has to know where a sequence or character ends before it
     # writes a notice into the guest's stream or resumes one after a takeover.
@@ -123,10 +147,25 @@ CRATE_BUDGETS = {
     # D41 admits and exposes private-issue authority independently.
     # D45: task-envelope verdicts stamped on every action and branch-scoped push and PR narrowing.
     # D47: admission-time confidentiality index and shadow payload-flow verdicts on decrypted egress.
-    "keel-input": 3_326,
+    # D68: the runtime may write one session file, the guest's event stream.
+    # D69: the --record-targets admission flag and its launcher test.
+    # D70: the ephemeral-workspace flag recorded in the run manifest, plus the
+    # two clippy allow attributes it needed, which the first raise missed.
+    # D71: the run resource guard that ends the backend group and verifies cleanup.
+    # D72: SIGHUP and SIGTERM forwarded to an orderly shutdown.
+    # D73: teardown checks handed to the broker for the in-chain record.
+    # D74: the supervisor's checked serve-side cleanup, signed receipt, and
+    # two-stage stop that waits for it.
+    # D75: in-chain resource registration and crash recovery from it.
+    # D76: the supervisor's idle timeout.
+    # D77: pty descriptor custody, the inherited-terminal refusal, stop
+    # escalation, hangup on end of input, and recovery after a forced stop.
+    # D78: private clearance ends at the origin repository's path boundary.
+    # D80: workspace:own, the acceptance ledger, and the clean HEAD clone.
+    # D81: the private push base and default branches at admission.
+    # D83: admitting the schema bundle and spawning the sandboxed helper.
+    "keel-input": 4_768,
 }
-UNALLOCATED_RESERVE = 669
-TOTAL_BUDGET = 16_000
 SENSITIVE_TYPES = {
     "keel-secrets": [
         "SecretBytes",
@@ -242,13 +281,6 @@ def check_loc() -> None:
             "I1: tokei is required to count first-party LOC. "
             "Install the pinned version with: cargo install tokei --version 15.0.0"
         )
-    allocated = sum(CRATE_BUDGETS.values())
-    if allocated + UNALLOCATED_RESERVE != TOTAL_BUDGET:
-        fail(
-            f"I1: per-crate budgets ({allocated}) plus unallocated reserve "
-            f"({UNALLOCATED_RESERVE}) must equal the total budget of {TOTAL_BUDGET}"
-        )
-
     violations = []
     total = 0
     for name, budget in CRATE_BUDGETS.items():
@@ -256,12 +288,11 @@ def check_loc() -> None:
         total += actual
         over = "" if actual <= budget else f"  OVER by {actual - budget}"
         if actual > budget:
-            violations.append(f"I1: {name} has {actual} first-party LOC; budget is {budget}")
+            violations.append(
+                f"I1: {name} has {actual} first-party LOC; its ratchet is {budget}. "
+                "Raise it in ci/check_invariants.py and give the reason in the commit."
+            )
         print(f"I1: {name}: {actual}/{budget} LOC{over}")
-    if total > TOTAL_BUDGET:
-        violations.append(
-            f"I1: trusted crates have {total} first-party LOC; budget is {TOTAL_BUDGET}"
-        )
     # Report every violation. Exiting on the first one hides the rest, which is how
     # a second crate stayed over budget unnoticed for fourteen commits.
     if violations:
@@ -269,8 +300,8 @@ def check_loc() -> None:
             print(f"error: {violation}", file=sys.stderr)
         raise SystemExit(1)
     print(
-        f"I1: trusted total: {total}/{TOTAL_BUDGET} LOC "
-        f"({allocated} allocated + {UNALLOCATED_RESERVE} reserved; tokei)"
+        f"I1: trusted total: {total} first-party LOC "
+        f"(ratchets sum to {sum(CRATE_BUDGETS.values())}; tokei)"
     )
 
 

@@ -25,8 +25,44 @@ agent_browser_version="0.38.2"
 agent_browser_package_sha256="2bb1d6e4660b2a109c912c8bb552f727125dbcd681c6d1eefc1af573b4546c49"
 agent_browser_sha256="eafeca9ca0fdb2fa2aa60c4554723348c739656b0ddba0d82ff654d4d33311b1"
 agent_browser_binary="$download_root/agent-browser-$agent_browser_version-linux-musl-arm64"
+# Every Alpine package the build installs is pinned by name, version, and
+# SHA-256 in spikes/guest-packages.lock (regenerate it with
+# spikes/lock-guest-packages.sh). The files are fetched once into apk_cache and
+# installed offline, so the lock alone decides what the image contains.
+package_lock="$repo_root/spikes/guest-packages.lock"
+apk_cache="$phase_root/apk-cache"
+alpine_mirror="https://dl-cdn.alpinelinux.org/alpine/v3.23"
+# Every timestamp in the root disk and the initramfs, so that two builds from
+# the same pins produce byte-identical images.
+source_date_epoch=1767225600
 
-mkdir -p "$download_root" "$target_root" "$cargo_root"
+mkdir -p "$download_root" "$target_root" "$cargo_root" "$apk_cache"
+
+# Prints the container paths of one locked set's package files.
+locked_files() {
+    awk -v set="$1" '$1 == set { printf "/cache/%s.apk ", $3 }' "$package_lock"
+}
+tool_packages=$(locked_files tools)
+
+grep -v '^#' "$package_lock" | while read -r _ repository package expected; do
+    file="$apk_cache/$package.apk"
+    if [ -f "$file" ] && [ "$(shasum -a 256 "$file" | awk '{print $1}')" = "$expected" ]; then
+        continue
+    fi
+    if ! curl -fsSL "$alpine_mirror/$repository/aarch64/$package.apk" -o "$file.partial"; then
+        rm -f "$file.partial"
+        echo "cannot download locked package $package; Alpine removes superseded" \
+            "versions, so refresh the lock with spikes/lock-guest-packages.sh" >&2
+        exit 1
+    fi
+    actual=$(shasum -a 256 "$file.partial" | awk '{print $1}')
+    if [ "$actual" != "$expected" ]; then
+        rm -f "$file.partial"
+        echo "locked package checksum mismatch for $package: expected $expected, got $actual" >&2
+        exit 1
+    fi
+    mv "$file.partial" "$file"
+done
 if [ ! -f "$claude_binary" ] ||
     [ "$(shasum -a 256 "$claude_binary" | awk '{print $1}')" != "$claude_sha256" ]; then
     temporary="$claude_binary.partial"
@@ -101,14 +137,26 @@ cp -R "$kernel_modules/." "$rootfs/lib/modules/"
 
 docker run --rm --platform linux/arm64 \
     -v "$rootfs:/rootfs" \
+    -v "$apk_cache:/cache:ro" \
     "$alpine_image" \
-    apk add --no-cache --initdb --root /rootfs \
-        --keys-dir /etc/apk/keys \
-        --repository https://dl-cdn.alpinelinux.org/alpine/v3.23/main \
-        --repository https://dl-cdn.alpinelinux.org/alpine/v3.23/community \
-        alpine-base bash ca-certificates curl git nodejs tmux \
-        chromium font-dejavu nss-tools \
-        build-base npm py3-pip rust cargo go
+    apk add -q --no-cache --no-network --initdb --root /rootfs \
+        --keys-dir /etc/apk/keys $(locked_files rootfs)
+# The image must contain exactly the locked set.
+installed=$(awk -F: '/^P:/ { name = $2 } /^V:/ { print name "-" $2 }' \
+    "$rootfs/lib/apk/db/installed" | sort)
+expected=$(awk '$1 == "rootfs" { print $3 }' "$package_lock" | sort)
+if [ "$installed" != "$expected" ]; then
+    echo "guest packages differ from spikes/guest-packages.lock" >&2
+    exit 1
+fi
+# Install-time records that would differ between builds: apk's log, and the
+# font caches, which embed their directories' modification times.
+rm -f "$rootfs/var/log/apk.log"
+docker run --rm --platform linux/arm64 \
+    -v "$rootfs:/rootfs" \
+    "$alpine_image" \
+    sh -c "find /rootfs/usr/share/fonts -type d -exec touch -d @$source_date_epoch {} + &&
+        chroot /rootfs fc-cache -f -s"
 
 test -x "$rootfs/usr/bin/curl"
 test -x "$rootfs/usr/bin/node"
@@ -177,7 +225,7 @@ JSON
 #
 # Chromium also calls Google services on its own: sign-in, push messaging,
 # variations, network time, and search. Each would be an approval prompt, or
-# an out-of-scope refusal in a triage run. The managed policy turns those
+# an out-of-scope refusal in a scoped run. The managed policy turns those
 # features off, and the endpoint switches send whatever remains to a closed
 # loopback port, which Chromium never routes through a proxy, so it fails
 # locally without an action.
@@ -284,10 +332,12 @@ rm -f "$rootfs_image"
 docker run --rm --platform linux/arm64 \
     -v "$rootfs:/rootfs:ro" \
     -v "$phase_root:/out" \
+    -v "$apk_cache:/cache:ro" -e TOOLS="$tool_packages" \
     "$alpine_image" \
-    sh -c 'apk add --no-cache -q squashfs-tools >/dev/null &&
+    sh -c 'apk add -q --no-cache --no-network $TOOLS >/dev/null &&
         mksquashfs /rootfs /out/keel-phase1-rootfs.squashfs \
-            -comp zstd -Xcompression-level 6 -all-root -no-xattrs -noappend -quiet -no-progress'
+            -comp zstd -Xcompression-level 6 -all-root -no-xattrs -noappend -quiet -no-progress \
+            -all-time '"$source_date_epoch"' -mkfs-time '"$source_date_epoch"
 test -s "$rootfs_image"
 
 # The initramfs is only stage 1: static busybox, the three modules that mount
@@ -306,20 +356,48 @@ if path.exists():
 PY
 docker run --rm --platform linux/arm64 \
     -v "$stage1:/stage1" \
+    -v "$apk_cache:/cache:ro" -e TOOLS="$tool_packages" \
     "$alpine_image" \
-    sh -c 'apk add --no-cache -q busybox-static >/dev/null && cp /bin/busybox.static /stage1/bin/busybox'
+    sh -c 'apk add -q --no-cache --no-network $TOOLS >/dev/null && cp /bin/busybox.static /stage1/bin/busybox'
 for module in drivers/block/virtio_blk fs/squashfs/squashfs fs/overlayfs/overlay; do
     gzip -dc "$kernel_modules/$(cat "$repo_root/.phase1/kernel/release")/kernel/$module.ko.gz" \
         > "$stage1/lib/modules/$(basename "$module").ko"
 done
 cp "$repo_root/spikes/phase1-stage1-init.sh" "$stage1/init"
 chmod 0755 "$stage1/init" "$stage1/bin/busybox"
-(
-    cd "$stage1"
-    find . -print | cpio -o -H newc -R 0:0 2>/dev/null
-) |
-    docker run --rm -i --platform linux/arm64 "$alpine_image" \
-        sh -c 'apk add --no-cache -q zstd >/dev/null && zstd -q -T0 -6 -c' > "$initramfs"
+# A newc archive written in sorted order, owned by root, with fixed
+# timestamps and inode numbers, so the initramfs is byte-identical across builds.
+python3 - "$stage1" "$source_date_epoch" <<'PY' |
+import os
+import stat
+import sys
+from pathlib import Path
+
+root, mtime = Path(sys.argv[1]), int(sys.argv[2])
+out = sys.stdout.buffer
+
+
+def entry(name, mode, data, ino):
+    encoded = name.encode() + b"\0"
+    fields = [ino, mode, 0, 0, 1, mtime, len(data), 0, 0, 0, 0, len(encoded), 0]
+    out.write(b"070701" + b"".join(b"%08X" % field for field in fields))
+    out.write(encoded + b"\0" * (-(110 + len(encoded)) % 4))
+    out.write(data + b"\0" * (-len(data) % 4))
+
+
+paths = sorted(root.rglob("*"), key=lambda path: path.relative_to(root).as_posix())
+for ino, path in enumerate([root, *paths], start=1):
+    info = path.lstat()
+    data = path.read_bytes() if stat.S_ISREG(info.st_mode) else b""
+    if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+        sys.exit(f"unexpected file type in stage 1: {path}")
+    name = "." if path == root else path.relative_to(root).as_posix()
+    entry(name, stat.S_IFMT(info.st_mode) | stat.S_IMODE(info.st_mode), data, ino)
+entry("TRAILER!!!", 0, b"", 0)
+PY
+    docker run --rm -i --platform linux/arm64 \
+        -v "$apk_cache:/cache:ro" -e TOOLS="$tool_packages" "$alpine_image" \
+        sh -c 'apk add -q --no-cache --no-network $TOOLS >/dev/null && zstd -q -T0 -6 -c' > "$initramfs"
 
 (
     cd "$rootfs"

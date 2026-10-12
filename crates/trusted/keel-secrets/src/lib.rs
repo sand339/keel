@@ -3,15 +3,15 @@
 
 use keel_audit::Redactor;
 use keel_kernel::{
-    ContextBlock, EgressConnector, EgressRequestAuthorizer, EgressSession, ModelBudgetRequest,
-    ModelUsage,
+    ContextBlock, EgressConnector, EgressRequestAuthorizer, EgressSession, ExtractionRule,
+    ModelBudgetRequest, ModelUsage,
 };
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose,
 };
 use ring::{
-    digest::{SHA256, digest},
+    digest::{SHA256, SHA512, digest},
     hmac,
 };
 use rustls::{
@@ -817,6 +817,13 @@ fn settle_complete_model_response(
             if !arguments.is_empty() {
                 authorizer.observe_model_output(&arguments);
             }
+            authorizer.observe_tool_calls(
+                &blocks
+                    .iter()
+                    .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+                    .filter_map(|block| block.get("input").cloned())
+                    .collect::<Vec<_>>(),
+            );
             authorizer.observe_model_context(
                 true,
                 blocks
@@ -1944,15 +1951,17 @@ fn parse_credential_process_output(output: &[u8]) -> Result<AwsCredentials, Stri
     })
 }
 
-/// Allows only an admitted model endpoint and strips server-side execution
-/// capabilities before forwarding.
+/// Allows only an admitted model endpoint, strips every tool the provider
+/// would run or define and other server-side capabilities, and forwards the
+/// rest.
 ///
 /// # Errors
 ///
 /// Returns an error unless the authenticated target is an admitted model host
 /// over TLS, for any path that endpoint does not describe, for a Bedrock request
-/// that declares a different wire contract, and for malformed JSON or a
-/// non-object request body.
+/// that declares a different wire contract, for content the provider would
+/// fetch (a URL or file source, or a container upload), and for malformed JSON
+/// or a non-object request body.
 pub fn sanitize_model_request(
     target: &ConnectionTarget,
     path: &str,
@@ -2019,22 +2028,117 @@ fn sanitize_model_request_for_destination(
             stripped.push(key.to_owned());
         }
     }
+    // Only tools the harness executes itself may pass. Any typed tool is run
+    // or defined by the provider, and a server tool performs egress for the
+    // workload outside every Keel boundary; an unknown type is one too.
     if let Some(tools) = object.get_mut("tools").and_then(Value::as_array_mut) {
         tools.retain(|tool| {
-            let tool_type = tool.get("type").and_then(Value::as_str).unwrap_or("");
-            let remove = ["web_search", "web_fetch", "computer", "bash", "text_editor"]
-                .iter()
-                .any(|prefix| tool_type.starts_with(prefix));
-            if remove {
-                stripped.push(format!("tools:{tool_type}"));
+            let custom = match tool.get("type") {
+                None => true,
+                Some(Value::String(tool_type)) => tool_type == "custom",
+                Some(_) => false,
+            };
+            if !custom {
+                let tool_type = tool.get("type").and_then(Value::as_str);
+                stripped.push(format!("tools:{}", tool_type.unwrap_or("non-string")));
             }
-            !remove
+            custom
         });
+    }
+    if let Some(system) = object.get("system").and_then(Value::as_array) {
+        require_inline_sources(system)?;
+    }
+    for message in object
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(content) = message.get("content").and_then(Value::as_array) {
+            require_inline_sources(content)?;
+        }
     }
     stripped.sort();
     let body = serde_json::to_vec(&value)
         .map_err(|error| TlsError::new("serialize model request", error))?;
     Ok(SanitizedModelRequest { body, stripped })
+}
+
+/// Refuses a content block that makes the provider fetch something: an image
+/// or document sourced from a URL or an uploaded file, or a container upload.
+/// The provider would perform that read for the workload, outside the egress
+/// allowlist, payload checks, and the run's own files.
+fn require_inline_sources(blocks: &[Value]) -> Result<(), TlsError> {
+    for block in blocks {
+        let source = block.get("source").filter(|source| source.is_object());
+        match block.get("type").and_then(Value::as_str) {
+            Some("image" | "document") => {
+                match source
+                    .and_then(|source| source.get("type"))
+                    .and_then(Value::as_str)
+                {
+                    Some("base64" | "text") => {}
+                    Some("content") => {
+                        let nested = source.and_then(|source| source.get("content"));
+                        if let Some(nested) = nested.and_then(Value::as_array) {
+                            require_inline_sources(nested)?;
+                        }
+                    }
+                    other => {
+                        return Err(TlsError(format!(
+                            "model request content source `{}` is not inline",
+                            other.unwrap_or("absent")
+                        )));
+                    }
+                }
+            }
+            Some("container_upload") => {
+                return Err(TlsError(
+                    "model request content references an uploaded file".to_owned(),
+                ));
+            }
+            Some("tool_result") => {
+                if let Some(content) = block.get("content").and_then(Value::as_array) {
+                    require_inline_sources(content)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// On the extraction helper's channel, a model request is exactly one forced
+/// tool, the admitted schema's, and one user text block that is the fetched
+/// body (PLAN D83). Anything else, such as a second tool or extra content,
+/// is refused before it is sent.
+fn require_extraction_shape(body: &[u8], rule: &ExtractionRule) -> Result<(), TlsError> {
+    let refuse = |reason: &str| TlsError(format!("extraction model request {reason}"));
+    let value: Value =
+        serde_json::from_slice(body).map_err(|error| TlsError::new("extraction request", error))?;
+    if value.get("tools") != Some(&Value::Array(vec![rule.tool.clone()])) {
+        return Err(refuse("must offer exactly the schema's tool"));
+    }
+    let forced = serde_json::json!({ "type": "tool", "name": rule.tool["name"] });
+    if value.get("tool_choice") != Some(&forced) {
+        return Err(refuse("must force the schema's tool"));
+    }
+    let text = value
+        .get("messages")
+        .and_then(Value::as_array)
+        .filter(|messages| messages.len() == 1)
+        .and_then(|messages| messages[0].as_object())
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .and_then(|message| message.get("content")?.as_array())
+        .filter(|content| content.len() == 1)
+        .and_then(|content| content[0].as_object())
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .and_then(|block| block.get("text")?.as_str())
+        .ok_or_else(|| refuse("must carry one user text block"))?;
+    if sha256_bytes(text.as_bytes()) != rule.content_digest {
+        return Err(refuse("must carry exactly the fetched content"));
+    }
+    Ok(())
 }
 
 fn model_budget_request(
@@ -3156,23 +3260,29 @@ where
                 TlsError::new("upstream request flush", error),
             ));
         }
-        let response =
-            match relay_http_response_with_observation(tls, &mut front, "TLS response", || {
+        let relayed = if !prepared.model && authorizer.response_is_pinned() {
+            relay_pinned_response(tls, &mut front, authorizer)
+        } else {
+            relay_http_response_with_observation(tls, &mut front, "TLS response", || {
                 authorizer
                     .record_response()
                     .map_err(|error| TlsError::new("kernel response provenance", error))
-            }) {
-                Ok(response) => response,
-                Err(failure) => {
-                    return Err(commit_after_interrupted_response(
-                        authorizer,
-                        prepared.model,
-                        failure,
-                    ));
-                }
-            };
+            })
+        };
+        let response = match relayed {
+            Ok(response) => response,
+            Err(failure) => {
+                return Err(commit_after_interrupted_response(
+                    authorizer,
+                    prepared.model,
+                    failure,
+                ));
+            }
+        };
         if prepared.model {
             settle_complete_model_response(authorizer, &response.bytes)?;
+        } else if let Ok(body) = response_body(&response.bytes) {
+            authorizer.observe_response_body(&body);
         }
         if let Some(error) = response.guest_error {
             return Err(error);
@@ -3320,6 +3430,37 @@ where
         .map_err(|failure| failure.error)
 }
 
+/// Relays a response the accepted lockfile pins (W4b). The whole response is
+/// held back, its body's SHA-512 goes to the kernel, and only after the
+/// floor is settled does any byte reach the guest; a body that does not
+/// match lowers the floor as an unpinned one would.
+fn relay_pinned_response<R, W>(
+    upstream: &mut R,
+    guest: &mut W,
+    authorizer: &mut dyn EgressRequestAuthorizer,
+) -> Result<RelayedHttpResponse, RelayFailure>
+where
+    R: std::io::Read,
+    W: std::io::Write,
+{
+    let mut held = Vec::new();
+    let mut response =
+        relay_http_response_with_observation(upstream, &mut held, "TLS response", || Ok(()))?;
+    let body = response_body(&response.bytes).unwrap_or_default();
+    let mut body_sha512 = [0_u8; 64];
+    body_sha512.copy_from_slice(digest(&SHA512, &body).as_ref());
+    authorizer
+        .record_pinned_response(body_sha512)
+        .map_err(|error| RelayFailure {
+            error: TlsError::new("kernel response provenance", error),
+            partial: Vec::new(),
+        })?;
+    if let Err(error) = guest.write_all(&held).and_then(|()| guest.flush()) {
+        response.guest_error = Some(TlsError::new("TLS response", error));
+    }
+    Ok(response)
+}
+
 fn relay_http_response_with_observation<R, W, F>(
     upstream: &mut R,
     guest: &mut W,
@@ -3386,6 +3527,9 @@ where
             return Err(TlsError("upstream response exceeds 16 MiB".to_owned()));
         }
         response.extend_from_slice(&chunk[..read]);
+        // Rescanning a window behind the new bytes catches a marker or value
+        // split across reads; a value is masked as each of its bytes arrives.
+        mask_relayed_credentials(response, previous_length.saturating_sub(16 * 1024));
         let state = http_response_state(response)?;
         let forwarded_length = match state {
             HttpResponseState::Complete(length) => length,
@@ -3406,6 +3550,35 @@ where
         if let HttpResponseState::Complete(length) = state {
             response.truncate(length);
             return Ok(guest_error);
+        }
+    }
+}
+
+/// AWS echoes the signed request's canonical form, session token included, in
+/// a signature error. Trusted code never relays it: each value after a
+/// marker is overwritten in place with `*`, which keeps `Content-Length` and
+/// chunk sizes true.
+const CREDENTIAL_MARKERS: &[&[u8]] = &[b"x-amz-security-token:", b"x-amz-security-token="];
+
+fn mask_relayed_credentials(response: &mut [u8], from: usize) {
+    for marker in CREDENTIAL_MARKERS {
+        let mut start = from;
+        while let Some(found) = response.get(start..).and_then(|rest| {
+            rest.windows(marker.len())
+                .position(|window| window.eq_ignore_ascii_case(marker))
+        }) {
+            let mut index = start + found + marker.len();
+            while let Some(byte) = response.get_mut(index) {
+                if matches!(
+                    *byte,
+                    b'\\' | b'"' | b'\'' | b'\r' | b'\n' | b' ' | b',' | b'&'
+                ) {
+                    break;
+                }
+                *byte = b'*';
+                index += 1;
+            }
+            start += found + marker.len();
         }
     }
 }
@@ -3707,6 +3880,9 @@ fn authorize_http_request(
                 "keel-secrets: stripped model request capabilities: {}",
                 sanitized.stripped.join(",")
             );
+        }
+        if let Some(rule) = authorizer.extraction_rule() {
+            require_extraction_shape(&sanitized.body, &rule)?;
         }
         sanitized.body
     } else {

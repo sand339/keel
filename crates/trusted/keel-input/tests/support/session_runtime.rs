@@ -1,6 +1,6 @@
 use super::{
-    MAX_DETACHED_OUTPUT, completed_exit_status, launcher_sandbox_profile, persist_exit_status,
-    remember_detached_output,
+    DEFAULT_IDLE_TIMEOUT, MAX_DETACHED_OUTPUT, completed_exit_status, idle_expired, idle_limit,
+    launcher_sandbox_profile, persist_exit_status, remember_detached_output,
 };
 use nix::sys::termios::{InputFlags, LocalFlags};
 use std::{
@@ -10,7 +10,7 @@ use std::{
     os::unix::net::UnixStream,
     path::Path,
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[test]
@@ -77,16 +77,16 @@ fn stop_requests_cooperative_runtime_shutdown() {
     let mut attached_once = false;
     let mut detached_output = Vec::new();
 
-    assert!(
-        super::serve_client(
-            server,
-            &mut terminal,
-            &mut attached,
-            &mut attached_once,
-            &mut detached_output,
-        )
-        .unwrap()
-    );
+    // The requester is held, not answered, until the receipt is durable.
+    let stopper = super::serve_client(
+        server,
+        &mut terminal,
+        &mut attached,
+        &mut attached_once,
+        &mut detached_output,
+    )
+    .unwrap();
+    assert!(stopper.is_some());
 
     let mut shutdown = [0_u8; 2];
     runtime.read_exact(&mut shutdown).unwrap();
@@ -94,4 +94,32 @@ fn stop_requests_cooperative_runtime_shutdown() {
     let mut response = [0_u8; 9];
     client.read_exact(&mut response).unwrap();
     assert_eq!(&response, b"STOPPING\n");
+}
+
+#[test]
+fn idle_limit_defaults_and_only_an_explicit_zero_disables_it() {
+    assert_eq!(idle_limit(None), Some(DEFAULT_IDLE_TIMEOUT));
+    assert_eq!(idle_limit(Some("90")), Some(Duration::from_secs(90)));
+    assert_eq!(idle_limit(Some("0")), None);
+    assert_eq!(
+        idle_limit(Some("forever")),
+        Some(DEFAULT_IDLE_TIMEOUT),
+        "a malformed value keeps the limit"
+    );
+}
+
+#[test]
+fn only_a_detached_session_silent_past_its_limit_is_idle() {
+    let silent = Instant::now().checked_sub(Duration::from_mins(2)).unwrap();
+    let limit = Some(Duration::from_mins(1));
+    assert!(idle_expired(limit, false, silent));
+    assert!(
+        !idle_expired(limit, true, silent),
+        "an attached session is never idle"
+    );
+    assert!(!idle_expired(limit, false, Instant::now()));
+    assert!(
+        !idle_expired(None, false, silent),
+        "a disabled limit never expires"
+    );
 }

@@ -13,6 +13,7 @@ cargo build --release \
     --bin keel-input-runtime \
     --bin keel-render-spike \
     --bin keel-runtime \
+    --bin keel-extract \
     --bin keel-vz-spike
 
 codesign --force --sign - \

@@ -1,4 +1,4 @@
-#![doc = "Triage scope matches strictly: subdomain wildcards, default ports, exclusions."]
+#![doc = "Run scope matches strictly: subdomain wildcards, default ports, exclusions, and none."]
 
 use keel_provenance::Scope;
 
@@ -71,4 +71,13 @@ fn malformed_and_empty_scopes_are_refused() {
         scope(&[], &["a.example"]).is_err(),
         "exclusions alone are no scope"
     );
+}
+
+#[test]
+fn none_admits_no_host_and_stands_alone() {
+    let none = scope(&["None"], &[]).unwrap();
+    assert!(!none.contains("a.example", 443));
+    assert_eq!(none.describe(), ["none"]);
+    assert!(scope(&["none", "a.example"], &[]).is_err());
+    assert!(scope(&["none"], &["a.example"]).is_err());
 }
