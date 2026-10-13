@@ -8,7 +8,7 @@ use keel_input::{
     TerminalControlReader, detached_output_has_pending_approval, encode_floor_lift, encode_resize,
     encode_shutdown, push_keystroke, safe_text,
 };
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use nix::sys::socket::{getsockopt, sockopt};
 use nix::{
     fcntl::{FcntlArg, FdFlag, OFlag, fcntl},
@@ -358,7 +358,10 @@ fn spawn_foreground(
     })
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    allow(unused_variables)
+)]
 fn peer_terminal_is_foreground(stream: &UnixStream) -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -378,7 +381,17 @@ fn peer_terminal_is_foreground(stream: &UnixStream) -> bool {
         matches!((groups.next(), groups.next(), groups.next()),
             (Some(group), Some(foreground), None) if group != "0" && group == foreground)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        let Some(credentials) = getsockopt(stream, sockopt::PeerCredentials).ok() else {
+            return false;
+        };
+        fs::read_to_string(format!("/proc/{}/stat", credentials.pid()))
+            .ok()
+            .and_then(|stat| super::confine::stat_process_groups(&stat))
+            .is_some_and(|(group, foreground)| group != 0 && group == foreground)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     false
 }
 
@@ -968,30 +981,45 @@ pub(super) fn launcher(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn E
     } else {
         workspace_root.clone()
     };
-    let profile = launcher_sandbox_profile(
+    super::create_bind_target(Path::new(result))?;
+    let mut child = super::confined_command(
         &renderer,
-        &canonical_start,
-        &workspace_root,
-        Path::new(result),
-    );
-    let mut child = Command::new("/usr/bin/sandbox-exec")
-        .args(["-p", &profile])
-        .arg(renderer)
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("TERM", super::safe_term())
-        .args([
-            "--launcher".into(),
-            rows.to_string().into(),
-            columns.to_string().into(),
-            canonical_start.into_os_string(),
-            workspace_root.into_os_string(),
-            result.clone(),
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        || {
+            launcher_sandbox_profile(
+                &renderer,
+                &canonical_start,
+                &workspace_root,
+                Path::new(result),
+            )
+        },
+        || super::confine::Confinement {
+            read_only: vec![
+                canonical_start.clone(),
+                workspace_root.clone(),
+                renderer
+                    .parent()
+                    .unwrap_or_else(|| Path::new("/nonexistent"))
+                    .to_path_buf(),
+            ],
+            read_write: vec![PathBuf::from(result)],
+            ..super::confine::Confinement::default()
+        },
+    )
+    .env_clear()
+    .env("PATH", "/usr/bin:/bin")
+    .env("TERM", super::safe_term())
+    .args([
+        "--launcher".into(),
+        rows.to_string().into(),
+        columns.to_string().into(),
+        canonical_start.into_os_string(),
+        workspace_root.into_os_string(),
+        result.clone(),
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()?;
     let mut renderer_input = child.stdin.take().ok_or("launcher stdin unavailable")?;
     let mut renderer_output = child.stdout.take().ok_or("launcher stdout unavailable")?;
     let mut renderer_errors = child.stderr.take().ok_or("launcher stderr unavailable")?;

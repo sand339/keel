@@ -9,7 +9,9 @@ temporary="$output.partial"
 "$deno" compile --quiet --no-check \
     --output "$temporary" \
     "$repo_root/spikes/keel-xterm-renderer.ts"
-codesign --force --sign - "$temporary"
+if [ "$(uname -s)" = Darwin ]; then
+    codesign --force --sign - "$temporary"
+fi
 mv "$temporary" "$output"
 "$output" --version
 "$deno" run --quiet --allow-run="$output" \

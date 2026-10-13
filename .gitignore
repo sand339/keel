@@ -5,3 +5,4 @@
 *.log
 /.keel/
 __pycache__/
+/.phase1-x86_64/

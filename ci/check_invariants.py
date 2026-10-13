@@ -164,7 +164,10 @@ CRATE_BUDGETS = {
     # D80: workspace:own, the acceptance ledger, and the clean HEAD clone.
     # D81: the private push base and default branches at admission.
     # D83: admitting the schema bundle and spawning the sandboxed helper.
-    "keel-input": 4_768,
+    # R3: Linux confinement of the four children through bubblewrap, the
+    # Linux foreground-terminal check, and naming processes from /proc in
+    # crash recovery.
+    "keel-input": 4_989,
 }
 SENSITIVE_TYPES = {
     "keel-secrets": [

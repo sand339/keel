@@ -1,6 +1,12 @@
 # Extending Keel to Linux
 
-**Status: future platform work; not implemented.**
+**Status: implemented on Ubuntu 24.04 x86_64.** `keel setup` builds and
+installs from source, `keel doctor` passes, the headless end-to-end suite
+(15 cases) and the lifecycle fault suite (5 cases) pass, and so does the
+workspace test suite. Ubuntu is the supported Linux distribution; others may
+work but are not tested. ARM64 runs, tested only in a nested VM. Publishing
+signed releases remains; see
+[What remains](#what-remains).
 
 This document describes how to add a supported Linux host runtime while
 preserving Keel's existing security boundary. It targets native KVM execution,
@@ -179,16 +185,58 @@ Landlock or bubblewrap, plus the same explicit
 `isolation:v8-sandboxed` grant and conformance tests. Until that adapter exists,
 Linux must reject the host V8 profile.
 
-The macOS renderer currently uses `sandbox-exec` as defense in depth. On Linux:
+Trusted `keel-input-runtime` confines four untrusted children with
+`sandbox-exec` today:
+
+- the runtime, which launches the VM backend and writes only its guest event
+  stream in the session directory;
+- the renderer;
+- the session launcher;
+- the `keel-extract` helper (W3), which may reach only the broker socket and
+  may not write, fork, or execute anything else.
+
+On Linux the same four go through one adapter built on bubblewrap, chosen
+over in-process Landlock and seccomp. Bubblewrap is an external OS binary, the
+same trust position `sandbox-exec` holds today. The in-process route would add
+`landlock` and `seccompiler` to the trusted dependency set and roughly double
+the trusted lines. The adapter only builds argument vectors from the same
+allowlists the macOS profiles encode. For each child it must:
 
 - retain pipe-only renderer input and exclusive trusted ownership of the real
   terminal;
 - prevent renderer access to `/dev/tty`;
 - drop capabilities and set `no_new_privs`;
-- apply a small seccomp profile;
-- use Landlock or a mount namespace to restrict filesystem access;
-- place each run in a dedicated cgroup;
+- unshare the network namespace; the Unix sockets its profile allows stay
+  reachable by bound path;
+- bind only the paths its macOS profile allows, read-only unless the profile
+  allows writes;
+- run in its own PID namespace with `--die-with-parent`, so it dies with
+  bubblewrap, and bubblewrap dies with the trusted runtime or its own command;
 - record every VM and helper process in the run resource registry.
+
+Bubblewrap has no system call filter of its own; it only applies one compiled
+by its caller. The macOS profiles filter no system calls either, so parity
+needs none, and the trusted code compiles no BPF.
+
+The PID namespace makes teardown stronger than on macOS, and made a per-run
+cgroup unnecessary for it. A backend that ignores `SIGTERM`, a backend left
+running by a killed trusted runtime, and a group member that outlives its
+leader cannot happen: each is killed by the kernel when the namespace ends.
+The fault suite checks that on Linux, where on macOS it checks escalation
+and recovery.
+
+Ubuntu 23.10 and later restrict unprivileged user namespaces through
+`AppArmor`. Bubblewrap can create the namespace but holds no capability in it,
+so it cannot bring up loopback in the new network namespace. A profile that
+grants `/usr/bin/bwrap` user namespaces lifts this for bubblewrap, which is
+how Ubuntu behaved before 23.10. `keel doctor` detects the restriction and
+prints the one-line install of that profile; it needs root once.
+
+Trusted host Git (`trusted_git_command`) is not confined on either platform.
+It clones the accepted `HEAD` for `workspace:own` runs (W4a) and the private
+copy that push derivation resolves against. It runs with a cleared
+environment and no global or system configuration, which Linux preserves
+unchanged.
 
 Host confinement supplements the microVM and trusted input boundary. It must
 not become a second policy engine.
@@ -313,9 +361,40 @@ provenance behavior, guest-visible tools, and teardown outcomes must match.
 | Ubuntu x86_64 feature parity | 4–6 weeks | 3,000–5,000 lines |
 | Polished ARM64/x86_64 release | 6–9 weeks | 4,000–7,000 lines |
 
-Most additions should remain outside the TCB. Any trusted Linux-specific code
-must be justified against the enforced TCB cap rather than treated as an
-automatic platform exception.
+Most additions remain outside the TCB: the Cloud Hypervisor launcher, relay
+extraction, `virtiofsd` supervision, guest images, and setup are untrusted.
+The trusted kernel, policy, provenance, audit, and secrets crates are already
+portable. The trusted Linux-specific code sits in `keel-input-runtime`:
+
+The estimate before building was 350–500 trusted lines, all in
+`keel-input-runtime`. The build used 221, raising the `keel-input` ratchet
+from 4,768 to 4,989:
+
+| Item | Replaces on macOS |
+|---|---|
+| Bubblewrap adapter, and one helper that confines all four children | `sandbox-exec` profiles |
+| Foreground-terminal peer check via `SO_PEERCRED` and `/proc` | `LOCAL_PEERPID` and `ps` |
+| Crash-recovery process identity via `/proc/<pid>/exe` | `ps -o comm=`, which Linux cuts to 15 bytes |
+| Manifest binding of `cloud-hypervisor` and `virtiofsd`; platform selection | `keel-vz-spike` binding |
+
+The per-run cgroup was not needed (see Workstream 6). D65 retired the
+aggregate cap, so each line is justified by its review cost and held to the
+per-crate ratchet.
+
+## What remains
+
+- ARM64 Linux on real hardware. On Ubuntu 24.04 ARM64 in a nested VM on an
+  M4 Mac, `keel setup`, `keel doctor`, and the fault suite pass, and 13 of the
+  15 E2E cases pass with `KEEL_E2E_TIMEOUT_SCALE=4`: the guest there boots
+  several times slower than native. Of the other two, `build-offline` is
+  refused by the model provider's safety filter on its first request, before
+  any tool runs, and `browser-mcp` sees the browser tools register after
+  Claude's first turn. The guest image is the macOS guest's, built from the
+  same lock, and passes both on macOS.
+- Publishing: release tarballs are built and tested (`spikes/package-release.sh`,
+  `keel setup --prebuilt`), so a user's install no longer fetches the guest
+  kernel from Alpine's CDN, which drops superseded versions. They are not yet
+  published, and not yet signed.
 
 ## Principal risks
 

@@ -416,6 +416,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "the host V8 profile is macOS-only; Linux refuses it"
+    )]
     fn allowed_http_stream_is_bridged_through_the_kernel_socket() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)

@@ -14,6 +14,13 @@ use std::{
     process::{Command, ExitCode},
 };
 
+/// This platform's VM backend, installed beside the runtime.
+const VM_BACKEND: &str = if cfg!(target_os = "linux") {
+    "keel-ch"
+} else {
+    "keel-vz-spike"
+};
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -66,9 +73,11 @@ fn run_vm(request: &RunRequest) -> Result<(), Box<dyn std::error::Error>> {
     let ca_certificate = env::var_os("KEEL_RUN_CA_PEM");
     let control = create_control(&request, ca_certificate.as_deref())
         .map_err(|error| format!("create VM control directory: {error}"))?;
-    let preflight = env::var_os("KEEL_VZ_BACKEND")
+    // KEEL_VZ_BACKEND is the name older launchers set.
+    let preflight = env::var_os("KEEL_VM_BACKEND")
+        .or_else(|| env::var_os("KEEL_VZ_BACKEND"))
         .map(PathBuf::from)
-        .unwrap_or(env::current_exe()?.with_file_name("keel-vz-spike"));
+        .unwrap_or(env::current_exe()?.with_file_name(VM_BACKEND));
     let mut backend = Command::new(preflight);
     backend
         .arg(&plan.kernel)
@@ -87,10 +96,10 @@ fn run_vm(request: &RunRequest) -> Result<(), Box<dyn std::error::Error>> {
     }
     let status = backend.status();
     let cleanup = fs::remove_dir_all(&control);
-    let status = status.map_err(|error| format!("start VZ backend: {error}"))?;
+    let status = status.map_err(|error| format!("start VM backend: {error}"))?;
     cleanup.map_err(|error| format!("remove VM control directory: {error}"))?;
     if !status.success() {
-        return Err(format!("VZ preflight exited with {status}").into());
+        return Err(format!("VM backend exited with {status}").into());
     }
     Ok(())
 }

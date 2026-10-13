@@ -24,7 +24,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Check native macOS isolation backend
         if: runner.os == 'macOS'
-        run: cargo clippy -p keel-isolate --all-targets --features libkrun-backend,vz-backend --locked -- -D warnings
+        run: cargo clippy -p keel-isolate --all-targets --features libkrun-backend,vz-backend,ch-backend --locked -- -D warnings
       - name: Check exclusive trusted terminal
         if: runner.os == 'macOS'
         run: ./spikes/run-tty-proof.sh

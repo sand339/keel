@@ -318,8 +318,11 @@ fn drop_capabilities() -> io::Result<()> {
     Ok(())
 }
 
-/// `kexec_file_load` on aarch64; the musl `libc` bindings omit it.
+/// `kexec_file_load`, which the musl `libc` bindings omit.
+#[cfg(target_arch = "aarch64")]
 const SYS_KEXEC_FILE_LOAD: libc::c_long = 294;
+#[cfg(target_arch = "x86_64")]
+const SYS_KEXEC_FILE_LOAD: libc::c_long = 320;
 
 /// Syscalls the workload never needs and that widen kernel attack surface or
 /// would let it escape the other layers.
@@ -360,9 +363,21 @@ const DENIED_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_reboot,
     libc::SYS_acct,
     libc::SYS_quotactl,
+    // Per-process segment descriptors exist only on x86 and have a history of
+    // kernel bugs; nothing in the workload uses them.
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_modify_ldt,
 ];
 
-const AUDIT_ARCH_AARCH64: u32 = 0xC000_00B7;
+/// The one system call ABI the filter accepts; any other is killed.
+#[cfg(target_arch = "aarch64")]
+const AUDIT_ARCH: u32 = 0xC000_00B7;
+#[cfg(target_arch = "x86_64")]
+const AUDIT_ARCH: u32 = 0xC000_003E;
+/// `x86_64` also accepts x32 system calls under the same architecture, numbered
+/// from this bit. The filter matches plain numbers only, so x32 is killed.
+#[cfg(target_arch = "x86_64")]
+const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 const RET_ALLOW: u32 = 0x7fff_0000;
 const RET_KILL_PROCESS: u32 = 0x8000_0000;
 const RET_ERRNO: u32 = 0x0005_0000;
@@ -416,10 +431,20 @@ fn seccomp_program() -> Vec<libc::sock_filter> {
     let eperm = errno(libc::EPERM);
     let mut program = vec![
         load(OFFSET_ARCH),
-        jump(AUDIT_ARCH_AARCH64, 1, 0),
+        jump(AUDIT_ARCH, 1, 0),
         ret(RET_KILL_PROCESS),
         load(OFFSET_NR),
     ];
+    #[cfg(target_arch = "x86_64")]
+    program.extend([
+        libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 1,
+            k: X32_SYSCALL_BIT,
+        },
+        ret(RET_KILL_PROCESS),
+    ]);
     for nr in DENIED_SYSCALLS {
         program.extend([jump(*nr as u32, 0, 1), ret(eperm)]);
     }

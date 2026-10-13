@@ -11,35 +11,44 @@ publish.workspace = true
 keel-cli = { version = "=0.0.1", path = "../keel-cli", optional = true }
 keel-conn = { version = "=0.0.1", path = "../keel-conn", optional = true }
 keel-gitd = { version = "=0.0.1", path = "../keel-gitd", optional = true }
+keel-mcp = { version = "=0.0.1", path = "../keel-mcp", optional = true }
+libc = { workspace = true, optional = true }
 pem = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 
 [features]
 default = []
 libkrun-backend = ["dep:keel-mcp", "dep:libc", "dep:serde_json", "dep:tokio"]
-vz-backend = [
-    "dep:block2",
-    "dep:dispatch2",
+# The backend-neutral runtime: the run launcher, the guest service relays,
+# the extraction helper, and the host V8 runner.
+runtime = [
     "dep:keel-cli",
     "dep:keel-conn",
     "dep:keel-gitd",
     "dep:keel-mcp",
     "dep:libc",
-    "dep:objc2",
-    "dep:objc2-foundation",
-    "dep:objc2-virtualization",
     "dep:pem",
     "dep:rustls",
     "dep:serde_json",
     "dep:tokio",
 ]
+# Virtualization.framework, on macOS.
+vz-backend = [
+    "runtime",
+    "dep:block2",
+    "dep:dispatch2",
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-virtualization",
+]
+# KVM with Cloud Hypervisor, on Linux.
+ch-backend = ["runtime"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = { version = "=0.6.2", optional = true }
 dispatch2 = { version = "=0.3.1", optional = true }
-keel-mcp = { version = "=0.0.1", path = "../keel-mcp", optional = true }
-libc = { workspace = true, optional = true }
 objc2 = { version = "=0.6.4", optional = true }
 objc2-foundation = { version = "=0.3.2", features = ["NSArray", "NSError", "NSFileHandle", "NSString", "NSURL"], optional = true }
 objc2-virtualization = { version = "=0.3.2", features = [
@@ -71,7 +80,6 @@ objc2-virtualization = { version = "=0.3.2", features = [
     "block2",
     "dispatch2",
 ], optional = true }
-tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 keel-kernel = { version = "=0.0.1", path = "../../trusted/keel-kernel" }
@@ -88,14 +96,19 @@ path = "src/bin/keel-vz-spike.rs"
 required-features = ["vz-backend"]
 
 [[bin]]
+name = "keel-ch"
+path = "src/bin/keel-ch.rs"
+required-features = ["ch-backend"]
+
+[[bin]]
 name = "keel-runtime"
 path = "src/bin/keel-runtime.rs"
-required-features = ["vz-backend"]
+required-features = ["runtime"]
 
 [[bin]]
 name = "keel-extract"
 path = "src/bin/keel-extract.rs"
-required-features = ["vz-backend"]
+required-features = ["runtime"]
 
 [lints]
 workspace = true

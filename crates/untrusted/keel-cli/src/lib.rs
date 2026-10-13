@@ -64,8 +64,12 @@ const fn default_model_cost_budget_microusd() -> u64 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum Command {
-    /// Download, build, and install the local Keel runtime.
-    Setup,
+    /// Download, build, and install the local Keel runtime, or install an
+    /// unpacked release.
+    Setup {
+        /// An unpacked release to install instead of building from source.
+        prebuilt: Option<PathBuf>,
+    },
     /// Check the local Keel runtime and current workspace.
     Doctor,
     /// Launch a harness through the configured runtime.
@@ -492,7 +496,10 @@ pub fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Comma
         return Ok(Command::Help);
     };
     match command {
-        "setup" if arguments.len() == 1 => Ok(Command::Setup),
+        "setup" if arguments.len() == 1 => Ok(Command::Setup { prebuilt: None }),
+        "setup" if arguments.len() == 3 && arguments[1] == "--prebuilt" => Ok(Command::Setup {
+            prebuilt: Some(PathBuf::from(&arguments[2])),
+        }),
         "doctor" if arguments.len() == 1 => Ok(Command::Doctor),
         "run" | "mux" if requests_help(&arguments[1..]) => Ok(Command::Help),
         "run" => parse_run(&arguments[1..]).map(Command::Run),
@@ -2461,10 +2468,80 @@ struct AxesSummary {
     flows: BTreeMap<String, usize>,
     avoided: Vec<String>,
     added: Vec<String>,
+    floor_start: BTreeMap<String, usize>,
+    floor_end: BTreeMap<String, usize>,
+    floor_lowered_by: BTreeMap<String, usize>,
+    floor_gates: usize,
+    floor_only_gates: usize,
+    floor_only_prompts: usize,
 }
 
 impl AxesSummary {
+    /// Records where a session's floor started, what lowered it, and where it
+    /// ended. The starting observation is not an audit event, so the start is
+    /// the declared rank in the admission manifest, or 0 for a directly
+    /// exposed workspace.
+    fn observe_floor(&mut self, records: &[AuditRecord]) {
+        let declared = records
+            .iter()
+            .find(|record| record.payload.event == "kernel.run-admitted")
+            .and_then(|record| record.payload.fields.get("manifest"))
+            .and_then(|manifest| serde_json::from_str::<serde_json::Value>(manifest).ok())
+            .and_then(|manifest| manifest["workspace"]["declared_rank"].as_u64());
+        let start = declared.map_or_else(
+            || "0 (exposed workspace)".to_owned(),
+            |rank| format!("{rank} (accepted HEAD)"),
+        );
+        *self.floor_start.entry(start).or_default() += 1;
+        let mut end = declared.unwrap_or(0).to_string();
+        for record in records {
+            let fields = &record.payload.fields;
+            if record.payload.event != "kernel.provenance" {
+                continue;
+            }
+            let (Some(before), Some(after)) =
+                (fields.get("floor_before"), fields.get("floor_after"))
+            else {
+                continue;
+            };
+            if after.parse::<u8>().ok() < before.parse::<u8>().ok() {
+                let source = fields
+                    .get("source")
+                    .and_then(|source| serde_json::from_str::<serde_json::Value>(source).ok());
+                let label = source.map_or_else(
+                    || "unknown".to_owned(),
+                    |source| match source["kind"].as_str() {
+                        Some("host") => source["host"].as_str().unwrap_or("host").to_owned(),
+                        Some(kind) => kind.to_owned(),
+                        None => "unknown".to_owned(),
+                    },
+                );
+                *self.floor_lowered_by.entry(label).or_default() += 1;
+            }
+            end.clone_from(after);
+        }
+        *self.floor_end.entry(end).or_default() += 1;
+    }
+
     fn observe(&mut self, action_id: u64, fields: &BTreeMap<String, String>) {
+        // Floor gates are counted for every action, including those recorded
+        // before intent and flow verdicts existed. A floor-only gate is the
+        // most that a more precise floor could remove.
+        let rules = fields
+            .get("rules")
+            .and_then(|rules| serde_json::from_str::<Vec<String>>(rules).ok())
+            .unwrap_or_default();
+        if rules.iter().any(|rule| rule == "kernel:minimum-rank") {
+            self.floor_gates += 1;
+            if rules.len() == 1 {
+                self.floor_only_gates += 1;
+                self.floor_only_prompts += usize::from(
+                    fields
+                        .get("prompt_presented")
+                        .is_some_and(|value| value == "true"),
+                );
+            }
+        }
         let Some(intent) = fields.get("intent") else {
             self.unrecorded += 1;
             return;
@@ -2479,10 +2556,6 @@ impl AxesSummary {
             }
             _ => fields.get("flow").map_or("not-checked", String::as_str),
         };
-        let rules = fields
-            .get("rules")
-            .and_then(|rules| serde_json::from_str::<Vec<String>>(rules).ok())
-            .unwrap_or_default();
         // Budget and model-budget refusals are resource limits in both models,
         // even when the kernel recorded them through its deny-only gate.
         if fields
@@ -2560,6 +2633,32 @@ impl AxesSummary {
         if !self.flows.is_empty() {
             let _ = writeln!(output, "  payload flow:            {}", count(&self.flows));
         }
+        if !self.floor_start.is_empty() {
+            let _ = writeln!(
+                output,
+                "  floor at start:          {}",
+                count(&self.floor_start)
+            );
+            let _ = writeln!(
+                output,
+                "  floor at end:            {}",
+                count(&self.floor_end)
+            );
+        }
+        if !self.floor_lowered_by.is_empty() {
+            let _ = writeln!(
+                output,
+                "  floor lowered by:        {}",
+                count(&self.floor_lowered_by)
+            );
+        }
+        if self.floor_gates > 0 {
+            let _ = writeln!(
+                output,
+                "  floor gates:             {}  ({} floor-only, {} of them prompted)",
+                self.floor_gates, self.floor_only_gates, self.floor_only_prompts
+            );
+        }
         for detail in &self.avoided {
             let _ = writeln!(output, "  avoided: {}", visible(detail));
         }
@@ -2589,6 +2688,18 @@ impl AxesSummary {
         }
         self.avoided.extend(other.avoided);
         self.added.extend(other.added);
+        for (map, other) in [
+            (&mut self.floor_start, other.floor_start),
+            (&mut self.floor_end, other.floor_end),
+            (&mut self.floor_lowered_by, other.floor_lowered_by),
+        ] {
+            for (name, count) in other {
+                *map.entry(name).or_default() += count;
+            }
+        }
+        self.floor_gates += other.floor_gates;
+        self.floor_only_gates += other.floor_only_gates;
+        self.floor_only_prompts += other.floor_only_prompts;
     }
 }
 
@@ -2614,6 +2725,8 @@ pub fn axes_report(sessions: &[String]) -> Result<String, CliError> {
         let admitted = manifest_summary(&records);
         let teardown = teardown_summary(&records);
         let group = manifest_group(&records);
+        let mut floor = AxesSummary::default();
+        floor.observe_floor(&records);
         let mut actions = BTreeMap::<u64, BTreeMap<String, String>>::new();
         for record in records {
             if record.payload.event == "kernel.action"
@@ -2629,6 +2742,7 @@ pub fn axes_report(sessions: &[String]) -> Result<String, CliError> {
         if summary.effects == 0 && summary.unrecorded == 0 {
             continue;
         }
+        summary.absorb(floor);
         judged += 1;
         let _ = writeln!(output, "\n{}", visible(&session));
         if let Some(admitted) = admitted {
@@ -3368,7 +3482,7 @@ pub fn write_runtime_request_in(
 /// Returns concise command help.
 #[must_use]
 pub const fn help() -> &'static str {
-    "usage:\n  keel setup\n  keel doctor\n  keel mux [--workspace PATH] [RUN_OPTIONS] [-- CLAUDE_ARGS...]\n  keel run [--isolation vm|vm-v8|v8-sandboxed] [--provenance floor|gate-context] [--cpus N] [--memory GIB] [--reuse-connections] [--record-targets] [--ephemeral-workspace] [--schemas BUNDLE.json] [--keep-alive] [--idle-timeout HOURS] [--allow CAPABILITY] [--policy POLICY.json] [--continue SESSION] [--model MODEL] [--auth api-key|bedrock|openrouter] [--profile scoped --scope RULE|none|--scope-file FILE|--report REPORT [--exclude RULE]] [--model-token-budget N] [--model-cost-budget USD] HARNESS [ARGS...]\n  keel policy compile POLICY.md --output DRAFT.json [--translation RESULT.json]\n  keel policy compile --text TEXT --output DRAFT.json [--translation RESULT.json]\n  keel policy accept DRAFT.json --output POLICY.json\n  keel policy show POLICY.json\n  keel policy diff OLD.json NEW.json\n  keel attach SESSION\n  keel stop SESSION\n  keel recover SESSION | --all\n  keel status SESSION [--audit AUDIT.ndjson]\n  keel audit verify AUDIT.ndjson RUN_KEY_FILE\n  keel report AUDIT.ndjson RUN_KEY_FILE [AUDIT.ndjson RUN_KEY_FILE ...]\n  keel report --axes [SESSION ...]\n  keel report --context [SESSION ...]\n  keel export SESSION [SESSION ...] [--out FILE] [--otlp URL]\n  keel floor show SESSION [--state FLOOR.json]\n  keel floor lift SESSION [RANK]\n\ncapabilities:\n  egress:HOST\n  push:branch\n  push:ref:refs/heads/PATTERN\n  pr:create\n  pr:target:BRANCH\n  github:read-private-issues\n  deny:force-push\n  isolation:v8-sandboxed\n  workspace:public\n  workspace:own\n"
+    "usage:\n  keel setup [--prebuilt RELEASE_DIR]\n  keel doctor\n  keel mux [--workspace PATH] [RUN_OPTIONS] [-- CLAUDE_ARGS...]\n  keel run [--isolation vm|vm-v8|v8-sandboxed] [--provenance floor|gate-context] [--cpus N] [--memory GIB] [--reuse-connections] [--record-targets] [--ephemeral-workspace] [--schemas BUNDLE.json] [--keep-alive] [--idle-timeout HOURS] [--allow CAPABILITY] [--policy POLICY.json] [--continue SESSION] [--model MODEL] [--auth api-key|bedrock|openrouter] [--profile scoped --scope RULE|none|--scope-file FILE|--report REPORT [--exclude RULE]] [--model-token-budget N] [--model-cost-budget USD] HARNESS [ARGS...]\n  keel policy compile POLICY.md --output DRAFT.json [--translation RESULT.json]\n  keel policy compile --text TEXT --output DRAFT.json [--translation RESULT.json]\n  keel policy accept DRAFT.json --output POLICY.json\n  keel policy show POLICY.json\n  keel policy diff OLD.json NEW.json\n  keel attach SESSION\n  keel stop SESSION\n  keel recover SESSION | --all\n  keel status SESSION [--audit AUDIT.ndjson]\n  keel audit verify AUDIT.ndjson RUN_KEY_FILE\n  keel report AUDIT.ndjson RUN_KEY_FILE [AUDIT.ndjson RUN_KEY_FILE ...]\n  keel report --axes [SESSION ...]\n  keel report --context [SESSION ...]\n  keel export SESSION [SESSION ...] [--out FILE] [--otlp URL]\n  keel floor show SESSION [--state FLOOR.json]\n  keel floor lift SESSION [RANK]\n\ncapabilities:\n  egress:HOST\n  push:branch\n  push:ref:refs/heads/PATTERN\n  pr:create\n  pr:target:BRANCH\n  github:read-private-issues\n  deny:force-push\n  isolation:v8-sandboxed\n  workspace:public\n  workspace:own\n"
 }
 
 #[cfg(test)]
@@ -3397,7 +3511,16 @@ mod tests {
 
     #[test]
     fn parses_setup_and_doctor_without_arguments() {
-        assert_eq!(parse_args(args(&["setup"])).unwrap(), Command::Setup);
+        assert_eq!(
+            parse_args(args(&["setup"])).unwrap(),
+            Command::Setup { prebuilt: None }
+        );
+        assert_eq!(
+            parse_args(args(&["setup", "--prebuilt", "release"])).unwrap(),
+            Command::Setup {
+                prebuilt: Some(PathBuf::from("release"))
+            }
+        );
         assert_eq!(parse_args(args(&["doctor"])).unwrap(), Command::Doctor);
         assert!(parse_args(args(&["setup", "--unknown"])).is_err());
         assert!(parse_args(args(&["doctor", "--unknown"])).is_err());
@@ -4755,6 +4878,93 @@ mod axes_tests {
         assert_eq!(summary.avoided.len(), 1);
         assert_eq!(summary.added.len(), 1);
         assert_eq!(summary.unrecorded, 1);
+        assert_eq!(summary.floor_gates, 1);
+        assert_eq!(summary.floor_only_gates, 1);
+        assert_eq!(summary.floor_only_prompts, 1);
+    }
+
+    fn record(event: &str, entries: &[(&str, &str)]) -> AuditRecord {
+        AuditRecord {
+            seq: 0,
+            run_id: "run".to_owned(),
+            previous_hash: String::new(),
+            payload: keel_audit::AuditPayload {
+                timestamp_ms: 0,
+                event: event.to_owned(),
+                action_id: None,
+                fields: fields(entries),
+            },
+            record_hash: String::new(),
+            mac: String::new(),
+        }
+    }
+
+    #[test]
+    fn floor_section_counts_gates_the_floor_alone_caused() {
+        let mut summary = AxesSummary::default();
+        // Unjudged actions from before the verdicts still count as floor gates.
+        summary.observe(1, &fields(&[("rules", r#"["kernel:minimum-rank"]"#)]));
+        summary.observe(
+            2,
+            &fields(&[
+                ("intent", "egress-host"),
+                ("rules", r#"["intent:egress-host","kernel:minimum-rank"]"#),
+                ("prompt_presented", "true"),
+            ]),
+        );
+        summary.observe(3, &fields(&[("intent", "inside"), ("rules", "[]")]));
+        assert_eq!(summary.floor_gates, 2);
+        assert_eq!(summary.floor_only_gates, 1);
+        assert_eq!(summary.floor_only_prompts, 0);
+    }
+
+    #[test]
+    fn floor_section_starts_at_the_declared_rank_and_names_what_lowered_it() {
+        let lowered = |before: &str, after: &str, source: &str| {
+            record(
+                "kernel.provenance",
+                &[
+                    ("floor_before", before),
+                    ("floor_after", after),
+                    ("rank", after),
+                    ("source", source),
+                ],
+            )
+        };
+        let own = [
+            record(
+                "kernel.run-admitted",
+                &[("manifest", r#"{"workspace":{"declared_rank":2}}"#)],
+            ),
+            lowered("2", "2", r#"{"kind":"host","host":"docs.rs","path":"/"}"#),
+            lowered(
+                "2",
+                "0",
+                r#"{"kind":"host","host":"github.com","path":"/x"}"#,
+            ),
+            lowered(
+                "0",
+                "0",
+                r#"{"kind":"host","host":"example.com","path":"/"}"#,
+            ),
+        ];
+        let mut summary = AxesSummary::default();
+        summary.observe_floor(&own);
+        summary.observe_floor(&[]);
+
+        assert_eq!(
+            summary.floor_start,
+            BTreeMap::from([
+                ("0 (exposed workspace)".to_owned(), 1),
+                ("2 (accepted HEAD)".to_owned(), 1),
+            ])
+        );
+        assert_eq!(summary.floor_end, BTreeMap::from([("0".to_owned(), 2)]));
+        assert_eq!(
+            summary.floor_lowered_by,
+            BTreeMap::from([("github.com".to_owned(), 1)]),
+            "only observations that lowered the floor are named"
+        );
     }
 
     fn context_record(phase: &str, sequence: &str, blocks: &str) -> AuditRecord {

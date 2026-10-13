@@ -81,7 +81,7 @@ An untrusted component can still contain important correctness logic. “Untrust
 
 Keel keeps the hand-written first-party trusted Rust surface small. CI holds each
 trusted crate to a line ratchet: growing a crate past its number fails until the
-number is raised, with the reason in the commit. The trusted total, about 15,300
+number is raised, with the reason in the commit. The trusted total, about 18,900
 lines, is reported rather than capped. The `tokei` count includes inline tests and
 trusted binaries as well as production library code.
 

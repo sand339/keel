@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Headless end-to-end suite for Keel on an Apple silicon Mac.
+"""Headless end-to-end suite for Keel on an Apple silicon Mac or a Linux KVM host.
 
 Runs every workflow that needs no operator answer against the installed
 runtime, checks each case's output and audit records, then verifies every
@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -41,6 +42,23 @@ from typing import Callable
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][0-9A-Za-z]|\x1b[=>78]")
 PENDING = "KEEL APPROVAL PENDING"
 ADMISSION = ("KEEL TASK ADMISSION", "KEEL TRUSTED ADMISSION")
+
+
+# Slow hosts, such as a nested VM, set KEEL_E2E_TIMEOUT_SCALE to stretch every
+# wait, so the suite tests correctness rather than speed.
+TIMEOUT_SCALE = float(os.environ.get("KEEL_E2E_TIMEOUT_SCALE", "1"))
+
+
+def scaled(seconds: float) -> float:
+    return seconds * TIMEOUT_SCALE
+
+
+def under_script(transcript: Path, command: list[str]) -> list[str]:
+    """Runs COMMAND on a pseudo-terminal, recording it to TRANSCRIPT. BSD
+    script(1) takes the command as arguments; util-linux takes one shell line."""
+    if sys.platform == "darwin":
+        return ["script", "-q", str(transcript), *command]
+    return ["script", "-q", "-e", "-c", shlex.join(command), str(transcript)]
 
 
 def clean(raw: bytes) -> str:
@@ -100,13 +118,13 @@ class Suite:
         environment = dict(self.environment, **(extra_env or {}))
         try:
             completed = subprocess.run(
-                ["script", "-q", str(transcript), str(self.keel), *arguments],
+                under_script(transcript, [str(self.keel), *arguments]),
                 cwd=cwd,
                 env=environment,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=timeout,
+                timeout=scaled(timeout),
             )
             code: int | None = completed.returncode
         except subprocess.TimeoutExpired:
@@ -221,7 +239,8 @@ def case_doctor(suite: Suite) -> Result:
     output = completed.stdout + completed.stderr
     (suite.transcripts / "doctor.txt").write_text(output)
     result.check("doctor exits 0", completed.returncode == 0, f"exit {completed.returncode}")
-    for line in ("guest root disk", "supports Landlock scoping", "VZ backend has virtualization"):
+    backend = "bubblewrap can create" if sys.platform == "linux" else "VZ backend has virtualization"
+    for line in ("guest root disk", "supports Landlock scoping", backend):
         result.check(f"doctor reports {line!r}", line in output)
     return result
 
@@ -302,7 +321,7 @@ def case_build_offline(suite: Suite) -> Result:
         ["run", "--memory", "4", "claude", "-p", run_script_prompt("build.sh"), "--allowedTools", "Bash"],
         workspace,
         ["E2E-C-OK", "E2E-RUST-OK", "E2E-GO-OK", "E2E-PIP-OK", "E2E-NPM-OK"],
-        timeout=600,
+        timeout=scaled(600),
     )
     memory = re.search(r"E2E-MEM-MIB (\d+)", text)
     result.check("--memory 4 reached the guest", bool(memory) and int(memory.group(1)) > 3500, memory.group(0) if memory else "")
@@ -353,10 +372,10 @@ def case_interrupted(suite: Suite) -> Result:
     transcript = suite.transcripts / "interrupted.typescript"
     started = time.monotonic()
     process = subprocess.Popen(
-        [
-            "script", "-q", str(transcript), str(suite.keel), "run", "claude", "-p",
+        under_script(transcript, [
+            str(suite.keel), "run", "claude", "-p",
             "Run `sleep 300` with the Bash tool, then reply DONE.", "--allowedTools", "Bash",
-        ],
+        ]),
         cwd=workspace,
         env=suite.environment,
         stdin=subprocess.DEVNULL,
@@ -364,7 +383,7 @@ def case_interrupted(suite: Suite) -> Result:
         stderr=subprocess.DEVNULL,
     )
     chain = None
-    deadline = time.monotonic() + 120
+    deadline = time.monotonic() + scaled(120)
     while time.monotonic() < deadline and chain is None:
         for session in suite.sessions_since(before):
             chains = list((suite.state / "sessions" / session).glob("audit-*.ndjson"))
@@ -378,7 +397,7 @@ def case_interrupted(suite: Suite) -> Result:
         os.kill(writer, signal.SIGKILL)
         time.sleep(5)
     try:
-        process.wait(timeout=120)
+        process.wait(timeout=scaled(120))
     except subprocess.TimeoutExpired:
         process.kill()
     if chain is not None:
@@ -422,10 +441,10 @@ def case_persistent_stop(suite: Suite) -> Result:
     transcript = suite.transcripts / "persistent-stop.typescript"
     started = time.monotonic()
     process = subprocess.Popen(
-        [
-            "script", "-q", str(transcript), str(suite.keel), "run", "--keep-alive", "claude", "-p",
+        under_script(transcript, [
+            str(suite.keel), "run", "--keep-alive", "claude", "-p",
             "Run `sleep 300` with the Bash tool, then reply DONE.", "--allowedTools", "Bash",
-        ],
+        ]),
         cwd=workspace,
         env=suite.environment,
         stdin=subprocess.DEVNULL,
@@ -433,7 +452,7 @@ def case_persistent_stop(suite: Suite) -> Result:
         stderr=subprocess.DEVNULL,
     )
     chain = None
-    deadline = time.monotonic() + 120
+    deadline = time.monotonic() + scaled(120)
     while time.monotonic() < deadline and chain is None:
         for session in suite.sessions_since(before):
             chains = list((suite.state / "sessions" / session).glob("audit-*.ndjson"))
@@ -446,7 +465,7 @@ def case_persistent_stop(suite: Suite) -> Result:
         result.sessions.append(session)
         descendants = descendants_of(int(chain.name.split("-")[1]))
         stop = subprocess.run(
-            [str(suite.keel), "stop", session], env=suite.environment, capture_output=True, text=True, timeout=60
+            [str(suite.keel), "stop", session], env=suite.environment, capture_output=True, text=True, timeout=scaled(60)
         )
         result.check("keel stop succeeds and names its receipt", stop.returncode == 0 and "teardown receipt" in stop.stdout, (stop.stdout + stop.stderr).strip())
         directory = chain.parent
@@ -465,11 +484,11 @@ def case_persistent_stop(suite: Suite) -> Result:
         )
         result.check("keel status reports closed with a verified receipt", "state: closed\n" in status.stdout and "receipt: verified after stop" in status.stdout, status.stdout.strip() or status.stderr.strip())
         again = subprocess.run(
-            [str(suite.keel), "stop", session], env=suite.environment, capture_output=True, text=True, timeout=30
+            [str(suite.keel), "stop", session], env=suite.environment, capture_output=True, text=True, timeout=scaled(30)
         )
         result.check("a repeated stop reports the existing receipt", again.returncode == 0 and "already stopped" in again.stdout, (again.stdout + again.stderr).strip())
     try:
-        process.wait(timeout=60)
+        process.wait(timeout=scaled(60))
     except subprocess.TimeoutExpired:
         process.kill()
     result.seconds = time.monotonic() - started
@@ -485,10 +504,10 @@ def case_idle_timeout(suite: Suite) -> Result:
     transcript = suite.transcripts / "idle-timeout.typescript"
     started = time.monotonic()
     process = subprocess.Popen(
-        [
-            "script", "-q", str(transcript), str(suite.keel), "run", "--keep-alive", "claude", "-p",
+        under_script(transcript, [
+            str(suite.keel), "run", "--keep-alive", "claude", "-p",
             "Run `sleep 300` with the Bash tool, then reply DONE.", "--allowedTools", "Bash",
-        ],
+        ]),
         cwd=workspace,
         env=dict(suite.environment, KEEL_IDLE_TIMEOUT_SECS="15"),
         stdin=subprocess.DEVNULL,
@@ -497,7 +516,7 @@ def case_idle_timeout(suite: Suite) -> Result:
         start_new_session=True,
     )
     chain = None
-    deadline = time.monotonic() + 120
+    deadline = time.monotonic() + scaled(120)
     while time.monotonic() < deadline and chain is None:
         for session in suite.sessions_since(before):
             chains = list((suite.state / "sessions" / session).glob("audit-*.ndjson"))
@@ -513,7 +532,7 @@ def case_idle_timeout(suite: Suite) -> Result:
         session = chain.parent.name
         result.sessions.append(session)
         receipt = chain.with_suffix(".receipt.json")
-        deadline = time.monotonic() + 90
+        deadline = time.monotonic() + scaled(90)
         while time.monotonic() < deadline and not receipt.exists():
             time.sleep(2)
         result.check("the detached session stopped itself", receipt.exists())
@@ -542,11 +561,11 @@ def case_workspace_own(suite: Suite) -> Result:
         before = suite.session_names()
         transcript = suite.transcripts / f"workspace-own-{attempt}.typescript"
         process = subprocess.Popen(
-            [
-                "script", "-q", str(transcript), str(suite.keel), "run", "--allow", "workspace:own", "claude", "-p",
+            under_script(transcript, [
+                str(suite.keel), "run", "--allow", "workspace:own", "claude", "-p",
                 "Use the Read tool on NOTE.md and on untracked-secret.txt, then reply with what each contains.",
                 "--allowedTools", "Read",
-            ],
+            ]),
             cwd=workspace,
             env=suite.environment,
             stdin=subprocess.PIPE,
@@ -555,7 +574,7 @@ def case_workspace_own(suite: Suite) -> Result:
         )
         # Input typed before the trusted screen appears is discarded, so the
         # approval is typed only once the prompt is on the terminal.
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + scaled(60)
         while time.monotonic() < deadline and not (
             transcript.exists() and b"Type APPROVE" in transcript.read_bytes()
         ):
@@ -564,7 +583,7 @@ def case_workspace_own(suite: Suite) -> Result:
         process.stdin.write(b"APPROVE\r")
         process.stdin.flush()
         try:
-            code = process.wait(timeout=420)
+            code = process.wait(timeout=scaled(420))
         except subprocess.TimeoutExpired:
             process.kill()
             code = None
@@ -622,27 +641,27 @@ def case_npm_ci_pinned(suite: Suite) -> Result:
     before = suite.session_names()
     transcript = suite.transcripts / "npm-ci-pinned.typescript"
     process = subprocess.Popen(
-        [
-            "script", "-q", str(transcript), str(suite.keel), "run",
+        under_script(transcript, [
+            str(suite.keel), "run",
             "--allow", "workspace:own", "--allow", "egress:registry.npmjs.org", "claude", "-p",
             "Use the Bash tool to run exactly `npm ci --no-audit --no-fund` and then "
             "`cat node_modules/is-number/package.json`, then reply with the package's version.",
             "--allowedTools", "Bash",
-        ],
+        ]),
         cwd=workspace,
         env=suite.environment,
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    deadline = time.monotonic() + 60
+    deadline = time.monotonic() + scaled(60)
     while time.monotonic() < deadline and not (transcript.exists() and b"Type APPROVE" in transcript.read_bytes()):
         time.sleep(0.2)
     assert process.stdin is not None
     process.stdin.write(b"APPROVE\r")
     process.stdin.flush()
     try:
-        code = process.wait(timeout=420)
+        code = process.wait(timeout=scaled(420))
     except subprocess.TimeoutExpired:
         process.kill()
         code = None
@@ -694,20 +713,20 @@ def case_extract_url(suite: Suite) -> Result:
     transcript = suite.transcripts / "extract-url.typescript"
     started = time.monotonic()
     process = subprocess.Popen(
-        [
-            "script", "-q", str(transcript), str(suite.keel), "run", "--schemas", str(schemas),
+        under_script(transcript, [
+            str(suite.keel), "run", "--schemas", str(schemas),
             "--allow", "egress:example.com", "--allow", "workspace:own", "claude", "-p",
             "Call the keel_extract MCP tool with source url:https://example.com/ and schema page-kind, "
             "then reply with exactly the JSON result it returns and nothing else.",
             "--allowedTools", "mcp__keel__keel_extract",
-        ],
+        ]),
         cwd=workspace,
         env=suite.environment,
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    deadline = time.monotonic() + 60
+    deadline = time.monotonic() + scaled(60)
     while time.monotonic() < deadline and not (
         transcript.exists() and b"Type APPROVE" in transcript.read_bytes()
     ):
@@ -716,7 +735,7 @@ def case_extract_url(suite: Suite) -> Result:
     process.stdin.write(b"APPROVE\r")
     process.stdin.flush()
     try:
-        code = process.wait(timeout=420)
+        code = process.wait(timeout=scaled(420))
     except subprocess.TimeoutExpired:
         process.kill()
         code = None

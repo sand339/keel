@@ -792,6 +792,13 @@ refusals and connection-setup legs are not counted, and running sessions are
 skipped until they seal. Use it to decide whether the shadow verdicts should
 start deciding.
 
+A floor section shows where each session's floor started (the declared rank
+of an accepted `HEAD`, or 0 for an exposed workspace), where it ended, which
+sources lowered it, and how many gates the floor raised. A floor-only gate is
+one the floor raised with no other reason: the most a more precise floor
+could remove, and the measure for whether per-turn provenance is worth
+building.
+
 Summarize what model requests carried, from the shadow context digest log:
 
 ~~~sh

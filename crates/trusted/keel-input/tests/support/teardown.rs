@@ -134,7 +134,10 @@ fn self_terminating_child(stoppable: bool) -> std::process::ExitStatus {
 
 #[test]
 fn children_inherit_the_blocked_termination_signals() {
-    assert_eq!(self_terminating_child(false).signal(), None);
+    // Rust starts Linux children with an empty signal mask, so there every
+    // child is already stoppable; macOS children inherit the blocked mask.
+    let expected = cfg!(target_os = "linux").then_some(Signal::SIGTERM as i32);
+    assert_eq!(self_terminating_child(false).signal(), expected);
 }
 
 #[test]

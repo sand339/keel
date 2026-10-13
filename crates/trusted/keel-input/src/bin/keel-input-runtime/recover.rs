@@ -23,14 +23,26 @@ pub(super) struct Expected {
 
 pub(super) const KEEL: Expected = Expected {
     runtime: "keel-input-runtime",
-    backend: &[
-        "sandbox-exec",
-        "keel-runtime",
-        "keel-vz-spike",
-        "deno",
-        "git",
-        "keel-extract",
-    ],
+    backend: if cfg!(target_os = "linux") {
+        &[
+            "bwrap",
+            "keel-runtime",
+            "keel-ch",
+            "cloud-hypervisor",
+            "virtiofsd",
+            "git",
+            "keel-extract",
+        ]
+    } else {
+        &[
+            "sandbox-exec",
+            "keel-runtime",
+            "keel-vz-spike",
+            "deno",
+            "git",
+            "keel-extract",
+        ]
+    },
 };
 
 /// What one recovery pass observed for one interrupted chain. It is not
@@ -231,7 +243,7 @@ fn group_members(group: i32) -> Option<Vec<(i32, u64, String)>> {
                 let leader = fields.next()?.parse::<i32>().ok()?;
                 let elapsed = elapsed_seconds(fields.next()?)?;
                 let command = fields.collect::<Vec<_>>().join(" ");
-                let name = Path::new(&command).file_name()?.to_str()?.to_owned();
+                let name = executable_name(member, &command)?;
                 (leader == group).then_some((member, elapsed, name))
             })
             .collect(),
@@ -267,7 +279,20 @@ fn process_name(pid: u32) -> Option<String> {
         .output()
         .ok()?;
     let command = String::from_utf8(output.stdout).ok()?;
-    Some(Path::new(command.trim()).file_name()?.to_str()?.to_owned())
+    executable_name(i32::try_from(pid).ok()?, command.trim())
+}
+
+/// The file name of the program a process runs. macOS `ps` reports its path.
+/// Linux `ps` reports a name cut to 15 bytes that the process may change, so
+/// there the name comes from the kernel's link to the executable.
+// Each platform reads one of the two.
+#[allow(unused_variables)]
+fn executable_name(pid: i32, reported: &str) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    let path = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    #[cfg(not(target_os = "linux"))]
+    let path = PathBuf::from(reported);
+    Some(path.file_name()?.to_str()?.to_owned())
 }
 
 #[cfg(test)]

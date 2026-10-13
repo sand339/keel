@@ -2,6 +2,10 @@
 set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+# SHA-256 with sha256sum where it exists (Linux), and shasum on macOS.
+sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi
+}
 downloads="$repo_root/.phase1/downloads"
 destination="$repo_root/.phase1/xterm"
 mkdir -p "$downloads" "$destination"
@@ -14,10 +18,10 @@ fetch_module() {
     output=$5
     archive="$downloads/$archive_name"
     if [ ! -f "$archive" ] ||
-        [ "$(shasum -a 256 "$archive" | awk '{print $1}')" != "$sha256" ]; then
+        [ "$(sha256 "$archive" | awk '{print $1}')" != "$sha256" ]; then
         temporary="$archive.partial"
         curl -fL --retry 3 "$url" -o "$temporary"
-        actual=$(shasum -a 256 "$temporary" | awk '{print $1}')
+        actual=$(sha256 "$temporary" | awk '{print $1}')
         if [ "$actual" != "$sha256" ]; then
             echo "xterm checksum mismatch for $archive_name: expected $sha256, got $actual" >&2
             exit 1

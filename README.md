@@ -2,7 +2,7 @@
 
 Keel is a research prototype for running AI coding and research workloads inside a local security boundary. It treats the model, its harness, repository content, tool output, and network content as potentially hostile, then places sensitive actions behind a small trusted kernel.
 
-Keel currently targets Apple silicon macOS. It is suitable for research, evaluation, and local experimentation; it is not yet production ready.
+Keel runs on Apple silicon macOS and on Ubuntu Linux with KVM (tested on 24.04 x86_64). It is suitable for research, evaluation, and local experimentation; it is not yet production ready.
 
 <p align="center">
   <img src="docs/assets/keel-launcher.png" alt="Keel secure-session launcher with Claude Code and V8 isolation profiles" width="900">
@@ -72,7 +72,33 @@ validating a finding in code offline. See [scoped runs](docs/USAGE.md#10-scoped-
 
 ## Quick start
 
+### Install a release
+
+A release needs no Docker or toolchain. Download the tarball for your platform
+and its `.sha256` from the
+[releases page](https://github.com/sand339/keel/releases) with `curl`, then:
+
+~~~sh
+shasum -a 256 -c keel-VERSION-PLATFORM.tar.gz.sha256   # sha256sum -c on Linux
+tar -xzf keel-VERSION-PLATFORM.tar.gz
+./keel-VERSION-PLATFORM/install.sh                      # checks every file, then installs
+export PATH="$HOME/.local/bin:$PATH"
+keel doctor
+~~~
+
+On Ubuntu the host still needs KVM, your user in the `kvm` group, and
+`bubblewrap` (`sudo apt-get install -y bubblewrap`). Releases are built on
+Ubuntu 24.04 and need it or later.
+
+On macOS, download with `curl` rather than a browser. Release binaries are
+signed ad hoc, not notarized, so Gatekeeper refuses ones a browser marks as
+downloaded.
+
+To build from source instead:
+
 ### Requirements
+
+On macOS:
 
 - Apple silicon Mac
 - Xcode Command Line Tools: `xcode-select --install`. If a newer beta macOS
@@ -87,6 +113,28 @@ validating a finding in code offline. See [scoped runs](docs/USAGE.md#10-scoped-
 - for Bedrock, the AWS CLI v2
 - about 7 GB of free disk for downloads, build caches, and the installed
   runtime, plus about 2 GB for Docker's build images
+
+On Linux (Ubuntu; other distributions are not supported):
+
+- an x86_64 or ARM64 host with KVM (`/dev/kvm`), your user in the `kvm`
+  group; ARM64 is tested only in a nested VM
+- Docker, running during setup, with your user in the `docker` group. It
+  builds the guest image; it is not the isolation boundary.
+- bubblewrap at `/usr/bin/bwrap`, which confines Keel's host-side children
+- Rust through [rustup](https://rustup.rs), a C toolchain, `pkg-config`, and
+  the libseccomp and libcap-ng headers, for building virtiofsd
+- curl, git, gzip, Python 3, `sha256sum`, and tar
+
+On Ubuntu 24.04:
+
+~~~sh
+sudo apt-get install -y build-essential pkg-config bubblewrap docker.io \
+    libseccomp-dev libcap-ng-dev
+sudo usermod -aG kvm,docker "$USER"    # then log in again
+~~~
+
+Ubuntu 23.10 and later also restrict the user namespaces bubblewrap needs;
+`keel doctor` detects this and prints the one-line `sudo` fix.
 
 ### Build and install local runtime artifacts
 
@@ -158,64 +206,43 @@ lower-assurance process starts.
 
 ## Security posture
 
-Keel is designed to do the following. Each property links to the tests that
-exercise it.
+| Prevents | Gates on operator approval | Records only (shadow) |
+| --- | --- | --- |
+| Credentials reaching the guest | Egress to unadmitted hosts | Task intent outside branch scopes |
+| Guest networking; link-local, loopback, and private destinations | Pushes and PRs outside a branch scope or from workspace code | Per-turn model context |
+| Admitted secrets leaving | Actions below the provenance floor | Action-centric decision verdicts |
+| `deny:` rules, and anything outside a scoped run | Private content to an uncleared destination | Every permitted action, in the audit chain |
+| Renderer-drawn approvals; guest writes to the audit log | Unaccounted lines in protected files of a push; floor lifts | |
 
-| Property | Evidence |
+| Property | Tests |
 | --- | --- |
-| Model and service credentials stay out of the workload; the guest presents sentinels, swapped only on their exact host and path | [`credential_scope.rs`](crates/trusted/keel-secrets/tests/support/credential_scope.rs), [`openrouter.rs`](crates/trusted/keel-secrets/tests/openrouter.rs) |
-| No ordinary guest networking; allowed requests go through brokered host relays, authorized per request after TLS termination | VZ host preflight and guest network report in [`keel-vz-spike.rs`](crates/untrusted/keel-isolate/src/bin/keel-vz-spike.rs); [`provenance_gate.rs`](crates/trusted/keel-kernel/tests/provenance_gate.rs) |
-| The guest workload is confined a second time inside the VM: no capabilities, Landlock, seccomp, and a bounded cgroup | `confinement_preflight_requires_every_layer` in [`keel-mcp`](crates/untrusted/keel-mcp/src/lib.rs); the host refuses to boot a guest whose preflight fails |
-| Each guest request carries the process that made it, and pushes and pull requests from workspace code are gated | `a_pull_request_carries_the_guest_origin_of_its_mcp_connection` in [`keel-mcp`](crates/untrusted/keel-mcp/src/lib.rs); [`push_provenance.rs`](crates/trusted/keel-kernel/tests/push_provenance.rs) |
-| Explicit policy combines with data provenance, budgets, and operator approval | [`primary_scenario.rs`](crates/trusted/keel-policy/tests/primary_scenario.rs), [`stateful_rules.rs`](crates/trusted/keel-policy/tests/stateful_rules.rs), [`write_inheritance.rs`](crates/trusted/keel-provenance/tests/write_inheritance.rs), [`model_budget.rs`](crates/trusted/keel-kernel/tests/model_budget.rs) |
-| Approval input is isolated from the untrusted terminal renderer | [`secure_attention.rs`](crates/trusted/keel-input/tests/secure_attention.rs), [`terminal_control.rs`](crates/trusted/keel-input/tests/terminal_control.rs) |
-| `A` binds to one exact action and is consumed once; `G` covers only the displayed host, port, and method, expires after 15 minutes, 64 actions, or a floor drop, and excludes credential-bearing and high-impact effects | [`egress_grant_scope.rs`](crates/trusted/keel-kernel/tests/egress_grant_scope.rs) and the permit tests in the kernel's [unit suite](crates/trusted/keel-kernel/tests/support/unit.rs) |
-| A scoped run's declared scope is enforced, refusing everything else without a prompt | [`scope.rs`](crates/trusted/keel-provenance/tests/scope.rs), [`scoped_run.rs`](crates/trusted/keel-input/tests/scoped_run.rs) |
-| Every run records a canonical admission manifest before its workload starts | [`admission_manifest.rs`](crates/trusted/keel-input/tests/admission_manifest.rs) |
-| Audit records are authenticated and hash-chained, and an unsealed prefix is never accepted as complete | [`verification_status.rs`](crates/trusted/keel-audit/tests/verification_status.rs) |
-| The runtime can write only one file in the session directory, the guest's event stream, and never the audit chain | `runtime_sandbox_writes_only_its_guest_events_file_in_the_session` in [`runtime_security.rs`](crates/trusted/keel-input/tests/support/runtime_security.rs) |
-| The hand-written trusted Rust is small, about 15,300 lines, and each trusted crate is held to a checked line ratchet | invariant I1 in [`ci/check_invariants.py`](ci/check_invariants.py) |
+| Credentials stay on the host; the guest gets sentinels | [`credential_scope.rs`](crates/trusted/keel-secrets/tests/support/credential_scope.rs), [`openrouter.rs`](crates/trusted/keel-secrets/tests/openrouter.rs) |
+| No guest NIC; each request is brokered and authorized after TLS termination | [`relay.rs`](crates/untrusted/keel-isolate/src/relay.rs), [`provenance_gate.rs`](crates/trusted/keel-kernel/tests/provenance_gate.rs) |
+| A second confinement layer in the guest: no capabilities, Landlock, seccomp, cgroup | [`keel-mcp`](crates/untrusted/keel-mcp/src/lib.rs) `confinement_preflight_requires_every_layer` |
+| Each request names the guest process behind it | [`push_provenance.rs`](crates/trusted/keel-kernel/tests/push_provenance.rs) |
+| Policy, provenance, budgets, and approval combine | [`primary_scenario.rs`](crates/trusted/keel-policy/tests/primary_scenario.rs), [`write_inheritance.rs`](crates/trusted/keel-provenance/tests/write_inheritance.rs), [`model_budget.rs`](crates/trusted/keel-kernel/tests/model_budget.rs) |
+| Approval input is isolated from the renderer | [`secure_attention.rs`](crates/trusted/keel-input/tests/secure_attention.rs) |
+| `A` approves one action once; `G` grants are scoped and expire | [`egress_grant_scope.rs`](crates/trusted/keel-kernel/tests/egress_grant_scope.rs) |
+| Scoped runs refuse everything outside their scope | [`scoped_run.rs`](crates/trusted/keel-input/tests/scoped_run.rs) |
+| Every run records its admission manifest first | [`admission_manifest.rs`](crates/trusted/keel-input/tests/admission_manifest.rs) |
+| The audit log is authenticated, hash-chained, and sealed | [`verification_status.rs`](crates/trusted/keel-audit/tests/verification_status.rs) |
+| The trusted code is about 18,900 lines, each crate held to a line ratchet | [`check_invariants.py`](ci/check_invariants.py) I1 |
 
-Keel does not claim to:
-
-- determine whether every semantically harmful action is harmful;
-- prevent an operator from approving a dangerous but accurately displayed action;
-- stop exfiltration through output that policy legitimately permits;
-- make the host V8 sandbox equivalent to a microVM;
-- protect against a compromised host OS, hypervisor, hardware, trusted dependency, or admitted runtime artifact;
-- provide production-grade availability, remote attestation, or complete crash recovery.
-
-Read the [threat model](docs/THREAT-MODEL.md) before relying on the prototype for sensitive work.
+Out of scope: judging whether an action is harmful, stopping an operator from
+approving an accurately shown action, exfiltration through permitted output,
+and a compromised host, hypervisor, or trusted dependency. See the
+[threat model](docs/THREAT-MODEL.md).
 
 ## Known limitations
 
-- **Payload checks are verbatim.** Private repository content headed to a
-  destination not cleared for it escalates, admitted secrets are denied, and
-  protected lines in a push that neither the accepted `HEAD` nor the model
-  accounts for escalate; the push is derived by trusted code from its own
-  bytes. Paraphrased, compressed, or re-encoded content is not detected.
-- **Extraction is schema-bounded.** `keel_extract` lets the agent read an
-  issue or page without lowering the floor, but only as the fields an admitted
-  schema allows; tasks that need the prose itself still read it raw.
-- **Shadow verdicts.** Task intent outside branch scopes and per-turn context
-  are recorded and reported but do not decide yet. `keel report --axes` and
-  `--context` measure them.
-- **Proxy protocols.** The trusted proxy speaks HTTP/1.1 only and does not
-  relay WebSockets, so pages and tools that need them do not work fully.
-- **Guest image.** Alpine packages, including Chromium, are locked, so
-  Chromium is patched only when the lock is refreshed
-  (`spikes/lock-guest-packages.sh`) and setup rebuilds the image. Chromium runs without its own sandbox; the VM is the boundary.
-- **Browser view.** There is no live view of the guest browser; use the
-  `agent-browser` CLI and the screenshots it saves.
-- **Platform.** Apple silicon macOS only. Linux is design work.
-- **Teardown.** `keel stop` returns only once a persistent session's
-  supervisor has checked its cleanup and written a signed receipt, and a hangup
-  or `SIGTERM` stops a run in order. If the trusted runtime is killed with
-  `SIGKILL` or the host crashes, the runtime backend and its VM keep running
-  until the next `keel run` or `keel attach` (after a 15-minute grace) or
-  `keel recover` releases what the run's audit chain records. Detached
-  sessions stop themselves after 12 idle hours. Recovery records are unsigned,
-  and foreground runs get no receipt.
+- **Payload checks are verbatim:** paraphrased or re-encoded content is not detected.
+- **Extraction is schema-bounded:** tasks that need an issue's prose still read it raw.
+- **Shadow verdicts:** task intent and per-turn context are measured, not enforced.
+- **HTTP/1.1 only:** no WebSockets through the proxy.
+- **Chromium updates with the package lock,** and runs without its own sandbox inside the VM.
+- **No live browser view:** use the `agent-browser` CLI and its screenshots.
+- **Platforms:** Apple silicon macOS and Ubuntu 24.04+ (x86_64; ARM64 tested only nested); host V8 is macOS-only.
+- **Crash cleanup:** on macOS a killed runtime's VM runs until `keel recover` (Linux ends it at once); recovery records are unsigned.
 
 ## Documentation
 

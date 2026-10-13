@@ -83,14 +83,30 @@ with `main` and carry each release's exact tree.
 cp ci/pre-push-guard.sh .git/hooks/pre-push
 
 # Each release, after this checklist passes on main:
-snapshot=$(git commit-tree main^{tree} -p public -m "Keel vX.Y.Z")
+snapshot=$(git commit-tree 'main^{tree}' -p refs/heads/public -m "Keel vX.Y.Z")
 git branch -f public "$snapshot"
 git push private main
-git push public public:main
+git push public refs/heads/public:refs/heads/main
 ```
 
-The first snapshot has no parent; later ones use `-p public` so the public
-history is one commit per release.
+Release tarballs are built per platform, on that platform, from a runtime
+`keel setup` installed from the release commit:
+
+```sh
+keel setup                       # from the checkout, on each platform
+./spikes/package-release.sh      # writes target/dist/keel-VERSION-PLATFORM.tar.gz and .sha256
+```
+
+Set `KEEL_RELEASE_VERSION` (for example `0.1.0`) for a tagged release; it
+defaults to the workspace version and commit. Before publishing, install the
+tarball as a user with no toolchain and run `keel doctor` and one session.
+Upload each tarball and its `.sha256` to the release on the public
+repository.
+
+The first snapshot has no parent; later ones use `-p refs/heads/public` so
+the public history is one commit per release. Spell the branch as
+`refs/heads/public`: a bare `public` is ambiguous, since it names both the
+branch and the remote.
 
 ---
 
@@ -98,7 +114,8 @@ history is one commit per release.
 
 ## v0.1.0 (unreleased)
 
-The first public research release. Apple silicon macOS only.
+The first public research release. Apple silicon macOS, and Linux with KVM
+(tested on Ubuntu 24.04 x86_64).
 
 **Isolation**
 - Claude Code and V8 workloads in a Virtualization.framework microVM with no

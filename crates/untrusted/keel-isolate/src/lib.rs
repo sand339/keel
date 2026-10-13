@@ -5,8 +5,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[cfg(feature = "vz-backend")]
+#[cfg(feature = "runtime")]
 pub mod host_v8;
+#[cfg(feature = "runtime")]
+pub mod relay;
 
 /// Identifies this crate as outside the trusted computing base.
 pub const TRUST_CLASS: &str = "untrusted";

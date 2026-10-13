@@ -920,6 +920,7 @@ dependencies = [
  "keel-compile",
  "keel-input",
  "keel-provenance",
+ "ring",
  "serde",
  "serde_json",
 ]

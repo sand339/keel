@@ -1,6 +1,10 @@
 #![forbid(unsafe_code)]
 #![doc = "Trusted terminal owner for an interactive Keel runtime."]
 
+// Only the Linux launcher confines with it; its tests run everywhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[path = "keel-input-runtime/confine.rs"]
+mod confine;
 #[path = "keel-input-runtime/receipt.rs"]
 mod receipt;
 #[path = "keel-input-runtime/recover.rs"]
@@ -27,7 +31,10 @@ use std::{
     net::{Ipv4Addr, TcpListener},
     os::{
         fd::AsRawFd as _,
-        unix::{fs::PermissionsExt as _, process::CommandExt as _},
+        unix::{
+            fs::{OpenOptionsExt as _, PermissionsExt as _},
+            process::CommandExt as _,
+        },
     },
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
@@ -41,6 +48,12 @@ use std::{
 };
 use teardown::RunResources;
 
+/// This platform's VM backend, installed beside the runtime.
+const VM_BACKEND: &str = if cfg!(target_os = "linux") {
+    "keel-ch"
+} else {
+    "keel-vz-spike"
+};
 const APPROVAL_TITLE_NOTICE: &[u8] = b"\x1b]2;Keel approval: Ctrl-] or Ctrl-A /approve\x07";
 const NORMAL_TITLE_NOTICE: &[u8] = b"\x1b]2;keel mux\x07";
 const MAX_DISPLAY_SNAPSHOT: usize = 4 * 1024 * 1024;
@@ -386,7 +399,10 @@ fn spawn_runtime(
         .parent()
         .ok_or("runtime backend has no parent directory")?;
     let installation_root = component_root.parent().unwrap_or(component_root);
-    let vz_backend = component_root.join("keel-vz-spike").canonicalize()?;
+    if cfg!(target_os = "linux") && isolation == "v8-sandboxed" {
+        return Err("the host V8 profile has no Linux confinement yet; use vm-v8".into());
+    }
+    let vm_backend = component_root.join(VM_BACKEND).canonicalize()?;
     let deno = component_root.join("deno").canonicalize()?;
     let sdk = component_root.join("keel-v8-sdk.ts").canonicalize()?;
     let git = trusted_git_toolchain()?;
@@ -426,11 +442,6 @@ fn spawn_runtime(
         .join(audit.file_name().map_or_else(String::new, |name| {
             name.to_string_lossy().replacen("audit-", "guest-", 1)
         }));
-    let allowed_child = if isolation == "v8-sandboxed" {
-        &deno
-    } else {
-        &vz_backend
-    };
     let v8_proxy_listener = (isolation == "v8-sandboxed")
         .then(|| TcpListener::bind((Ipv4Addr::LOCALHOST, 0)))
         .transpose()?;
@@ -439,21 +450,52 @@ fn spawn_runtime(
         .map(TcpListener::local_addr)
         .transpose()?
         .map(|address| address.port());
-    let profile = runtime_sandbox_profile(
-        [&runtime, allowed_child, &git.executable, &git.exec_root],
-        &git.data_root,
-        &workspace,
-        installation_root,
-        &request,
-        [&scratch, &guest_events],
-        &broker_socket,
-        v8_proxy_port,
+    #[cfg(target_os = "linux")]
+    let hypervisor = component_root.join("cloud-hypervisor").canonicalize()?;
+    #[cfg(target_os = "linux")]
+    let virtiofsd = component_root.join("virtiofsd").canonicalize()?;
+    create_bind_target(&guest_events)?;
+    let mut command = confined_command(
+        &runtime,
+        || {
+            let allowed_child = if isolation == "v8-sandboxed" {
+                &deno
+            } else {
+                &vm_backend
+            };
+            runtime_sandbox_profile(
+                [&runtime, allowed_child, &git.executable, &git.exec_root],
+                &git.data_root,
+                &workspace,
+                installation_root,
+                &request,
+                [&scratch, &guest_events],
+                &broker_socket,
+                v8_proxy_port,
+            )
+        },
+        || confine::Confinement {
+            read_only: vec![
+                installation_root.to_path_buf(),
+                request.clone(),
+                git.executable.clone(),
+                git.exec_root.clone(),
+                git.data_root.clone(),
+                PathBuf::from("/bin/sh"),
+                PathBuf::from("/bin/bash"),
+            ],
+            read_write: vec![
+                workspace.clone(),
+                scratch.clone(),
+                guest_events.clone(),
+                broker_socket.clone(),
+            ],
+            devices: vec![PathBuf::from("/dev/kvm")],
+            directory: Some(workspace.clone()),
+        },
     );
-    let mut command = Command::new("/usr/bin/sandbox-exec");
+    command.args(arguments);
     command
-        .args(["-p", &profile])
-        .arg(&runtime)
-        .args(arguments)
         .current_dir(&workspace)
         .env_clear()
         .env("PATH", git.search_path)
@@ -462,7 +504,7 @@ fn spawn_runtime(
         .env("KEEL_KERNEL_SOCKET", broker_socket)
         .env("KEEL_RUNTIME_SCRATCH", &scratch)
         .env("KEEL_GUEST_EVENTS", &guest_events)
-        .env("KEEL_VZ_BACKEND", &vz_backend)
+        .env("KEEL_VM_BACKEND", &vm_backend)
         .env(
             "KEEL_GIT_UPLOAD_PACK",
             git.exec_root.join("git-upload-pack"),
@@ -480,6 +522,13 @@ fn spawn_runtime(
     if let Some(port) = v8_proxy_port {
         command.env("KEEL_V8_PROXY_PORT", port.to_string());
     }
+    // The backend's helpers run inside the runtime's confinement, which is
+    // their boundary, so virtiofsd needs no sandbox of its own.
+    #[cfg(target_os = "linux")]
+    command
+        .env("KEEL_CLOUD_HYPERVISOR", &hypervisor)
+        .env("KEEL_VIRTIOFSD", &virtiofsd)
+        .env("KEEL_VIRTIOFSD_SANDBOX", "none");
     // The run's admission manifest is durable before any workload process
     // exists; failing to record it refuses the run.
     let trusted_runtime = env::current_exe()?;
@@ -494,7 +543,12 @@ fn spawn_runtime(
     if isolation == "v8-sandboxed" {
         artifacts.extend([("v8_runtime", deno.as_path()), ("v8_sdk", sdk.as_path())]);
     } else {
-        artifacts.push(("vz_backend", vz_backend.as_path()));
+        artifacts.push(("vz_backend", vm_backend.as_path()));
+        #[cfg(target_os = "linux")]
+        artifacts.extend([
+            ("cloud_hypervisor", hypervisor.as_path()),
+            ("virtiofsd", virtiofsd.as_path()),
+        ]);
     }
     if renderer.exists() {
         artifacts.push(("renderer", renderer.as_path()));
@@ -647,6 +701,43 @@ fn sb_ancestor_literals(path: &Path) -> String {
         .join(" ")
 }
 
+/// Starts the command that runs `program` confined: under its `sandbox-exec`
+/// profile on macOS, and under bubblewrap with `confinement` on Linux. Both
+/// end with the program, so arguments the caller adds go to it.
+// Each platform uses one of the two descriptions.
+#[allow(unused_variables)]
+fn confined_command(
+    program: &Path,
+    profile: impl FnOnce() -> String,
+    confinement: impl FnOnce() -> confine::Confinement,
+) -> Command {
+    #[cfg(target_os = "linux")]
+    {
+        let mut command = Command::new(confine::BWRAP);
+        command.args(confinement().arguments(program, &[]));
+        command
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut command = Command::new("/usr/bin/sandbox-exec");
+        command.args(["-p", &profile()]).arg(program);
+        command
+    }
+}
+
+/// Creates an empty file a confined child may write, because bubblewrap
+/// binds only paths that exist.
+fn create_bind_target(path: &Path) -> io::Result<()> {
+    if cfg!(target_os = "linux") {
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn runtime_sandbox_profile(
     executables: [&Path; 4],
@@ -764,10 +855,16 @@ fn spawn_extract_helper(
         sb_string(&helper),
     );
     let provider = keel_secrets::runtime_model_provider()?;
-    let mut command = Command::new("/usr/bin/sandbox-exec");
+    let mut command = confined_command(
+        &helper,
+        || profile,
+        || confine::Confinement {
+            read_only: vec![components.to_path_buf()],
+            read_write: vec![socket.clone()],
+            ..confine::Confinement::default()
+        },
+    );
     command
-        .args(["-p", &profile])
-        .arg(&helper)
         .env_clear()
         .env("KEEL_EXTRACT_SOCKET", &socket)
         .env("KEEL_MODEL_HOST", &provider.host)
@@ -1131,10 +1228,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     let mut child_output = child.stdout.take().ok_or("runtime stdout unavailable")?;
     let (rows, columns) = terminal_dimensions().unwrap_or((24, 80));
-    let mut renderer_command = Command::new("/usr/bin/sandbox-exec");
+    let mut renderer_command = confined_command(
+        &renderer,
+        || renderer_profile,
+        || confine::Confinement {
+            read_only: vec![renderer_directory.to_path_buf()],
+            directory: Some(renderer_directory.to_path_buf()),
+            ..confine::Confinement::default()
+        },
+    );
     renderer_command
-        .args(["-p", &renderer_profile])
-        .arg(&renderer)
         .args(["--canonical", &rows.to_string(), &columns.to_string()])
         // A Deno standalone executable resolves its current directory during
         // startup. Keep that lookup inside the renderer's existing read-only
@@ -1373,3 +1476,7 @@ mod security_tests;
 #[cfg(test)]
 #[path = "../../tests/support/teardown.rs"]
 mod teardown_tests;
+
+#[cfg(test)]
+#[path = "../../tests/support/confine.rs"]
+mod confine_tests;

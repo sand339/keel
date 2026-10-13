@@ -58,8 +58,8 @@ fn run_export(
 
 fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     match parse_args(env::args_os().skip(1))? {
-        Command::Setup => {
-            println!("{}", install()?);
+        Command::Setup { prebuilt } => {
+            println!("{}", install(prebuilt.as_deref())?);
             Ok(ExitCode::SUCCESS)
         }
         Command::Doctor => {

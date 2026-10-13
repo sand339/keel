@@ -2,8 +2,39 @@
 set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-"$repo_root/spikes/fetch-deno.sh"
-phase_root="$repo_root/.phase1"
+# SHA-256 with sha256sum where it exists (Linux), and shasum on macOS.
+sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi
+}
+# The guest architecture: aarch64 for Apple silicon and ARM64 Linux hosts,
+# x86_64 for Intel and AMD Linux hosts. It defaults to the build host's.
+case "${KEEL_GUEST_ARCH:-$(uname -m)}" in
+arm64 | aarch64)
+    guest_arch=aarch64
+    platform=linux/arm64
+    claude_platform=linux-arm64-musl
+    claude_sha256="83d95a9fa28b1fadd8c012fda873aed8f8998e23dfabe6dd4efd05bcdd7383ba"
+    agent_browser_file=agent-browser-linux-musl-arm64
+    agent_browser_sha256="eafeca9ca0fdb2fa2aa60c4554723348c739656b0ddba0d82ff654d4d33311b1"
+    package_lock="$repo_root/spikes/guest-packages.lock"
+    phase_root="$repo_root/.phase1"
+    "$repo_root/spikes/fetch-deno.sh"
+    ;;
+x86_64 | amd64)
+    guest_arch=x86_64
+    platform=linux/amd64
+    claude_platform=linux-x64-musl
+    claude_sha256="ba22ce4b5744c6016e3076ccbd692a059fc4e9f1592f21361859a73938f4e722"
+    agent_browser_file=agent-browser-linux-musl-x64
+    agent_browser_sha256="993d462f4dcfc19860d93a6521a452eba4502bfc449fe0120303c2ccb998e675"
+    package_lock="$repo_root/spikes/guest-packages-x86_64.lock"
+    phase_root="$repo_root/.phase1-x86_64"
+    ;;
+*)
+    echo "unsupported guest architecture: ${KEEL_GUEST_ARCH:-$(uname -m)}" >&2
+    exit 1
+    ;;
+esac
 download_root="$phase_root/downloads"
 target_root="$phase_root/target-linux"
 cargo_root="$phase_root/cargo-home"
@@ -11,25 +42,24 @@ rootfs="$phase_root/rootfs"
 initramfs="$phase_root/keel-phase1-initramfs.cpio.zst"
 rootfs_image="$phase_root/keel-phase1-rootfs.squashfs"
 stage1="$phase_root/stage1"
-kernel_modules="$repo_root/.phase1/kernel/modules"
+kernel_modules="$phase_root/kernel/modules"
 
 rust_image="rust:1.97-alpine3.23@sha256:c4a364ddbf684fe038e6fa6a4f25b30c8dc85247423e0e660676ece0d17be4a2"
 alpine_image="alpine:3.23@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0"
 claude_version="2.1.287"
-claude_sha256="83d95a9fa28b1fadd8c012fda873aed8f8998e23dfabe6dd4efd05bcdd7383ba"
-claude_binary="$download_root/claude-$claude_version-linux-arm64-musl"
+claude_binary="$download_root/claude-$claude_version-$claude_platform"
 guest_binary="$target_root/release/keel-mcp-guest"
 # agent-browser (vercel-labs) drives the guest's Chromium, as an MCP server
-# for the agent and a CLI for the analyst. Only its musl arm64 binary is used.
+# for the agent and a CLI for the analyst. Only its musl binary for the guest
+# architecture is used.
 agent_browser_version="0.38.2"
 agent_browser_package_sha256="2bb1d6e4660b2a109c912c8bb552f727125dbcd681c6d1eefc1af573b4546c49"
-agent_browser_sha256="eafeca9ca0fdb2fa2aa60c4554723348c739656b0ddba0d82ff654d4d33311b1"
-agent_browser_binary="$download_root/agent-browser-$agent_browser_version-linux-musl-arm64"
+agent_browser_binary="$download_root/agent-browser-$agent_browser_version-${agent_browser_file#agent-browser-}"
 # Every Alpine package the build installs is pinned by name, version, and
-# SHA-256 in spikes/guest-packages.lock (regenerate it with
+# SHA-256 in the architecture's lock, spikes/guest-packages.lock or
+# guest-packages-x86_64.lock (regenerate them with
 # spikes/lock-guest-packages.sh). The files are fetched once into apk_cache and
 # installed offline, so the lock alone decides what the image contains.
-package_lock="$repo_root/spikes/guest-packages.lock"
 apk_cache="$phase_root/apk-cache"
 alpine_mirror="https://dl-cdn.alpinelinux.org/alpine/v3.23"
 # Every timestamp in the root disk and the initramfs, so that two builds from
@@ -44,18 +74,36 @@ locked_files() {
 }
 tool_packages=$(locked_files tools)
 
+# Docker on Linux leaves what a container writes owned by root, where Docker
+# Desktop maps it to the building user. Hand a tree back to that user so the
+# host-side steps below can edit it, keeping its setuid and setgid bits, which
+# chown clears. The images own every entry by root regardless.
+own_tree() {
+    [ "$(uname -s)" = Linux ] || return 0
+    docker run --rm --platform "$platform" -v "$1:/tree" "$alpine_image" sh -euc '
+        find /tree \( -perm -4000 -o -perm -2000 \) -type f -exec stat -c "%a %n" {} + > /tmp/modes || true
+        chown -R '"$(id -u):$(id -g)"' /tree
+        while read -r mode path; do chmod "$mode" "$path"; done < /tmp/modes'
+}
+# A previous Linux build that stopped early may have left root-owned trees.
+if [ "$(uname -s)" = Linux ]; then
+    for tree in "$phase_root/rootfs" "$phase_root/stage1"; do
+        if [ -e "$tree" ]; then own_tree "$tree"; fi
+    done
+fi
+
 grep -v '^#' "$package_lock" | while read -r _ repository package expected; do
     file="$apk_cache/$package.apk"
-    if [ -f "$file" ] && [ "$(shasum -a 256 "$file" | awk '{print $1}')" = "$expected" ]; then
+    if [ -f "$file" ] && [ "$(sha256 "$file" | awk '{print $1}')" = "$expected" ]; then
         continue
     fi
-    if ! curl -fsSL "$alpine_mirror/$repository/aarch64/$package.apk" -o "$file.partial"; then
+    if ! curl -fsSL "$alpine_mirror/$repository/$guest_arch/$package.apk" -o "$file.partial"; then
         rm -f "$file.partial"
         echo "cannot download locked package $package; Alpine removes superseded" \
             "versions, so refresh the lock with spikes/lock-guest-packages.sh" >&2
         exit 1
     fi
-    actual=$(shasum -a 256 "$file.partial" | awk '{print $1}')
+    actual=$(sha256 "$file.partial" | awk '{print $1}')
     if [ "$actual" != "$expected" ]; then
         rm -f "$file.partial"
         echo "locked package checksum mismatch for $package: expected $expected, got $actual" >&2
@@ -64,12 +112,12 @@ grep -v '^#' "$package_lock" | while read -r _ repository package expected; do
     mv "$file.partial" "$file"
 done
 if [ ! -f "$claude_binary" ] ||
-    [ "$(shasum -a 256 "$claude_binary" | awk '{print $1}')" != "$claude_sha256" ]; then
+    [ "$(sha256 "$claude_binary" | awk '{print $1}')" != "$claude_sha256" ]; then
     temporary="$claude_binary.partial"
     curl -fL \
-        "https://downloads.claude.ai/claude-code-releases/$claude_version/linux-arm64-musl/claude" \
+        "https://downloads.claude.ai/claude-code-releases/$claude_version/$claude_platform/claude" \
         -o "$temporary"
-    actual=$(shasum -a 256 "$temporary" | awk '{print $1}')
+    actual=$(sha256 "$temporary" | awk '{print $1}')
     if [ "$actual" != "$claude_sha256" ]; then
         echo "Claude checksum mismatch: expected $claude_sha256, got $actual" >&2
         exit 1
@@ -77,20 +125,20 @@ if [ ! -f "$claude_binary" ] ||
     mv "$temporary" "$claude_binary"
 fi
 if [ ! -f "$agent_browser_binary" ] ||
-    [ "$(shasum -a 256 "$agent_browser_binary" | awk '{print $1}')" != "$agent_browser_sha256" ]; then
+    [ "$(sha256 "$agent_browser_binary" | awk '{print $1}')" != "$agent_browser_sha256" ]; then
     package="$download_root/agent-browser-$agent_browser_version.tgz"
     curl -fL \
         "https://registry.npmjs.org/agent-browser/-/agent-browser-$agent_browser_version.tgz" \
         -o "$package.partial"
-    actual=$(shasum -a 256 "$package.partial" | awk '{print $1}')
+    actual=$(sha256 "$package.partial" | awk '{print $1}')
     if [ "$actual" != "$agent_browser_package_sha256" ]; then
         rm -f "$package.partial"
         echo "agent-browser package checksum mismatch: expected $agent_browser_package_sha256, got $actual" >&2
         exit 1
     fi
-    tar -xzOf "$package.partial" package/bin/agent-browser-linux-musl-arm64 > "$agent_browser_binary.partial"
+    tar -xzOf "$package.partial" "package/bin/$agent_browser_file" > "$agent_browser_binary.partial"
     rm -f "$package.partial"
-    actual=$(shasum -a 256 "$agent_browser_binary.partial" | awk '{print $1}')
+    actual=$(sha256 "$agent_browser_binary.partial" | awk '{print $1}')
     if [ "$actual" != "$agent_browser_sha256" ]; then
         rm -f "$agent_browser_binary.partial"
         echo "agent-browser binary checksum mismatch: expected $agent_browser_sha256, got $actual" >&2
@@ -105,7 +153,7 @@ if [ ! -x "$guest_binary" ] ||
         "$repo_root/crates/trusted/keel-kernel" \
         "$repo_root/crates/untrusted/keel-mcp" \
         -type f -newer "$guest_binary" -print -quit | grep -q .; then
-    docker run --rm --platform linux/arm64 \
+    docker run --rm --platform "$platform" \
         -e CARGO_HOME=/phase1-cargo \
         -e CARGO_TARGET_DIR=/phase1-target \
         -v "$repo_root:/work:ro" \
@@ -135,7 +183,7 @@ fi
 mkdir -p "$rootfs/lib/modules"
 cp -R "$kernel_modules/." "$rootfs/lib/modules/"
 
-docker run --rm --platform linux/arm64 \
+docker run --rm --platform "$platform" \
     -v "$rootfs:/rootfs" \
     -v "$apk_cache:/cache:ro" \
     "$alpine_image" \
@@ -146,17 +194,18 @@ installed=$(awk -F: '/^P:/ { name = $2 } /^V:/ { print name "-" $2 }' \
     "$rootfs/lib/apk/db/installed" | sort)
 expected=$(awk '$1 == "rootfs" { print $3 }' "$package_lock" | sort)
 if [ "$installed" != "$expected" ]; then
-    echo "guest packages differ from spikes/guest-packages.lock" >&2
+    echo "guest packages differ from $package_lock" >&2
     exit 1
 fi
 # Install-time records that would differ between builds: apk's log, and the
 # font caches, which embed their directories' modification times.
-rm -f "$rootfs/var/log/apk.log"
-docker run --rm --platform linux/arm64 \
+docker run --rm --platform "$platform" \
     -v "$rootfs:/rootfs" \
     "$alpine_image" \
     sh -c "find /rootfs/usr/share/fonts -type d -exec touch -d @$source_date_epoch {} + &&
         chroot /rootfs fc-cache -f -s"
+own_tree "$rootfs"
+rm -f "$rootfs/var/log/apk.log"
 
 test -x "$rootfs/usr/bin/curl"
 test -x "$rootfs/usr/bin/node"
@@ -313,11 +362,11 @@ if settings.get("strictKnownMarketplaces") != []:
     sys.exit(f"{path} no longer disables plugin marketplaces")
 PY
 
-docker run --rm --platform linux/arm64 \
+docker run --rm --platform "$platform" \
     -v "$rootfs:/rootfs:ro" \
     "$alpine_image" \
     /rootfs/usr/local/bin/claude --version
-docker run --rm --platform linux/arm64 \
+docker run --rm --platform "$platform" \
     -v "$rootfs:/rootfs:ro" \
     "$alpine_image" \
     /rootfs/usr/local/bin/keel-mcp-guest invalid too many arguments >/dev/null 2>&1 &&
@@ -329,7 +378,7 @@ docker run --rm --platform linux/arm64 \
 # on any Linux image: the guest workload keeps UID 0 but no capabilities, and
 # could not otherwise reach its own home directory or settings.
 rm -f "$rootfs_image"
-docker run --rm --platform linux/arm64 \
+docker run --rm --platform "$platform" \
     -v "$rootfs:/rootfs:ro" \
     -v "$phase_root:/out" \
     -v "$apk_cache:/cache:ro" -e TOOLS="$tool_packages" \
@@ -354,13 +403,14 @@ if path.exists():
 (path / "bin").mkdir(parents=True)
 (path / "lib" / "modules").mkdir(parents=True)
 PY
-docker run --rm --platform linux/arm64 \
+docker run --rm --platform "$platform" \
     -v "$stage1:/stage1" \
     -v "$apk_cache:/cache:ro" -e TOOLS="$tool_packages" \
     "$alpine_image" \
     sh -c 'apk add -q --no-cache --no-network $TOOLS >/dev/null && cp /bin/busybox.static /stage1/bin/busybox'
+own_tree "$stage1"
 for module in drivers/block/virtio_blk fs/squashfs/squashfs fs/overlayfs/overlay; do
-    gzip -dc "$kernel_modules/$(cat "$repo_root/.phase1/kernel/release")/kernel/$module.ko.gz" \
+    gzip -dc "$kernel_modules/$(cat "$phase_root/kernel/release")/kernel/$module.ko.gz" \
         > "$stage1/lib/modules/$(basename "$module").ko"
 done
 cp "$repo_root/spikes/phase1-stage1-init.sh" "$stage1/init"
@@ -395,12 +445,19 @@ for ino, path in enumerate([root, *paths], start=1):
     entry(name, stat.S_IFMT(info.st_mode) | stat.S_IMODE(info.st_mode), data, ino)
 entry("TRAILER!!!", 0, b"", 0)
 PY
-    docker run --rm -i --platform linux/arm64 \
+    docker run --rm -i --platform "$platform" \
         -v "$apk_cache:/cache:ro" -e TOOLS="$tool_packages" "$alpine_image" \
         sh -c 'apk add -q --no-cache --no-network $TOOLS >/dev/null && zstd -q -T0 -6 -c' > "$initramfs"
 
-(
-    cd "$rootfs"
-    find . -type f -print0 | sort -z | xargs -0 shasum -a 256
-) > "$phase_root/rootfs.sha256"
-shasum -a 256 "$initramfs" "$rootfs_image"
+# Some files, such as busybox's setuid helper, are not readable by their owner,
+# so on Linux the listing is made by root in a container.
+if [ "$(uname -s)" = Linux ]; then
+    docker run --rm --platform "$platform" -v "$rootfs:/rootfs:ro" -w /rootfs "$alpine_image" \
+        sh -c 'find . -type f -print0 | sort -z | xargs -0 sha256sum'
+else
+    (
+        cd "$rootfs"
+        find . -type f -print0 | sort -z | xargs -0 shasum -a 256
+    )
+fi > "$phase_root/rootfs.sha256"
+sha256 "$initramfs" "$rootfs_image"

@@ -9,6 +9,15 @@ use std::{
 };
 
 const CONFIG_VERSION: u8 = 1;
+/// This platform's VM backend, installed beside the runtime.
+const VM_BACKEND: &str = if cfg!(target_os = "linux") {
+    "keel-ch"
+} else {
+    "keel-vz-spike"
+};
+/// The `AppArmor` profile Ubuntu 23.10 and later need before bubblewrap may
+/// create the namespaces Keel confines its children in.
+const BWRAP_APPARMOR_PROFILE: &str = "abi <abi/4.0>,\ninclude <tunables/global>\n\nprofile bwrap /usr/bin/bwrap flags=(unconfined) {\n  userns,\n  include if exists <local/bwrap>\n}\n";
 type RuntimePath = fn(&RuntimeConfig) -> &Path;
 const RUNTIME_ENVIRONMENT: [(&str, RuntimePath); 5] = [
     ("KEEL_RUNTIME_BACKEND", |config| &config.runtime_backend),
@@ -37,41 +46,83 @@ pub struct DoctorReport {
     pub healthy: bool,
 }
 
-/// Downloads pinned assets, builds Keel, and installs a self-contained runtime.
+/// Where an install takes each file from: a built source checkout, or an
+/// unpacked release whose layout is the installed one.
+struct Artifacts {
+    bin: PathBuf,
+    deno: PathBuf,
+    sdk: PathBuf,
+    kernel: PathBuf,
+    kernel_release: PathBuf,
+    rootfs: PathBuf,
+    initramfs: PathBuf,
+}
+
+impl Artifacts {
+    fn checkout(source: &Path) -> Self {
+        // The image build keeps each guest architecture apart; x86_64 is the
+        // only one that is not the historical default.
+        let images = source.join(if cfg!(target_arch = "x86_64") {
+            ".phase1-x86_64"
+        } else {
+            ".phase1"
+        });
+        Self {
+            bin: source.join("target/release"),
+            deno: source.join(".phase1/deno/host/deno"),
+            sdk: source.join("spikes/keel-v8-sdk.ts"),
+            kernel: images.join("kernel/Image"),
+            kernel_release: images.join("kernel/release"),
+            rootfs: images.join("keel-phase1-rootfs.squashfs"),
+            initramfs: images.join("keel-phase1-initramfs.cpio.zst"),
+        }
+    }
+
+    fn release(release: &Path) -> Self {
+        let bin = release.join("bin");
+        let images = release.join("images");
+        Self {
+            deno: bin.join("deno"),
+            sdk: bin.join("keel-v8-sdk.ts"),
+            bin,
+            kernel: images.join("vmlinuz-virt"),
+            kernel_release: images.join("kernel-release"),
+            rootfs: images.join("keel-phase1-rootfs.squashfs"),
+            initramfs: images.join("keel-phase1-initramfs.cpio.zst"),
+        }
+    }
+}
+
+/// This host's release platform, as `spikes/package-release.sh` names it.
+fn release_platform() -> String {
+    let os = if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        env::consts::OS
+    };
+    format!("{os}-{}", env::consts::ARCH)
+}
+
+/// Installs a self-contained runtime: from an unpacked release when one is
+/// named, after checking every file against its checksums; otherwise by
+/// downloading pinned assets and building Keel from the source checkout.
 ///
 /// # Errors
 ///
 /// Returns an error for an unsupported host, missing prerequisite, failed
-/// build, invalid artifact, or installation failure.
-pub fn install() -> Result<String, CliError> {
+/// build, release that does not verify, or installation failure.
+pub fn install(prebuilt: Option<&Path>) -> Result<String, CliError> {
     require_supported_host()?;
-    let source = source_root()?;
-    for program in [
-        "cargo", "clang", "codesign", "cpio", "curl", "docker", "gzip", "python3", "shasum", "tar",
-    ] {
-        if find_program(program).is_none() {
-            return Err(CliError::new(format!(
-                "required setup program is missing: {program}"
-            )));
-        }
-    }
-    if !Command::new("docker")
-        .arg("info")
-        .output()
-        .is_ok_and(|output| output.status.success())
-    {
-        return Err(CliError::new("Docker is installed but is not running"));
-    }
-    for script in [
-        "spikes/fetch-phase0.sh",
-        "spikes/fetch-guest-kernel.sh",
-        "spikes/fetch-deno.sh",
-        "spikes/build-xterm-renderer.sh",
-        "spikes/build-phase1-image.sh",
-        "spikes/build-vz-runtime.sh",
-    ] {
-        run_script(&source, script)?;
-    }
+    let artifacts = if let Some(release) = prebuilt {
+        let release = fs::canonicalize(release).map_err(io_error)?;
+        verify_release(&release)?;
+        Artifacts::release(&release)
+    } else {
+        let source = source_root()?;
+        build_from_source(&source)?;
+        Artifacts::checkout(&source)
+    };
+    let linux = cfg!(target_os = "linux");
 
     let home = home_directory()?;
     let install_root = env::var_os("KEEL_INSTALL_DIR")
@@ -81,49 +132,47 @@ pub fn install() -> Result<String, CliError> {
     let previous_config = runtime_config().ok().flatten();
     fs::create_dir_all(&install_bin).map_err(io_error)?;
     fs::create_dir_all(&install_images).map_err(io_error)?;
+    let platform_executables: &[&str] = if linux {
+        &[VM_BACKEND, "cloud-hypervisor", "virtiofsd"]
+    } else {
+        &[VM_BACKEND]
+    };
     for executable in [
         "keel",
         "keel-input-runtime",
         "keel-runtime",
         "keel-extract",
-        "keel-vz-spike",
         "keel-render-spike",
         "keel-xterm-renderer",
-    ] {
+    ]
+    .iter()
+    .chain(platform_executables)
+    {
         copy_file(
-            &source.join("target/release").join(executable),
+            &artifacts.bin.join(executable),
             &install_bin.join(executable),
         )?;
     }
-    copy_file(
-        &source.join(".phase1/deno/host/deno"),
-        &install_bin.join("deno"),
-    )?;
-    copy_file(
-        &source.join("spikes/keel-v8-sdk.ts"),
-        &install_bin.join("keel-v8-sdk.ts"),
-    )?;
+    copy_file(&artifacts.deno, &install_bin.join("deno"))?;
+    copy_file(&artifacts.sdk, &install_bin.join("keel-v8-sdk.ts"))?;
     let kernel = install_images.join("vmlinuz-virt");
     let initramfs = install_images.join("keel-phase1-initramfs.cpio.zst");
-    copy_file(&source.join(".phase1/kernel/Image"), &kernel)?;
+    copy_file(&artifacts.kernel, &kernel)?;
     copy_file(
-        &source.join(".phase1/kernel/release"),
+        &artifacts.kernel_release,
         &install_images.join("kernel-release"),
     )?;
     copy_file(
-        &source.join(".phase1/keel-phase1-rootfs.squashfs"),
+        &artifacts.rootfs,
         &install_images.join("keel-phase1-rootfs.squashfs"),
     )?;
-    copy_file(
-        &source.join(".phase1/keel-phase1-initramfs.cpio.zst"),
-        &initramfs,
-    )?;
+    copy_file(&artifacts.initramfs, &initramfs)?;
 
     let config = RuntimeConfig {
         version: CONFIG_VERSION,
         input_runtime: install_bin.join("keel-input-runtime"),
         runtime_backend: install_bin.join("keel-runtime"),
-        vz_backend: install_bin.join("keel-vz-spike"),
+        vz_backend: install_bin.join(VM_BACKEND),
         renderer: install_bin.join("keel-render-spike"),
         kernel,
         initramfs,
@@ -138,20 +187,158 @@ pub fn install() -> Result<String, CliError> {
     ))
 }
 
+/// Checks that an unpacked release is for this host and that every file under
+/// `bin/` and `images/` is listed in its `SHA256SUMS` with a matching digest,
+/// so nothing unverified is installed.
+fn verify_release(release: &Path) -> Result<(), CliError> {
+    let platform = fs::read_to_string(release.join("PLATFORM"))
+        .map_err(|error| CliError::new(format!("release has no PLATFORM file: {error}")))?;
+    if platform.trim() != release_platform() {
+        return Err(CliError::new(format!(
+            "this release is for {}, and this host is {}",
+            platform.trim(),
+            release_platform()
+        )));
+    }
+    let sums = fs::read_to_string(release.join("SHA256SUMS"))
+        .map_err(|error| CliError::new(format!("release has no SHA256SUMS: {error}")))?;
+    let mut listed = std::collections::BTreeSet::new();
+    for line in sums.lines().filter(|line| !line.is_empty()) {
+        let (expected, name) = line
+            .split_once("  ")
+            .ok_or_else(|| CliError::new(format!("malformed SHA256SUMS line: {line}")))?;
+        let relative = Path::new(name.strip_prefix("./").unwrap_or(name));
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(CliError::new(format!("unsafe path in SHA256SUMS: {name}")));
+        }
+        let actual = sha256_file(&release.join(relative))?;
+        if actual != expected {
+            return Err(CliError::new(format!(
+                "{name} does not match its checksum: expected {expected}, got {actual}"
+            )));
+        }
+        listed.insert(relative.to_path_buf());
+    }
+    for directory in ["bin", "images"] {
+        for entry in fs::read_dir(release.join(directory)).map_err(io_error)? {
+            let path = entry.map_err(io_error)?.path();
+            let relative = path.strip_prefix(release).map_err(io_error)?;
+            if !listed.contains(relative) {
+                return Err(CliError::new(format!(
+                    "release file is not in SHA256SUMS: {}",
+                    relative.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String, CliError> {
+    use std::io::Read as _;
+    let mut file = fs::File::open(path)
+        .map_err(|error| CliError::new(format!("{}: {error}", path.display())))?;
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buffer = vec![0_u8; 1 << 20];
+    loop {
+        let count = file.read(&mut buffer).map_err(io_error)?;
+        if count == 0 {
+            break;
+        }
+        context.update(&buffer[..count]);
+    }
+    Ok(context
+        .finish()
+        .as_ref()
+        .iter()
+        .fold(String::new(), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        }))
+}
+
+/// Checks the build prerequisites, then fetches the pinned assets and builds
+/// Keel and its guest image from the checkout.
+fn build_from_source(source: &Path) -> Result<(), CliError> {
+    let linux = cfg!(target_os = "linux");
+    let programs: &[&str] = if linux {
+        &[
+            "bwrap",
+            "cargo",
+            "curl",
+            "docker",
+            "gzip",
+            "pkg-config",
+            "python3",
+            "sha256sum",
+            "tar",
+        ]
+    } else {
+        &[
+            "cargo", "clang", "codesign", "cpio", "curl", "docker", "gzip", "python3", "shasum",
+            "tar",
+        ]
+    };
+    for program in programs {
+        if find_program(program).is_none() {
+            return Err(CliError::new(format!(
+                "required setup program is missing: {program}"
+            )));
+        }
+    }
+    if !Command::new("docker")
+        .arg("info")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        return Err(CliError::new("Docker is installed but is not running"));
+    }
+    // virtiofsd is built from source against these two libraries.
+    if linux
+        && !Command::new("pkg-config")
+            .args(["--exists", "libseccomp", "libcap-ng"])
+            .status()
+            .is_ok_and(|status| status.success())
+    {
+        return Err(CliError::new(
+            "virtiofsd needs libseccomp and libcap-ng headers: install libseccomp-dev and \
+libcap-ng-dev (Debian, Ubuntu) or libseccomp-devel and libcap-ng-devel (Fedora)",
+        ));
+    }
+    let scripts: &[&str] = if linux {
+        &[
+            "spikes/fetch-guest-kernel.sh",
+            "spikes/fetch-deno.sh",
+            "spikes/build-xterm-renderer.sh",
+            "spikes/build-phase1-image.sh",
+            "spikes/build-linux-runtime.sh",
+        ]
+    } else {
+        &[
+            "spikes/fetch-phase0.sh",
+            "spikes/fetch-guest-kernel.sh",
+            "spikes/fetch-deno.sh",
+            "spikes/build-xterm-renderer.sh",
+            "spikes/build-phase1-image.sh",
+            "spikes/build-vz-runtime.sh",
+        ]
+    };
+    for script in scripts {
+        run_script(source, script)?;
+    }
+
+    Ok(())
+}
+
 /// Checks the installed runtime, credentials, and current Git workspace.
 #[must_use]
 pub fn doctor() -> DoctorReport {
     let mut report = CheckReport::default();
-    report.required(
-        cfg!(target_os = "macos"),
-        "host operating system is macOS",
-        "Keel's packaged runtime currently requires macOS",
-    );
-    report.required(
-        cfg!(target_arch = "aarch64"),
-        "host architecture is Apple silicon",
-        "the packaged guest currently requires Apple silicon",
-    );
+    check_host(&mut report);
     let config = match runtime_config() {
         Ok(Some(config)) => {
             report.ok("runtime configuration loaded");
@@ -175,7 +362,7 @@ pub fn doctor() -> DoctorReport {
         for (label, path) in [
             ("trusted input runtime", &config.input_runtime),
             ("runtime backend", &config.runtime_backend),
-            ("VZ backend", &config.vz_backend),
+            ("VM backend", &config.vz_backend),
             ("renderer", &config.renderer),
         ] {
             report.required(
@@ -223,11 +410,7 @@ pub fn doctor() -> DoctorReport {
             );
         }
         check_guest_kernel(&mut report, &config.kernel);
-        report.required(
-            valid_vz_signature(&config.vz_backend),
-            "VZ backend has virtualization entitlements",
-            "VZ backend is unsigned or lacks virtualization entitlements",
-        );
+        check_backend(&mut report, &config.vz_backend);
     }
     check_model_credentials(&mut report);
     report.optional(
@@ -424,12 +607,124 @@ fn install_launcher(
 }
 
 fn require_supported_host() -> Result<(), CliError> {
-    if !cfg!(target_os = "macos") || !cfg!(target_arch = "aarch64") {
+    let supported = (cfg!(target_os = "macos") && cfg!(target_arch = "aarch64"))
+        || (cfg!(target_os = "linux")
+            && cfg!(any(target_arch = "x86_64", target_arch = "aarch64")));
+    if !supported {
         return Err(CliError::new(
-            "Keel setup currently supports Apple silicon macOS",
+            "Keel setup supports Apple silicon macOS, and Linux on x86_64 or ARM64",
         ));
     }
     Ok(())
+}
+
+/// Checks what the VM backend needs beside it: its hypervisor and file
+/// sharing helpers on Linux, its virtualization entitlements on macOS.
+fn check_backend(report: &mut CheckReport, backend: &Path) {
+    if cfg!(target_os = "linux") {
+        for name in ["cloud-hypervisor", "virtiofsd"] {
+            let path = backend.with_file_name(name);
+            report.required(
+                is_executable(&path),
+                &format!("{name}: {}", path.display()),
+                &format!("{name} is missing or not executable: {}", path.display()),
+            );
+        }
+    } else {
+        report.required(
+            valid_vz_signature(backend),
+            "VZ backend has virtualization entitlements",
+            "VZ backend is unsigned or lacks virtualization entitlements",
+        );
+    }
+}
+
+/// Checks the host platform, and on Linux what its runtime needs.
+fn check_host(report: &mut CheckReport) {
+    if cfg!(target_os = "linux") {
+        report.required(
+            cfg!(any(target_arch = "x86_64", target_arch = "aarch64")),
+            "host is Linux on x86_64 or ARM64",
+            "Keel on Linux requires an x86_64 or ARM64 host",
+        );
+        let ubuntu = fs::read_to_string("/etc/os-release").is_ok_and(|release| {
+            release
+                .lines()
+                .any(|line| line == "ID=ubuntu" || line == "ID=\"ubuntu\"")
+        });
+        report.optional(
+            ubuntu,
+            "Linux distribution is Ubuntu",
+            "this Linux distribution is not supported; Keel is tested on Ubuntu",
+        );
+        check_linux_host(report);
+    } else {
+        report.required(
+            cfg!(target_os = "macos"),
+            "host operating system is macOS",
+            "Keel requires macOS on Apple silicon, or Linux with KVM",
+        );
+        report.required(
+            cfg!(target_arch = "aarch64"),
+            "host architecture is Apple silicon",
+            "the packaged macOS guest requires Apple silicon",
+        );
+    }
+}
+
+/// Checks what the Linux runtime needs from the host: KVM for the guest, and
+/// bubblewrap able to create the namespaces Keel confines its children in.
+fn check_linux_host(report: &mut CheckReport) {
+    let kvm = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm");
+    report.required(
+        kvm.is_ok(),
+        "KVM is available (/dev/kvm)",
+        &format!(
+            "cannot open /dev/kvm ({}); enable virtualization and add this user to the kvm \
+group (`sudo usermod -aG kvm $USER`, then log in again)",
+            kvm.err()
+                .map_or_else(String::new, |error| error.to_string())
+        ),
+    );
+    let bwrap = Path::new("/usr/bin/bwrap");
+    if !is_executable(bwrap) {
+        report.fail("bubblewrap is missing at /usr/bin/bwrap; install the bubblewrap package");
+        return;
+    }
+    let confines = Command::new(bwrap)
+        .args([
+            "--unshare-all",
+            "--die-with-parent",
+            "--ro-bind",
+            "/",
+            "/",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if confines {
+        report.ok("bubblewrap can create Keel's confinement namespaces");
+        return;
+    }
+    let restricted = fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+        .is_ok_and(|value| value.trim() == "1");
+    if restricted {
+        report.fail(&format!(
+            "AppArmor restricts user namespaces, so bubblewrap cannot confine Keel's children; \
+allow it once with:\n  printf '{}' | sudo tee /etc/apparmor.d/bwrap >/dev/null && sudo \
+apparmor_parser -r /etc/apparmor.d/bwrap",
+            BWRAP_APPARMOR_PROFILE.replace('\n', "\\n")
+        ));
+    } else {
+        report.fail(
+            "bubblewrap cannot create user namespaces; enable unprivileged user namespaces \
+(kernel.unprivileged_userns_clone=1 or user.max_user_namespaces > 0)",
+        );
+    }
 }
 
 fn find_program(name: &str) -> Option<PathBuf> {
@@ -684,12 +979,66 @@ fn check_guest_kernel(report: &mut CheckReport, kernel: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{CONFIG_VERSION, CheckReport, RuntimeConfig, install_launcher};
+    use super::{
+        CONFIG_VERSION, CheckReport, RuntimeConfig, install_launcher, release_platform,
+        sha256_file, verify_release,
+    };
     use std::{
+        fmt::Write as _,
         fs,
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    fn release_fixture() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("keel-release-{nonce:x}"));
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::create_dir_all(root.join("images")).unwrap();
+        fs::write(root.join("bin/keel"), "launcher").unwrap();
+        fs::write(root.join("images/vmlinuz-virt"), "kernel").unwrap();
+        fs::write(root.join("PLATFORM"), format!("{}\n", release_platform())).unwrap();
+        let mut sums = String::new();
+        for name in ["bin/keel", "images/vmlinuz-virt"] {
+            let _ = writeln!(sums, "{}  ./{name}", sha256_file(&root.join(name)).unwrap());
+        }
+        fs::write(root.join("SHA256SUMS"), sums).unwrap();
+        root
+    }
+
+    #[test]
+    fn a_release_installs_only_when_every_file_verifies() {
+        let release = release_fixture();
+        assert!(verify_release(&release).is_ok());
+
+        fs::write(release.join("images/vmlinuz-virt"), "tampered").unwrap();
+        let error = verify_release(&release).unwrap_err().to_string();
+        assert!(error.contains("does not match its checksum"), "{error}");
+        fs::remove_dir_all(&release).unwrap();
+
+        let release = release_fixture();
+        fs::write(release.join("bin/extra"), "unlisted").unwrap();
+        let error = verify_release(&release).unwrap_err().to_string();
+        assert!(error.contains("not in SHA256SUMS"), "{error}");
+        fs::remove_dir_all(&release).unwrap();
+
+        let release = release_fixture();
+        let mut sums = fs::read_to_string(release.join("SHA256SUMS")).unwrap();
+        let _ = writeln!(sums, "{}  ../outside", "0".repeat(64));
+        fs::write(release.join("SHA256SUMS"), sums).unwrap();
+        let error = verify_release(&release).unwrap_err().to_string();
+        assert!(error.contains("unsafe path"), "{error}");
+        fs::remove_dir_all(&release).unwrap();
+
+        let release = release_fixture();
+        fs::write(release.join("PLATFORM"), "plan9-mips\n").unwrap();
+        let error = verify_release(&release).unwrap_err().to_string();
+        assert!(error.contains("this release is for plan9-mips"), "{error}");
+        fs::remove_dir_all(&release).unwrap();
+    }
 
     #[test]
     fn required_failure_remains_unhealthy_after_later_success() {

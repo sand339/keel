@@ -29,7 +29,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from e2e import under_script
+
 REPO = Path(__file__).resolve().parent.parent
+# On Linux the backend runs in bubblewrap's PID namespace with
+# --die-with-parent: it dies with bubblewrap, and bubblewrap dies with the
+# trusted runtime or its own command. The orphan faults below cannot happen
+# there, so each Linux case checks that nothing outlives the run instead.
+LINUX = sys.platform == "linux"
 INSTALLED = Path.home() / ".local/share/keel"
 
 # Ignores the signals teardown sends first. The orphan-member variant forks a
@@ -163,7 +170,10 @@ class Faults:
         flags = ["-DORPHAN_MEMBER"] if mode == "orphan-member" else []
         backend = directory / "bin" / "keel-runtime"
         subprocess.run(["clang", "-O2", *flags, "-o", str(backend), str(source)], check=True)
-        for sibling in ("keel-vz-spike", "deno", "keel-v8-sdk.ts"):
+        backend_siblings = (
+            ("keel-ch", "cloud-hypervisor", "virtiofsd") if sys.platform == "linux" else ("keel-vz-spike",)
+        )
+        for sibling in (*backend_siblings, "deno", "keel-v8-sdk.ts"):
             (directory / "bin" / sibling).symlink_to(INSTALLED / "bin" / sibling)
         (directory / "images").symlink_to(INSTALLED / "images")
         return backend
@@ -184,12 +194,14 @@ class Faults:
         root = self.state / "sessions"
         return {entry.name for entry in root.iterdir()} if root.exists() else set()
 
-    def start(self, name: str, mode: str, keep_alive: bool) -> tuple[subprocess.Popen, Path, int]:
+    def start(
+        self, name: str, mode: str, keep_alive: bool, ready: bool = True
+    ) -> tuple[subprocess.Popen, Path, int]:
         """Starts a run and returns it once its chain records the backend group."""
         before = self.sessions()
         arguments = [str(self.keel), "run", *(["--keep-alive"] if keep_alive else []), "claude"]
         process = subprocess.Popen(
-            ["script", "-q", str(self.root / f"{name}.typescript"), *arguments],
+            under_script(self.root / f"{name}.typescript", arguments),
             cwd=self.workspace,
             env=self.environment(mode),
             stdin=subprocess.DEVNULL,
@@ -213,6 +225,8 @@ class Faults:
             process.kill()
             raise RuntimeError(f"{name}: the run never recorded its backend group")
         chain, pgid = found[0]
+        if not ready:
+            return process, chain, pgid
 
         # The group is recorded as soon as sandbox-exec is spawned; inject
         # nothing until the fake backend has installed its signal handlers,
@@ -263,7 +277,12 @@ def case_stop_escalates(faults: Faults) -> Result:
         result.check("keel stop succeeds", stop.returncode == 0, (stop.stdout + stop.stderr).strip())
         teardown = [r for r in faults.records(chain) if r["event"] == "kernel.run-teardown"]
         fields = teardown[0]["fields"] if teardown else {}
-        result.check("the in-chain teardown records SIGKILL escalation", fields.get("escalated") == "true", str(fields))
+        if LINUX:
+            # SIGTERM ends bubblewrap, and its namespace takes the stubborn
+            # backend with it, so there is nothing left to escalate against.
+            result.check("the in-chain teardown records a clean stop", fields.get("ok") == "true", str(fields))
+        else:
+            result.check("the in-chain teardown records SIGKILL escalation", fields.get("escalated") == "true", str(fields))
         result.check("and the backend group check passed", fields.get("ok") == "true")
         receipt = chain.with_suffix(".receipt.json")
         body = json.loads(receipt.read_text()) if receipt.exists() else {}
@@ -290,6 +309,11 @@ def crash_case(faults: Faults, name: str, mode: str, member_only: bool) -> Resul
                 f"leader alive: {pid_alive(pgid)}, group alive: {group_alive(pgid)}, leader: "
                 + subprocess.run(["ps", "-o", "stat=,ppid=", "-p", str(pgid)], capture_output=True, text=True).stdout.strip(),
             )
+        elif LINUX:
+            result.check(
+                "the backend dies with the killed runtime",
+                wait_for(lambda: not group_alive(pgid), 10),
+            )
         else:
             result.check("the fault holds: the backend outlives the killed runtime", pid_alive(pgid))
         result.check("status reports stale", "state: stale\n" in faults.status(mode, session))
@@ -314,7 +338,26 @@ def case_crash_orphan_leader(faults: Faults) -> Result:
 
 def case_crash_orphan_member(faults: Faults) -> Result:
     """Only a member of the backend group survives; recovery ends it without a live leader."""
+    if LINUX:
+        return member_dies_with_leader(faults)
     return crash_case(faults, "crash-orphan-member", "orphan-member", member_only=True)
+
+
+def member_dies_with_leader(faults: Faults) -> Result:
+    """On Linux a member cannot outlive its leader: when the backend's command
+    exits, its PID namespace ends, and the run stops in order."""
+    result = Result("crash-orphan-member")
+    process, chain, pgid = faults.start("crash-orphan-member", "orphan-member", keep_alive=False, ready=False)
+    try:
+        result.check("the run ends when the backend leader exits", wait_for(lambda: process.poll() is not None, 30))
+        result.check("no member of the backend group survives", wait_for(lambda: not group_alive(pgid), 10))
+        teardown = [r for r in faults.records(chain) if r["event"] == "kernel.run-teardown"]
+        fields = teardown[0]["fields"] if teardown else {}
+        result.check("the in-chain teardown passed", fields.get("ok") == "true", str(fields))
+        result.check("status does not report stale", "state: stale\n" not in faults.status("orphan-member", chain.parent.name))
+    finally:
+        faults.finish(process, pgid)
+    return result
 
 
 def case_supervisor_killed(faults: Faults) -> Result:

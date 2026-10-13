@@ -1,5 +1,6 @@
 #!/bin/sh
-# Resolves the guest image's Alpine packages and writes spikes/guest-packages.lock.
+# Resolves the guest image's Alpine packages and writes spikes/guest-packages.lock
+# (aarch64) or spikes/guest-packages-x86_64.lock.
 #
 # The lock names every package the image build installs, including
 # dependencies, with its exact version, repository, and SHA-256.
@@ -14,7 +15,23 @@
 set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-lock="$repo_root/spikes/guest-packages.lock"
+# KEEL_GUEST_ARCH selects the architecture, as in build-phase1-image.sh.
+case "${KEEL_GUEST_ARCH:-$(uname -m)}" in
+arm64 | aarch64)
+    guest_arch=aarch64
+    platform=linux/arm64
+    lock="$repo_root/spikes/guest-packages.lock"
+    ;;
+x86_64 | amd64)
+    guest_arch=x86_64
+    platform=linux/amd64
+    lock="$repo_root/spikes/guest-packages-x86_64.lock"
+    ;;
+*)
+    echo "unsupported guest architecture: ${KEEL_GUEST_ARCH:-$(uname -m)}" >&2
+    exit 1
+    ;;
+esac
 alpine_image=$(sed -n 's/^alpine_image="\(.*\)"$/\1/p' "$repo_root/spikes/build-phase1-image.sh")
 test -n "$alpine_image"
 
@@ -23,8 +40,9 @@ chromium font-dejavu nss-tools
 build-base npm py3-pip rust cargo go"
 tools_world="squashfs-tools busybox-static zstd"
 
-resolved=$(docker run --rm --platform linux/arm64 \
+resolved=$(docker run --rm --platform "$platform" \
     -e ROOTFS_WORLD="$rootfs_world" -e TOOLS_WORLD="$tools_world" \
+    -e GUEST_ARCH="$guest_arch" \
     "$alpine_image" sh -eu -c '
 apk update -q >/dev/null
 installed() {
@@ -45,7 +63,7 @@ emit() {
         /^    https:/ && version == want[name] && !(name in done) { print name, version, \$1; done[name] = 1 }
     " | while read -r name version base; do
         file="$name-$version.apk"
-        wget -q -O "/fetch/$set_name/$file" "$base/aarch64/$file"
+        wget -q -O "/fetch/$set_name/$file" "$base/$GUEST_ARCH/$file"
         sum=$(sha256sum "/fetch/$set_name/$file" | cut -d " " -f 1)
         echo "$set_name ${base##*/} $name-$version $sum"
     done
