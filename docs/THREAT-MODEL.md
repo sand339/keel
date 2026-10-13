@@ -453,11 +453,10 @@ A passing suite is evidence for a particular source revision and environment. It
 
 The following are not current guarantees:
 
-- enforcement from the admission manifest: every run records a canonical manifest of its artifact digests, policy, workspace state, authority, credential scopes, and model terms before the workload starts ([`admission_manifest.rs`](../crates/trusted/keel-input/tests/admission_manifest.rs)), but the digests are evidence, and the untrusted backend reads the artifacts after admission;
-- teardown receipts for foreground runs or a crashed supervisor; a persistent session's surviving supervisor signs a receipt anchored in the chain, with the chain's local tamper evidence and no more;
-- authenticated crash recovery: `keel recover` acts only on resources the authenticated chain names and refuses foreign process groups and paths, but its record is unsigned, it runs only when `keel run`, `keel attach`, or `keel recover` is invoked, and a backend killed before its record was written is missed; an abandoned detached session holds its VM and credentials until its idle limit, 12 hours by default;
-- a Linux KVM or Cloud Hypervisor backend;
-- distributed evaluation and reinforcement-learning infrastructure;
+- exclusive custody of the boot images: admission hashes, and the backend boots, private copies of the kernel, initramfs, and root disk, but a process of the same user can still race that copy;
+- a receipt from a crashed supervisor; every run that opens a chain ends with a signed receipt, its supervisor's or its own, with the chain's local tamper evidence and no more;
+- authenticated crash recovery: `keel recover` acts only on resources the authenticated chain names and refuses foreign process groups and paths, but its record is unsigned, it runs only when invoked (by `keel run`, `keel attach`, `keel recover`, or the opt-in hourly reaper), and a backend killed before its record was written is missed;
+- erasure of every copy of a credential: Keel wipes its own buffers, but not the process environment it inherited, nor `ring`'s derived signing keys;
 - external audit witnessing or hardware-backed attestation;
 - per-turn provenance reconstructed from the exact content in each model
   request; current direct-workspace exposure fails closed at rank zero.

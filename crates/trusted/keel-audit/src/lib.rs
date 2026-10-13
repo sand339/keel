@@ -23,6 +23,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{SystemTime, UNIX_EPOCH},
 };
+use zeroize::Zeroize;
 
 const HASH_DOMAIN: &[u8] = b"keel-audit-record-v1\0";
 const SIGNATURE_DOMAIN: &[u8] = b"keel-audit-signature-v1\0";
@@ -123,28 +124,36 @@ impl Redactor {
     ///
     /// Returns an error if any configured value is empty.
     pub fn new(secrets: impl IntoIterator<Item = impl Into<String>>) -> Result<Self, AuditError> {
-        let secrets = secrets.into_iter().map(Into::into).collect::<Vec<_>>();
-        if secrets.iter().any(String::is_empty) {
+        // Every copy of a secret made here is wiped when it is no longer
+        // needed: the inputs, each encoded form, and each duplicate removed.
+        let mut originals = secrets.into_iter().map(Into::into).collect::<Vec<String>>();
+        if originals.iter().any(String::is_empty) {
+            originals.zeroize();
             return Err(AuditError::InvalidRedaction);
         }
-        let mut secrets = secrets
-            .into_iter()
-            .flat_map(|secret| {
-                let standard = base64(secret.as_bytes(), b'+', b'/');
-                let url_safe = base64(secret.as_bytes(), b'-', b'_');
-                [
-                    secret.clone(),
-                    percent_encode(&secret),
-                    standard.clone(),
-                    standard.trim_end_matches('=').to_owned(),
-                    url_safe.clone(),
-                    url_safe.trim_end_matches('=').to_owned(),
-                ]
-            })
-            .filter(|secret| !secret.is_empty())
-            .collect::<Vec<_>>();
+        let mut secrets = Vec::with_capacity(originals.len() * 6);
+        for secret in &originals {
+            let mut standard = base64(secret.as_bytes(), b'+', b'/');
+            let mut url_safe = base64(secret.as_bytes(), b'-', b'_');
+            secrets.extend([
+                secret.clone(),
+                percent_encode(secret),
+                standard.trim_end_matches('=').to_owned(),
+                url_safe.trim_end_matches('=').to_owned(),
+                std::mem::take(&mut standard),
+                std::mem::take(&mut url_safe),
+            ]);
+        }
+        originals.zeroize();
+        secrets.retain(|secret| !secret.is_empty());
         secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
-        secrets.dedup();
+        secrets.dedup_by(|duplicate, kept| {
+            let same = duplicate == kept;
+            if same {
+                duplicate.zeroize();
+            }
+            same
+        });
         Ok(Self { secrets })
     }
 
@@ -156,6 +165,12 @@ impl Redactor {
             .fold(value.to_owned(), |redacted, secret| {
                 redacted.replace(secret, REDACTED)
             })
+    }
+}
+
+impl Drop for Redactor {
+    fn drop(&mut self) {
+        self.secrets.zeroize();
     }
 }
 

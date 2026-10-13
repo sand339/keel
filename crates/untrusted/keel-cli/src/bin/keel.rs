@@ -5,10 +5,10 @@ use keel_cli::{
     Command, PolicySource, accepted_policy_ledger, apply_session_policy, axes_report,
     configured_input_runtime, context_report, derive_workspace_egress, doctor,
     explicit_mux_workspace, fatigue_report, format_enforcement_report, format_floor_status, help,
-    host_default_model, install, launch_runtime, load_floor_status, new_session_id, parse_args,
-    persistent_runtime_operation, reconcile_crashed_sessions, record_accepted_policy,
-    select_mux_launch, session_directory, session_enforcement_state, start_persistent_runtime,
-    validate_run_isolation, validate_v8_request_entry,
+    host_default_model, install, install_reaper, launch_runtime, load_floor_status, new_session_id,
+    parse_args, persistent_runtime_operation, reconcile_crashed_sessions, record_accepted_policy,
+    remove_reaper, select_mux_launch, session_directory, session_enforcement_state,
+    start_persistent_runtime, validate_run_isolation, validate_v8_request_entry,
 };
 use keel_compile::{PolicyArtifact, load_policy_translation, translate_policy_with_claude};
 use serde::{Deserialize, Serialize};
@@ -60,6 +60,17 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     match parse_args(env::args_os().skip(1))? {
         Command::Setup { prebuilt } => {
             println!("{}", install(prebuilt.as_deref())?);
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Reaper { install } => {
+            println!(
+                "{}",
+                if install {
+                    install_reaper()?
+                } else {
+                    remove_reaper()?
+                }
+            );
             Ok(ExitCode::SUCCESS)
         }
         Command::Doctor => {

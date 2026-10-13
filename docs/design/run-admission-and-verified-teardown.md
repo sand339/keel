@@ -1,18 +1,12 @@
 # Run admission and verified teardown
 
-**Status: partially implemented.** Trusted-terminal admission now binds the
-declared task capabilities, egress hosts, and elevated model token/cost
-ceilings before workload execution. The [v1 slice](#v1-slice-admission-manifest-and-session-status),
-an audited admission manifest and session status, is implemented (D57); the
-byte-bound staging of boot artifacts, automatic reconciliation, and fault
-injection are the rest of roadmap R1. The [v2 slice](#v2-slice-in-chain-teardown-for-one-run),
-an in-chain teardown record, is implemented (D73), and the
-[v3 slice](#v3-slice-supervisor-receipt-and-two-stage-stop), a signed
-post-seal receipt behind a two-stage `keel stop`, is implemented (D74), and
-the [v4 slice](#v4-slice-in-chain-resources-and-crash-recovery), crash
-recovery from resources the chain records, is implemented (D75). The
-[v5 slice](#v5-slice-idle-timeout-and-recovery-on-use) adds an idle timeout
-for abandoned sessions and recovery on use (D76).
+**Status: implemented.** Admission manifests (D57), in-chain teardown
+(D73), the supervisor receipt and two-stage stop (D74), crash recovery (D75),
+the idle timeout and recovery on use (D76), and fault injection (D77) are
+described in the slices below. Roadmap R1 then finished the rest, in the
+[R1 slice](#r1-slice-every-run-receipted-and-bound): receipts for every run,
+relay and approval checks, credential wiping, booting the hashed image
+copies, and the opt-in reaper. What it does not claim is listed there.
 
 This hardening phase gives every VM boot a complete, immutable identity and
 makes `keel stop` return only after Keel has checked the observable teardown
@@ -396,6 +390,40 @@ misbehaves on purpose. Its first runs found three defects, all fixed in D77:
 
 Session directories are never deleted automatically: chains are evidence, and
 pruning them is a retention decision for the operator.
+
+## R1 slice: every run receipted and bound
+
+- **Every run ends with a receipt.** A `RunSession` guard owns the broker and
+  the run's resources from the broker's start. On every exit, early errors
+  included, it releases the resources, seals the chain with a teardown record
+  (stop reason `error` on an early error), and, for a run no `serve`
+  supervises, signs its own receipt with a key held only in memory whose
+  public half the teardown record names.
+- **Relays, pools, and approvals.** The broker joins every client thread
+  before sealing; each owns its guest relay and any upstream connection it
+  reuses. The teardown record names how many were open at stop
+  (`relay-sessions`) and whether a pending approval was denied
+  (`pending-approval`).
+- **Credentials are wiped.** Beyond `SecretBytes`, Keel wipes each forwarded
+  request with its credential or session token injected, every intermediate
+  buffer of the injection, the session token's copies in signing, the
+  credential-process and `gh` output, and the redactor's copies.
+- **The hashed images are the booted images.** The launcher copies the
+  kernel, initramfs, and root disk into a private run directory, hashes the
+  copies for the manifest, and boots those; the directory is a recorded
+  resource that teardown removes and recovery releases.
+- **Opt-in reaper.** `keel setup --install-reaper` runs `keel recover --all`
+  hourly through launchd or a systemd user timer.
+
+Limits:
+
+- A process of the same user can race the private image copy; on ext4 the copy
+  costs about 2 s and 700 MB per run, where copy-on-write makes it free.
+- The process environment block and `ring`'s derived signing keys are not
+  wiped: the first needs `unsafe`, the second lives inside `ring`'s types.
+- A crashed supervisor still writes no receipt, and recovery records stay
+  unsigned.
+- The receipt is local tamper evidence, not attestation.
 
 ## Verified teardown
 

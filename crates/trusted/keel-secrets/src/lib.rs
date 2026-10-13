@@ -29,7 +29,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Identifies this crate as part of the trusted computing base.
 pub const TRUSTED_CRATE: &str = "keel-secrets";
@@ -222,19 +222,30 @@ impl SystemEgressConnector {
                 std::env::var("GH_TOKEN").ok(),
                 std::env::var("GITHUB_TOKEN").ok(),
             ) {
-                (Some(left), Some(right)) if left != right => {
+                (Some(mut left), Some(mut right)) if left != right => {
+                    left.zeroize();
+                    right.zeroize();
                     return Err(
                         "GH_TOKEN and GITHUB_TOKEN contain different credentials".to_owned()
                     );
                 }
-                (Some(token), _) | (_, Some(token)) => Some(token),
+                (Some(token), other) | (other, Some(token)) => {
+                    if let Some(mut other) = other {
+                        other.zeroize();
+                    }
+                    Some(token)
+                }
                 (None, None) => std::process::Command::new("gh")
                     .args(["auth", "token", "--hostname", "github.com"])
                     .output()
                     .ok()
                     .filter(|output| output.status.success())
-                    .and_then(|output| String::from_utf8(output.stdout).ok())
-                    .map(|token| token.trim().to_owned())
+                    .and_then(|output| {
+                        let stdout = Zeroizing::new(output.stdout);
+                        std::str::from_utf8(&stdout)
+                            .ok()
+                            .map(|token| token.trim().to_owned())
+                    })
                     .filter(|token| !token.is_empty()),
             }
         } else {
@@ -967,10 +978,12 @@ impl CredentialVault {
         // A signed provider authenticates by computing a header, not by holding
         // one. The sentinel the guest presented is dropped with the header it
         // arrived in, which is why the residual check below still passes.
-        let mut output = match &self.signer {
+        // Every buffer that has held an injected credential is wiped when it
+        // is replaced or dropped.
+        let mut output = Zeroizing::new(match &self.signer {
             Some(signer) if signer.matches(target) => signer.sign(target, request)?,
             _ => request.to_vec(),
-        };
+        });
         for binding in &self.bindings {
             let contains = binding
                 .sentinel
@@ -999,13 +1012,13 @@ impl CredentialVault {
                 // below fails closed when none of them matches.
                 continue;
             }
-            output = binding.sentinel.expose(|sentinel| {
+            output = Zeroizing::new(binding.sentinel.expose(|sentinel| {
                 binding
                     .credential
                     .expose(|credential| replace_credential_header(&output, sentinel, credential))
-            })?;
+            })?);
         }
-        self.refuse_sentinels(output)
+        self.refuse_sentinels(std::mem::take(&mut *output))
     }
 
     /// Passes a request through only if it carries no credential sentinel.
@@ -1015,7 +1028,7 @@ impl CredentialVault {
     /// # Errors
     ///
     /// Returns an error if any bound or built-in sentinel remains.
-    pub fn refuse_sentinels(&self, output: Vec<u8>) -> Result<Vec<u8>, TlsError> {
+    pub fn refuse_sentinels(&self, mut output: Vec<u8>) -> Result<Vec<u8>, TlsError> {
         let bound_sentinel_remains = self.bindings.iter().any(|binding| {
             binding
                 .sentinel
@@ -1032,6 +1045,7 @@ impl CredentialVault {
             .iter()
             .any(|sentinel| find_subslice(&output, sentinel.as_bytes()).is_some())
         {
+            output.zeroize();
             return Err(TlsError(
                 "credential sentinel has no binding for this request".to_owned(),
             ));
@@ -1591,7 +1605,7 @@ impl SigV4Signer {
         )
         .map_err(|error| TlsError::new("signed request headers", error))?;
         if let Some(token) = &authorization.session_token {
-            write!(output, "X-Amz-Security-Token: {token}\r\n")
+            write!(output, "X-Amz-Security-Token: {}\r\n", token.as_str())
                 .map_err(|error| TlsError::new("signed request headers", error))?;
         }
         write!(output, "Authorization: {}\r\n\r\n", authorization.value)
@@ -1634,13 +1648,13 @@ impl SigV4Signer {
             }
         }
         let scope = format!("{date_stamp}/{}/{SIGV4_SERVICE}/aws4_request", self.region);
-        let session_token = held
-            .session_token
-            .as_ref()
-            .map(|token| token.expose(|bytes| String::from_utf8_lossy(bytes).into_owned()));
+        let session_token = held.session_token.as_ref().map(|token| {
+            Zeroizing::new(token.expose(|bytes| String::from_utf8_lossy(bytes).into_owned()))
+        });
         let mut signed_headers = "content-type;host;x-amz-date".to_owned();
-        let mut canonical_headers =
-            format!("content-type:{SIGV4_CONTENT_TYPE}\nhost:{authority}\nx-amz-date:{amz_date}\n");
+        let mut canonical_headers = Zeroizing::new(format!(
+            "content-type:{SIGV4_CONTENT_TYPE}\nhost:{authority}\nx-amz-date:{amz_date}\n"
+        ));
         if let Some(token) = &session_token {
             signed_headers.push_str(";x-amz-security-token");
             canonical_headers.push_str("x-amz-security-token:");
@@ -1649,9 +1663,10 @@ impl SigV4Signer {
         }
         // The empty line is the canonical query string: no admitted operation
         // takes parameters, and `canonical_request_uri` refuses one outright.
-        let canonical_request = format!(
-            "{method}\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
-        );
+        let canonical_request = Zeroizing::new(format!(
+            "{method}\n{canonical_uri}\n\n{}\n{signed_headers}\n{payload_hash}",
+            *canonical_headers
+        ));
         let string_to_sign = format!(
             "{SIGV4_ALGORITHM}\n{amz_date}\n{scope}\n{}",
             encode_lower_hex(digest(&SHA256, canonical_request.as_bytes()).as_ref())
@@ -1686,7 +1701,7 @@ const SIGNED_HEADER_NAMES: [&str; 4] = [
 
 struct SignedAuthorization {
     value: String,
-    session_token: Option<String>,
+    session_token: Option<Zeroizing<String>>,
 }
 
 /// Derives the `SigV4` signing key and signs the string to sign.
@@ -1916,12 +1931,16 @@ fn resolve_credential_process(command: &str) -> Result<AwsCredentials, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    parse_credential_process_output(&output.stdout)
+    let stdout = Zeroizing::new(output.stdout);
+    parse_credential_process_output(&stdout)
 }
 
 fn parse_credential_process_output(output: &[u8]) -> Result<AwsCredentials, String> {
-    let value: Value = serde_json::from_slice(output)
-        .map_err(|error| format!("credential process output is not JSON: {error}"))?;
+    let value = WipedJson(
+        serde_json::from_slice(output)
+            .map_err(|error| format!("credential process output is not JSON: {error}"))?,
+    );
+    let value = &value.0;
     if value.get("Version").and_then(Value::as_u64) != Some(1) {
         return Err("credential process output is not Version 1".to_owned());
     }
@@ -1949,6 +1968,23 @@ fn parse_credential_process_output(output: &[u8]) -> Result<AwsCredentials, Stri
         session_token: field("SessionToken").map(|token| SecretBytes::new(token.as_bytes())),
         expires_at,
     })
+}
+
+/// Parsed credential-process JSON, whose strings are wiped when it is dropped.
+struct WipedJson(Value);
+
+impl Drop for WipedJson {
+    fn drop(&mut self) {
+        fn wipe(value: &mut Value) {
+            match value {
+                Value::String(text) => text.zeroize(),
+                Value::Array(items) => items.iter_mut().for_each(wipe),
+                Value::Object(map) => map.values_mut().for_each(wipe),
+                _ => {}
+            }
+        }
+        wipe(&mut self.0);
+    }
 }
 
 /// Allows only an admitted model endpoint, strips every tool the provider
@@ -3809,6 +3845,13 @@ fn headers_request_connection_close(headers: &str) -> bool {
 struct PreparedHttpRequest {
     bytes: Vec<u8>,
     model: bool,
+}
+
+impl Drop for PreparedHttpRequest {
+    /// The bytes carry the injected credential or session token.
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+    }
 }
 
 struct AuthorizedHttpRequest {

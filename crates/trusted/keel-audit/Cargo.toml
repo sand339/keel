@@ -12,6 +12,7 @@ keel-kernel = { version = "=0.0.1", path = "../keel-kernel" }
 ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 keel-provenance = { version = "=0.0.1", path = "../keel-provenance" }

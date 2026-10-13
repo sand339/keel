@@ -58,7 +58,8 @@ CRATE_BUDGETS = {
     # rule over derived blobs, and payload violations as gate reasons.
     # D83: the extraction helper's channel, its job queue and frames, binding
     # each helper request to its job, and validating the result before delivery.
-    "keel-kernel": 6_031,
+    # R1: the teardown record counts the relay sessions open at stop.
+    "keel-kernel": 6_037,
     # D22, D23, D25, and D28 moved 211 unclaimed lines from this evaluator-only
     # crate.
     # D31: immutable built-in restrictions beneath accepted policy.
@@ -95,7 +96,8 @@ CRATE_BUDGETS = {
     # D74: the signed supervisor teardown receipt, its verification, and the seal digest.
     # D75: the kernel.run-resource record.
     # D83: the kernel.extraction record.
-    "keel-audit": 1_436,
+    # R1: the redactor wipes every credential form it holds.
+    "keel-audit": 1_448,
     # D16 moved 200 lines here from keel-input for the eventstream usage decoder.
     # The trusted input path is complete, so its surplus was sized for work that
     # Phase 2 has since finished. D17 then added 700 with no donor at all: SigV4
@@ -120,7 +122,9 @@ CRATE_BUDGETS = {
     # provider would fetch (URL, file, or container sources) is refused.
     # D83: the extraction request shape and the body and tool-call hooks.
     # D84: AWS session tokens masked in every relayed response.
-    "keel-secrets": 3_528,
+    # R1: wiping every buffer that held an injected credential or session
+    # token, and the credential-process and `gh` output.
+    "keel-secrets": 3_566,
     # D20 added 100 from keel-provenance for the display seam tracker: the trusted
     # terminal owner has to know where a sequence or character ends before it
     # writes a notice into the guest's stream or resumes one after a takeover.
@@ -167,7 +171,11 @@ CRATE_BUDGETS = {
     # R3: Linux confinement of the four children through bubblewrap, the
     # Linux foreground-terminal check, and naming processes from /proc in
     # crash recovery.
-    "keel-input": 4_989,
+    # R1: a session guard that seals every run, early errors included, and an
+    # unsupervised run's own signed receipt, and a pending approval's denial
+    # at stop recorded in the teardown record, and admission hashing and the
+    # backend booting private copies of the boot images.
+    "keel-input": 5_120,
 }
 SENSITIVE_TYPES = {
     "keel-secrets": [

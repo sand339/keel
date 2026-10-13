@@ -261,6 +261,192 @@ fn sha256_file(path: &Path) -> Result<String, CliError> {
         }))
 }
 
+const REAPER_LABEL: &str = "dev.keel.reaper";
+
+/// Where the reaper's job definition lives on this platform.
+fn reaper_files(home: &Path) -> Vec<PathBuf> {
+    if cfg!(target_os = "macos") {
+        vec![home.join(format!("Library/LaunchAgents/{REAPER_LABEL}.plist"))]
+    } else {
+        let units = home.join(".config/systemd/user");
+        vec![
+            units.join("keel-reaper.service"),
+            units.join("keel-reaper.timer"),
+        ]
+    }
+}
+
+/// Installs an hourly `keel recover --all`, so a host where Keel then goes
+/// unused does not keep a crashed session's backend until the next command.
+/// It is opt-in because it changes host configuration.
+///
+/// # Errors
+///
+/// Returns an error when Keel is not installed or the job cannot be written
+/// or loaded.
+pub fn install_reaper() -> Result<String, CliError> {
+    let config = runtime_config()?
+        .ok_or_else(|| CliError::new("Keel is not installed; run `keel setup` first"))?;
+    let keel = config.input_runtime.with_file_name("keel");
+    if !is_executable(&keel) {
+        return Err(CliError::new(format!(
+            "installed keel is missing: {}",
+            keel.display()
+        )));
+    }
+    let home = home_directory()?;
+    let files = reaper_files(&home);
+    for file in &files {
+        if let Some(parent) = file.parent() {
+            fs::create_dir_all(parent).map_err(io_error)?;
+        }
+    }
+    let log = home.join(".keel/reaper.log");
+    if cfg!(target_os = "macos") {
+        load_launchd_reaper(&files[0], &keel, &log)?;
+    } else {
+        load_systemd_reaper(&files, &keel)?;
+    }
+    let mut message = format!(
+        "Installed the Keel crash reaper: `{} recover --all` runs hourly.\nRemove it with `keel setup --remove-reaper`.",
+        keel.display()
+    );
+    if cfg!(target_os = "linux") {
+        message.push_str(
+            "\nSystemd runs user timers only while you are logged in, unless lingering is on \
+(`loginctl enable-linger`).",
+        );
+    }
+    Ok(message)
+}
+
+/// Writes and loads the launchd agent that runs the reaper hourly.
+fn load_launchd_reaper(plist: &Path, keel: &Path, log: &Path) -> Result<(), CliError> {
+    let xml = |path: &Path| {
+        path.display()
+            .to_string()
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    fs::write(
+        plist,
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+<plist version=\"1.0\">\n<dict>\n\
+  <key>Label</key><string>{REAPER_LABEL}</string>\n\
+  <key>ProgramArguments</key><array><string>{}</string><string>recover</string><string>--all</string></array>\n\
+  <key>StartInterval</key><integer>3600</integer>\n\
+  <key>ProcessType</key><string>Background</string>\n\
+  <key>StandardOutPath</key><string>{}</string>\n\
+  <key>StandardErrorPath</key><string>{}</string>\n\
+</dict>\n</plist>\n",
+            xml(keel),
+            xml(log),
+            xml(log)
+        ),
+    )
+    .map_err(io_error)?;
+    let domain = format!("gui/{}", user_id()?);
+    let _ = Command::new("launchctl")
+        .args(["bootout", &format!("{domain}/{REAPER_LABEL}")])
+        .output();
+    let loaded = Command::new("launchctl")
+        .args(["bootstrap", &domain])
+        .arg(plist)
+        .output()
+        .map_err(io_error)?;
+    if !loaded.status.success() {
+        return Err(CliError::new(format!(
+            "launchctl could not load the reaper: {}",
+            String::from_utf8_lossy(&loaded.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Writes and enables the systemd user timer that runs the reaper hourly.
+fn load_systemd_reaper(files: &[PathBuf], keel: &Path) -> Result<(), CliError> {
+    let quoted = format!("\"{}\"", keel.display().to_string().replace('"', "\\\""));
+    fs::write(
+        &files[0],
+        format!(
+            "[Unit]\nDescription=Release resources of crashed Keel sessions\n\n\
+[Service]\nType=oneshot\nExecStart={quoted} recover --all\n"
+        ),
+    )
+    .map_err(io_error)?;
+    fs::write(
+        &files[1],
+        "[Unit]\nDescription=Hourly Keel crash recovery\n\n\
+[Timer]\nOnBootSec=10min\nOnUnitActiveSec=1h\n\n[Install]\nWantedBy=timers.target\n",
+    )
+    .map_err(io_error)?;
+    for arguments in [
+        &["--user", "daemon-reload"][..],
+        &["--user", "enable", "--now", "keel-reaper.timer"][..],
+    ] {
+        let ran = Command::new("systemctl")
+            .args(arguments)
+            .output()
+            .map_err(io_error)?;
+        if !ran.status.success() {
+            return Err(CliError::new(format!(
+                "systemctl {} failed: {}",
+                arguments.join(" "),
+                String::from_utf8_lossy(&ran.stderr).trim()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Removes the hourly crash-recovery job.
+///
+/// # Errors
+///
+/// Returns an error when a job file cannot be removed.
+pub fn remove_reaper() -> Result<String, CliError> {
+    let home = home_directory()?;
+    if cfg!(target_os = "macos") {
+        let _ = Command::new("launchctl")
+            .args(["bootout", &format!("gui/{}/{REAPER_LABEL}", user_id()?)])
+            .output();
+    } else {
+        let _ = Command::new("systemctl")
+            .args(["--user", "disable", "--now", "keel-reaper.timer"])
+            .output();
+    }
+    let mut removed = false;
+    for file in reaper_files(&home) {
+        match fs::remove_file(&file) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error(error)),
+        }
+    }
+    if cfg!(target_os = "linux") {
+        let _ = Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .output();
+    }
+    Ok(if removed {
+        "Removed the Keel crash reaper.".to_owned()
+    } else {
+        "No Keel crash reaper was installed.".to_owned()
+    })
+}
+
+fn user_id() -> Result<String, CliError> {
+    let output = Command::new("id").arg("-u").output().map_err(io_error)?;
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if !output.status.success() || id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(CliError::new("cannot determine the user id"));
+    }
+    Ok(id)
+}
+
 /// Checks the build prerequisites, then fetches the pinned assets and builds
 /// Keel and its guest image from the checkout.
 fn build_from_source(source: &Path) -> Result<(), CliError> {
@@ -419,6 +605,9 @@ pub fn doctor() -> DoctorReport {
         "GitHub authentication is unavailable; run `gh auth login` or set GH_TOKEN",
     );
     check_local_state(&mut report);
+    if home_directory().is_ok_and(|home| reaper_files(&home).iter().all(|file| file.is_file())) {
+        report.ok("crash reaper is installed (hourly `keel recover --all`)");
+    }
     DoctorReport {
         output: report.output,
         healthy: report.healthy,

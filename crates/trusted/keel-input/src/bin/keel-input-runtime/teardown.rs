@@ -1,7 +1,9 @@
 //! The run's resource registry: the only path that removes what one run
 //! created on the host, and the check that each resource is really gone.
 
-use keel_input::TeardownCheck;
+use super::receipt;
+use keel_audit::RunKey;
+use keel_input::{RunTeardownEvent, RuntimeBroker, TeardownCheck};
 use nix::{
     errno::Errno,
     sys::signal::{Signal, killpg},
@@ -16,7 +18,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 const TERMINATE_GRACE: Duration = Duration::from_secs(2);
@@ -29,11 +31,17 @@ pub(super) struct RunResources {
     backend: Option<Child>,
     helper: Option<Child>,
     scratch: Option<PathBuf>,
+    images: Option<PathBuf>,
 }
 
 impl RunResources {
     pub(super) fn scratch(&mut self, path: PathBuf) -> &Path {
         self.scratch.insert(path)
+    }
+
+    /// Registers the private copies of the boot images admission hashed.
+    pub(super) fn images(&mut self, path: PathBuf) -> &Path {
+        self.images.insert(path)
     }
 
     /// Registers the backend, which leads its own process group.
@@ -83,6 +91,13 @@ impl RunResources {
                 unmet: remove_verified(&scratch),
             });
         }
+        if let Some(images) = self.images.take() {
+            released.checks.push(TeardownCheck {
+                kind: "images",
+                detail: images.display().to_string(),
+                unmet: remove_verified(&images),
+            });
+        }
         released
     }
 }
@@ -91,6 +106,119 @@ impl Drop for RunResources {
     fn drop(&mut self) {
         if let Some(error) = self.release().error() {
             eprintln!("keel: {error}");
+        }
+    }
+}
+
+/// One run from its broker's start to its sealed chain. On every exit, the
+/// normal one and each early error, it releases the run's resources, seals
+/// the chain with a teardown record, and, for a run no `serve` supervises,
+/// signs its own receipt, so every run that opened a chain ends with one.
+pub(super) struct RunSession {
+    broker: Option<RuntimeBroker>,
+    /// The run's host resources, released before the chain is sealed.
+    pub(super) resources: RunResources,
+    /// The supervising `serve` process's key, which signs the receipt.
+    supervisor_key: Option<String>,
+    /// An unsupervised run's own receipt key, held only in memory.
+    own_key: Option<RunKey>,
+    started: SystemTime,
+}
+
+impl RunSession {
+    /// Takes the run's broker. `supervisor_key` is `serve`'s public key; with
+    /// none, the run generates its own key and records its public half.
+    pub(super) fn new(
+        broker: RuntimeBroker,
+        supervisor_key: Option<String>,
+        started: SystemTime,
+    ) -> Result<Self, String> {
+        let own_key = match supervisor_key {
+            Some(_) => None,
+            None => Some(RunKey::generate().map_err(|error| error.to_string())?),
+        };
+        Ok(Self {
+            broker: Some(broker),
+            resources: RunResources::default(),
+            supervisor_key,
+            own_key,
+            started,
+        })
+    }
+
+    /// The broker and the resources together, for spawning what the run
+    /// registers.
+    pub(super) fn parts(&mut self) -> (&RuntimeBroker, &mut RunResources) {
+        (
+            self.broker
+                .as_ref()
+                .expect("the broker lives until the session ends"),
+            &mut self.resources,
+        )
+    }
+
+    pub(super) fn broker(&self) -> &RuntimeBroker {
+        self.broker
+            .as_ref()
+            .expect("the broker lives until the session ends")
+    }
+
+    /// Seals the chain with what `released` established, then writes the
+    /// unsupervised run's receipt. Ending twice does nothing.
+    pub(super) fn end(
+        &mut self,
+        stop_reason: &'static str,
+        escalated: bool,
+        released: &Released,
+    ) -> Result<(), String> {
+        let Some(broker) = self.broker.take() else {
+            return Ok(());
+        };
+        let directory = broker.audit_path().parent().map(Path::to_path_buf);
+        let broker_directory = broker.socket_path().parent().map(Path::to_path_buf);
+        let supervisor_key = self
+            .supervisor_key
+            .clone()
+            .or_else(|| self.own_key.as_ref().map(RunKey::public_hex));
+        let sealed = broker.shutdown_with_teardown(Some(RunTeardownEvent {
+            stop_reason,
+            escalated,
+            checks: released.checks.clone(),
+            supervisor_key,
+        }));
+        if let (Some(key), Some(directory)) = (&self.own_key, directory) {
+            let mut teardown = receipt::Teardown::begin();
+            if let Some(broker_directory) = broker_directory {
+                teardown.check_absent("broker-dir", &broker_directory);
+            }
+            let (path, ok) = teardown
+                .finish(
+                    &directory,
+                    std::process::id(),
+                    self.started,
+                    key,
+                    stop_reason,
+                )
+                .map_err(|error| format!("write teardown receipt: {error}"))?;
+            if !ok {
+                eprintln!(
+                    "keel: teardown receipt names unmet checks: {}",
+                    path.display()
+                );
+            }
+        }
+        sealed.map(drop)
+    }
+}
+
+impl Drop for RunSession {
+    /// An early error: release, seal with stop reason `error`, and receipt.
+    fn drop(&mut self) {
+        if self.broker.is_some() {
+            let released = self.resources.release();
+            if let Err(error) = self.end("error", released.escalated, &released) {
+                eprintln!("keel: {error}");
+            }
         }
     }
 }

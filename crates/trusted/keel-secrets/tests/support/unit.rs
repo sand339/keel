@@ -1742,7 +1742,7 @@ fn a_signed_request_commits_to_the_sanitized_body_and_not_the_one_received() {
         false,
     )
     .expect("signed invoke request");
-    let signed = String::from_utf8(prepared.bytes).expect("utf8");
+    let signed = String::from_utf8(prepared.bytes.clone()).expect("utf8");
 
     let amz_date = signed
         .lines()

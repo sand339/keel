@@ -388,6 +388,38 @@ def case_supervisor_killed(faults: Faults) -> Result:
     return result
 
 
+def case_early_error(faults: Faults) -> Result:
+    """A run that fails after its chain opens still releases what it started,
+    seals with stop reason `error`, and leaves its own verified receipt."""
+    result = Result("early-error")
+    before = faults.sessions()
+    environment = dict(faults.environment("stubborn"), KEEL_XTERM_RENDERER="/nonexistent/keel-xterm-renderer")
+    completed = subprocess.run(
+        under_script(faults.root / "early-error.typescript", [str(faults.keel), "run", "claude"]),
+        cwd=faults.workspace,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=120,
+    )
+    result.check("the run fails", completed.returncode != 0, f"exit {completed.returncode}")
+    sessions = sorted(faults.sessions() - before)
+    chains = [chain for session in sessions for chain in (faults.state / "sessions" / session).glob("audit-*.ndjson")]
+    if not result.check("the run opened one chain", len(chains) == 1, str(chains)):
+        return result
+    chain = chains[0]
+    teardown = [r for r in faults.records(chain) if r["event"] == "kernel.run-teardown"]
+    fields = teardown[0]["fields"] if teardown else {}
+    result.check("the chain is sealed with stop reason error", fields.get("stop_reason") == "error", str(fields))
+    receipt = chain.with_suffix(".receipt.json")
+    body = json.loads(receipt.read_text()) if receipt.exists() else {}
+    result.check("its own receipt passed", body.get("ok") is True, str(body.get("checks")))
+    status = faults.status("stubborn", chain.parent.name)
+    result.check("status reports closed with a verified receipt", "state: closed\n" in status and "receipt: verified after error" in status, status)
+    return result
+
+
 def case_backend_descriptors(faults: Faults) -> Result:
     """The untrusted backend inherits no terminal: not the persistent
     supervisor's pty master or slave, and not one from a foreground launch."""
@@ -416,6 +448,11 @@ def case_backend_descriptors(faults: Faults) -> Result:
                         os.kill(pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+            # The run was killed, not stopped: recover it, so what it left on
+            # the host (scratch, the private image copies) is released.
+            wait_for(lambda: not pid_alive(writer), 10)
+            recover = faults.keel_command("descriptor-probe", "recover", chain.parent.name)
+            result.check(f"{label}: recovery releases the killed run", recover.returncode == 0, (recover.stdout + recover.stderr).strip())
     return result
 
 
@@ -425,6 +462,7 @@ CASES: dict[str, Callable[[Faults], Result]] = {
     "crash-orphan-leader": case_crash_orphan_leader,
     "crash-orphan-member": case_crash_orphan_member,
     "supervisor-killed": case_supervisor_killed,
+    "early-error": case_early_error,
 }
 
 

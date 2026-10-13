@@ -27,8 +27,14 @@
 # crate was already admitted elsewhere in the trusted set and is used here only
 # for that closed action shape.
 
+#
+# keel-audit/zeroize: the redactor holds every credential form it scrubs from
+# audit records for the whole run, and wipes them when it is dropped (R1).
+# keel-secrets already admits this pinned version for the same purpose, so it
+# adds a second caller, not new code.
+
 [allow]
-keel-audit = ["ring", "serde", "serde_json"]
+keel-audit = ["ring", "serde", "serde_json", "zeroize"]
 keel-input = ["nix", "ring", "serde", "serde_json"]
 keel-kernel = ["nix", "ring", "serde_json"]
 keel-policy = ["cedar-policy", "ring", "serde", "serde_json"]

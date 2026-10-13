@@ -186,6 +186,16 @@ class Suite:
                 if record["fields"].get("prompt_presented") == "true"
             ]
             result.check(f"{session} presented no operator prompt", not presented)
+            # Every run that opened a chain ends with a receipt, foreground
+            # runs included, signed by the key the sealed chain names.
+            status = subprocess.run(
+                [str(self.keel), "status", session], env=self.environment, capture_output=True, text=True
+            )
+            result.check(
+                f"{session} ends with a verified receipt",
+                "state: closed\n" in status.stdout and "receipt: verified after" in status.stdout,
+                status.stdout.strip() or status.stderr.strip(),
+            )
         return text
 
 
@@ -253,6 +263,13 @@ def case_v8_vm(suite: Suite) -> Result:
         manifest = suite.manifest(session) or {}
         result.check("manifest names the vm-v8 isolation", manifest.get("run", {}).get("isolation") == "vm-v8")
         result.check("manifest records the root disk digest", bool(manifest.get("artifacts", {}).get("rootfs")))
+        teardown = [r for r in suite.records(session) if r["event"] == "kernel.run-teardown"]
+        images = [v for k, v in (teardown[0]["fields"] if teardown else {}).items() if k.endswith(".images")]
+        result.check(
+            "the run booted private image copies, removed at teardown",
+            bool(images) and images[0].startswith("ok: "),
+            str(images),
+        )
     return result
 
 

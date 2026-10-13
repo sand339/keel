@@ -82,6 +82,15 @@ impl Teardown {
         self.check(kind, &path.display().to_string(), unmet);
     }
 
+    /// Checks that a path is gone, for what another owner already removed.
+    pub(super) fn check_absent(&mut self, kind: &str, path: &Path) {
+        let unmet = match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            _ => Some("still present".to_owned()),
+        };
+        self.check(kind, &path.display().to_string(), unmet);
+    }
+
     pub(super) fn into_checks(self) -> BTreeMap<String, String> {
         self.checks
     }

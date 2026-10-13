@@ -16,9 +16,9 @@ mod teardown;
 
 use keel_audit::RunKey;
 use keel_input::{
-    GateController, InputEvent, InputGate, PendingApproval, RunTeardownEvent, RuntimeBroker,
-    RuntimeIntent, SECURE_ATTENTION, TerminalControl, TerminalControlReader, encode_resize,
-    push_keystroke, render_gate, safe_text, terminal_gate_channel,
+    GateController, InputEvent, InputGate, PendingApproval, RuntimeBroker, RuntimeIntent,
+    SECURE_ATTENTION, TerminalControl, TerminalControlReader, encode_resize, push_keystroke,
+    render_gate, safe_text, terminal_gate_channel,
 };
 use keel_kernel::GateDecision;
 use nix::sys::signal::{SigSet, Signal};
@@ -44,9 +44,9 @@ use std::{
         mpsc,
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
-use teardown::RunResources;
+use teardown::{RunResources, RunSession};
 
 /// This platform's VM backend, installed beside the runtime.
 const VM_BACKEND: &str = if cfg!(target_os = "linux") {
@@ -248,7 +248,9 @@ fn spawn_gate_receiver(
         Ok(())
     })
 }
-fn begin_shutdown(state: &Arc<Mutex<InteractiveState>>) -> io::Result<()> {
+/// Stops accepting approvals and denies a pending one. Returns whether one
+/// was pending, for the teardown record.
+fn begin_shutdown(state: &Arc<Mutex<InteractiveState>>) -> io::Result<bool> {
     let pending = {
         let mut state = lock_state(state)?;
         state.shutting_down = true;
@@ -256,10 +258,11 @@ fn begin_shutdown(state: &Arc<Mutex<InteractiveState>>) -> io::Result<()> {
         state.approval_notice_shown = false;
         state.pending.take()
     };
+    let denied = pending.is_some();
     if let Some(pending) = pending {
         let _ = pending.decide(GateDecision::Deny);
     }
-    Ok(())
+    Ok(denied)
 }
 fn route_input(
     state: &Arc<Mutex<InteractiveState>>,
@@ -406,15 +409,6 @@ fn spawn_runtime(
     let deno = component_root.join("deno").canonicalize()?;
     let sdk = component_root.join("keel-v8-sdk.ts").canonicalize()?;
     let git = trusted_git_toolchain()?;
-    let kernel = component_root
-        .join("../images/vmlinuz-virt")
-        .canonicalize()?;
-    let initramfs = component_root
-        .join("../images/keel-phase1-initramfs.cpio.zst")
-        .canonicalize()?;
-    let rootfs = component_root
-        .join("../images/keel-phase1-rootfs.squashfs")
-        .canonicalize()?;
     let workspace = broker.workspace().to_path_buf();
     let request = arguments
         .get(2)
@@ -432,6 +426,22 @@ fn spawn_runtime(
     }
     let scratch = resources.scratch(trusted_scratch("runtime")?).to_path_buf();
     broker.record_resource("scratch", scratch.display().to_string())?;
+    // Admission hashes, and the backend boots, private copies of the images,
+    // so a change to the installed files cannot alter what this run boots
+    // after its manifest names it. Copy-on-write makes the copy cheap where
+    // the filesystem supports it. A process of the same user that races the
+    // copy itself is not excluded.
+    let images = resources.images(trusted_scratch("images")?).to_path_buf();
+    broker.record_resource("images", images.display().to_string())?;
+    let stage = |name: &str| -> Result<PathBuf, Box<dyn Error>> {
+        let staged = images.join(name);
+        fs::copy(component_root.join("../images").join(name), &staged)?;
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o400))?;
+        Ok(staged)
+    };
+    let kernel = stage("vmlinuz-virt")?;
+    let initramfs = stage("keel-phase1-initramfs.cpio.zst")?;
+    let rootfs = stage("keel-phase1-rootfs.squashfs")?;
     // The one session file the untrusted runtime may write: the guest's own
     // event stream, beside the audit chain it never touches (PLAN D68).
     let audit = broker.audit_path();
@@ -467,7 +477,7 @@ fn spawn_runtime(
                 [&runtime, allowed_child, &git.executable, &git.exec_root],
                 &git.data_root,
                 &workspace,
-                installation_root,
+                [installation_root, &images],
                 &request,
                 [&scratch, &guest_events],
                 &broker_socket,
@@ -477,6 +487,7 @@ fn spawn_runtime(
         || confine::Confinement {
             read_only: vec![
                 installation_root.to_path_buf(),
+                images.clone(),
                 request.clone(),
                 git.executable.clone(),
                 git.exec_root.clone(),
@@ -743,7 +754,7 @@ fn runtime_sandbox_profile(
     executables: [&Path; 4],
     git_data_root: &Path,
     workspace: &Path,
-    components: &Path,
+    [components, images]: [&Path; 2],
     request: &Path,
     [scratch, guest_events]: [&Path; 2],
     broker: &Path,
@@ -772,6 +783,7 @@ fn runtime_sandbox_profile(
 (allow default)
 (deny file-read* (require-not (require-any
   (literal "/") (literal "/var") (literal "/etc") (literal "/tmp")
+  (subpath "{}") {}
   (subpath "{}") {}
   (subpath "{}") {}
   (literal "{}") (subpath "{}") {}
@@ -803,6 +815,8 @@ fn runtime_sandbox_profile(
         sb_ancestor_literals(workspace),
         sb_string(components),
         sb_ancestor_literals(components),
+        sb_string(images),
+        sb_ancestor_literals(images),
         sb_string(request),
         sb_string(scratch),
         sb_ancestor_literals(scratch),
@@ -1174,8 +1188,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     .map(|key| RunKey::from_hex(&key).map(|key| key.public_hex()))
     .transpose()?;
     let (gate, controller) = terminal_gate_channel();
-    let broker = intent.start_kernel_broker_with_gate(gate)?;
-    let floor_control = broker.control();
+    let started = SystemTime::now();
+    // From here every exit, including each early error below, releases the
+    // run's resources, seals its chain, and leaves a signed receipt.
+    let mut session = RunSession::new(
+        intent.start_kernel_broker_with_gate(gate)?,
+        supervisor_key,
+        started,
+    )?;
+    let floor_control = session.broker().control();
     let (floor_lifts, floor_lift_requests) = mpsc::sync_channel(1);
     let floor_lift_stop = Arc::new(AtomicBool::new(false));
     let worker_stop = Arc::clone(&floor_lift_stop);
@@ -1192,8 +1213,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     });
-    let audit_path = broker.audit_path().to_path_buf();
-    let audit_key_path = broker.audit_key_path().to_path_buf();
+    let audit_path = session.broker().audit_path().to_path_buf();
+    let audit_key_path = session.broker().audit_key_path().to_path_buf();
     let terminal_mode = TerminalMode::enter()?;
     let interactive = Arc::new(Mutex::new(InteractiveState {
         input: InputGate::new(),
@@ -1209,14 +1230,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let renderer_directory = renderer
         .parent()
         .ok_or("renderer has no containing directory")?;
-    // Declared after the broker so that, on every early return, the backend
-    // group is ended before the broker seals the audit chain.
-    let mut resources = RunResources::default();
-    spawn_runtime(&arguments, &broker, &isolation, &mut resources, termination)?;
-    if let Some(socket) = broker.extract_socket_path() {
-        spawn_extract_helper(&broker, &socket, &mut resources, termination)?;
+    {
+        let (broker, resources) = session.parts();
+        spawn_runtime(&arguments, broker, &isolation, resources, termination)?;
+        if let Some(socket) = broker.extract_socket_path() {
+            spawn_extract_helper(broker, &socket, resources, termination)?;
+        }
     }
-    let child = resources.running_backend()?;
+    let child = session.resources.running_backend()?;
     let runtime_group = Pid::from_raw(child.id().cast_signed());
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     let stop_escalated = Arc::new(AtomicBool::new(false));
@@ -1416,8 +1437,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         .join()
         .map_err(|_| "renderer feed thread panicked")?
         .map_err(|error| format!("send guest output to terminal renderer: {error}"))?;
-    let released = resources.release();
-    begin_shutdown(&interactive)?;
+    let mut released = session.resources.release();
+    let denied = begin_shutdown(&interactive)?;
+    released.checks.push(keel_input::TeardownCheck {
+        kind: "pending-approval",
+        detail: if denied { "denied at stop" } else { "none" }.to_owned(),
+        unmet: None,
+    });
     let renderer_status = renderer.wait()?;
     output_thread
         .join()
@@ -1439,12 +1465,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         "error"
     };
-    let _broker_report = broker.shutdown_with_teardown(Some(RunTeardownEvent {
+    session.end(
         stop_reason,
-        escalated: released.escalated || stop_escalated.load(Ordering::Acquire),
-        checks: released.checks.clone(),
-        supervisor_key,
-    }))?;
+        released.escalated || stop_escalated.load(Ordering::Acquire),
+        &released,
+    )?;
     gate_thread
         .join()
         .map_err(|_| "gate receiver thread panicked")??;

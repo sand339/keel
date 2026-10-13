@@ -242,7 +242,7 @@ and a compromised host, hypervisor, or trusted dependency. See the
 - **Chromium updates with the package lock,** and runs without its own sandbox inside the VM.
 - **No live browser view:** use the `agent-browser` CLI and its screenshots.
 - **Platforms:** Apple silicon macOS and Ubuntu 24.04+ (x86_64; ARM64 tested only nested); host V8 is macOS-only.
-- **Crash cleanup:** on macOS a killed runtime's VM runs until `keel recover` (Linux ends it at once); recovery records are unsigned.
+- **Crash cleanup:** on macOS a killed runtime's VM runs until `keel recover` or the opt-in hourly reaper (Linux ends it at once); recovery records are unsigned.
 
 ## Documentation
 

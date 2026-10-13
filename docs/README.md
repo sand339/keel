@@ -35,16 +35,15 @@ Design notes explain individual mechanisms in more detail. They are useful to co
 - [Natural-language policy compiler](design/policy-compiler.md)
 - [V8 isolation modes](design/v8-isolation.md)
 - [Amazon Bedrock SigV4 relay](design/bedrock-sigv4.md)
+- [Linux KVM and Cloud Hypervisor backend](design/linux-platform-support.md)
+- [Canonical run admission and verified teardown](design/run-admission-and-verified-teardown.md)
 
 ### Planned or exploratory work
 
-- [Canonical run admission and verified teardown](design/run-admission-and-verified-teardown.md)
-- [Linux KVM and Cloud Hypervisor backend](design/linux-platform-support.md)
 - [Action-centric provenance, guest confinement, and process attribution](design/guest-confinement-attribution-and-turn-provenance.md)
-- [Distributed evaluation and RL substrate](design/distributed-eval-rl-substrate.md)
 - [Triage reproduction (now the scoped profile)](design/triage-reproduction.md)
 - [Run profiles](design/run-profiles.md)
-- [Render vertex concept](design/render-vertex.md)
+- [Render vertex concept](design/render-vertex.md) (superseded: the guest has its own browser, D59)
 
 The status stated inside a design note can lag the implementation. The [roadmap](ROADMAP.md) is the public list of unfinished commitments.
 

@@ -1,215 +1,152 @@
 # Keel roadmap
 
-This roadmap contains future work only. Completed milestones and implementation history belong in the decision log and Git history.
-
-Roadmap ordering expresses dependency and security priority, not a delivery date.
-
-## Current baseline
-
-Keel already has working macOS microVM execution for Claude and V8 workloads, a lower-assurance opt-in host V8 sandbox, policy and provenance enforcement, trusted approvals, brokered credentials and network access, resource budgets, persistent sessions, and authenticated audit logs.
-
-Those features are documented in [Architecture](ARCHITECTURE.md). They are not roadmap items.
-
-## R0 — Remaining public-source release readiness
-
-Finish preparing the repository so a new user can understand, build, and evaluate it without private context. The repository has an explicit license, contribution guide, private-reporting policy, [pinned-artifact record](ARTIFACTS.md), [release checklist](RELEASE.md), and a known-limitations section in the README.
-
-Remaining deliverables:
-
-- decide the published history and authorship; the release tree itself has been scrubbed of personal and employer references;
-- make setup and doctor output actionable on a clean Apple silicon machine;
-- run the complete CI suite on the release commit, and repeat the secret, dependency, and license review there;
-- add a minimal end-to-end demonstration that produces verifiable audit evidence.
-
-Exit criteria:
-
-- a clean clone can follow the public README without undocumented steps;
-- every public security claim points to implementation or test evidence;
-- no historical plan is presented as current behavior.
-
-## R1 — Canonical run admission and verified teardown
-
-Implement [run admission and verified teardown](design/run-admission-and-verified-teardown.md).
-
-The admission record will bind the authority-bearing inputs before a workload starts, including:
-
-- run and continuation identity;
-- kernel, initramfs, runtime, relay, and policy artifact digests;
-- repository and workspace identity;
-- isolation profile and requested capabilities;
-- provider, credential handle, destinations, and budgets;
-- provenance mode and starting floor.
-
-Checked teardown (D71–D73), a signed supervisor receipt behind a two-stage `keel stop` (D74), and operator-invoked crash recovery from in-chain resource records (D75) are implemented. Detached sessions stop after an idle limit, and `keel run` and `keel attach` recover crashed sessions first (D76). What remains on the teardown side: an opt-in launchd reaper for hosts where Keel goes unused, receipts for foreground runs and for early-error exits, closing relays and dropping connection pools with recorded checks, zeroizing Keel-owned secret buffers, and fault-injection tests.
-
-Exit criteria:
-
-- a run refuses to start when an admitted input changes;
-- status can distinguish active, cleanly closed, interrupted, and stale sessions;
-- stop returns only after observable teardown checks complete;
-- crash-recovery tests cover host, guest, relay, and CLI interruption points;
-- audit verification links admission, runtime events, and teardown.
+Future work only. What is built is in [Architecture](ARCHITECTURE.md); its
+history is in the decision log and Git. Order expresses dependency and security
+priority, not a delivery date.
 
 ## R2 — Security evaluation and reproducible evidence
 
-Turn the current test suite into a publishable evaluation of Keel's claims.
+Turn the test suite into a publishable evaluation of Keel's claims:
 
-Work:
-
-- define adversarial scenarios for prompt injection, credential theft, destination confusion, replay, parser differentials, terminal forgery, provenance laundering, and audit tampering;
-- run the same V8 workloads through both isolation profiles and document the expected boundary difference;
-- add fuzzing for action parsers, relay framing, policy inputs, and audit verification;
-- measure trusted-code size, dependency surface, startup time, steady-state overhead, approval latency, and relay throughput;
-- publish exact source revision, platform, artifact hashes, commands, and raw results;
-- add negative tests demonstrating what Keel intentionally does not prevent;
-- validate Bedrock behavior against a live endpoint and capture protocol fixtures that contain no secrets.
+- adversarial scenarios for prompt injection, credential theft, destination
+  confusion, replay, parser differentials, terminal forgery, provenance
+  laundering, and audit tampering;
+- fuzzing for action parsers, relay framing, policy inputs, and audit
+  verification;
+- measurements of trusted-code size, dependency surface, startup time,
+  overhead, approval latency, and relay throughput, on macOS and Linux;
+- negative tests for what Keel intentionally does not prevent;
+- published source revision, platform, artifact hashes, commands, and raw
+  results.
 
 Exit criteria:
 
 - each threat-model objective has at least one positive and one negative test;
-- published results are reproducible from a clean checkout;
-- benchmark and security claims state their environment and limitations;
-- known failures become tracked issues or explicit residual risks.
+- results reproduce from a clean checkout;
+- every claim states its environment and limitations.
 
-## R3 — Linux isolation backend
+## Enforce the action-centric verdicts
 
-Implement [Linux platform support](design/linux-platform-support.md) with KVM and Cloud Hypervisor.
+Task intent outside branch scopes and the action-centric decision table are
+recorded in shadow and do not decide yet. Promote them once real sessions show
+they help, measured with `keel report --axes`:
 
-The goal is security-property parity, not merely successful boot. Linux should reuse the trusted policy, provenance, approval, audit, and relay semantics while replacing platform-specific VM lifecycle code.
-
-Initial target:
-
-- Ubuntu 24.04 LTS on x86_64;
-- KVM with Cloud Hypervisor;
-- pinned kernel, initramfs, and virtiofsd;
-- interactive and noninteractive Claude sessions;
-- V8 microVM workloads;
-- equivalent no-normal-NIC posture and host-brokered effects.
+- a run of real sessions, on both platforms, where the action-centric rules
+  remove more prompts than they add;
+- no added denial of an action the operator would have approved;
+- each verdict switched on separately, with the rule it replaces retired.
 
 Exit criteria:
 
-- the same boundary and adversarial suites pass on macOS and Linux;
-- platform differences are explicit in status and audit evidence;
-- no container runtime is treated as the primary isolation boundary;
-- Linux artifact admission and teardown meet R1 requirements;
-- setup, doctor, and failure recovery work on a clean supported host.
+- the README no longer lists shadow verdicts as a limitation;
+- `keel report --axes` shows the measured prompt change for each switch.
 
-## R4 — Distributed evaluation and RL substrate
+## Linux and VM tests in CI
 
-Implement the [distributed evaluation and RL substrate](design/distributed-eval-rl-substrate.md) only after R1 through R3.
+Linux end-to-end runs are manual today, and CI boots no VM on either platform.
+Run them on every push:
 
-The fleet control plane must schedule work without becoming the authority oracle. Each worker continues to make sensitive decisions locally through Keel's trusted kernel.
-
-Work:
-
-- signed image, policy, workload, and evaluation bundles;
-- worker identity, admission, lease, and revocation;
-- deterministic noninteractive runs with durable closure;
-- content-addressed evidence upload and verification;
-- resource quotas and tenant separation;
-- resumable scheduling and idempotent result collection;
-- environment reset suitable for evaluation and RL rollouts;
-- aggregation that preserves per-run provenance and audit identity.
+- Linux runners with KVM: `keel setup`, `keel doctor`, a `vm-v8` run, and the
+  fault suite;
+- release tarballs built in CI, installed by a user with no toolchain, and
+  smoke-tested;
+- live model cases on a schedule, behind a credential the repository holds.
 
 Exit criteria:
 
-- a compromised scheduler cannot grant an action that the worker's accepted policy denies;
-- stale or replayed leases cannot start new work;
-- every result is traceable to admitted artifacts and a verified teardown receipt;
-- tenant-isolation and failure-recovery tests run under adversarial scheduling;
-- local single-node operation remains supported and understandable.
+- a change that breaks Linux setup, boot, confinement, or teardown fails CI;
+- every published tarball comes from CI, not a workstation.
 
-## R5 — Optional render vertex
+## Guest patch cadence
 
-Evaluate the [render vertex](design/render-vertex.md) as a separate, narrowly scoped capability for browser-based validation.
+The guest's Chromium, Node, toolchains, and kernel are pinned, so they are
+patched only when the lock is refreshed by hand, and Alpine removes superseded
+versions from its CDN.
 
-This is exploratory and should not be added to the primary workload guest. A browser creates a large, frequently changing attack surface and conflicts with Keel's small-vertex assumptions.
-
-Before implementation:
-
-- define the exact validation use cases and outputs;
-- place the browser in a separate isolation boundary;
-- authenticate every request between the workload, broker, and render vertex;
-- prevent the renderer from inheriting model or repository credentials;
-- define provenance for pages, screenshots, downloads, and browser-produced evidence;
-- establish artifact pinning, patch cadence, and teardown requirements.
+- a scheduled lock refresh for both architectures, rebuilt and run through
+  the E2E suite;
+- security advisories watched for every pinned guest package and VMM binary;
+- the guest kernel and images published with each release, so installs never
+  depend on Alpine keeping an old version.
 
 Exit criteria:
 
-- the render vertex can be disabled without changing core authorization semantics;
-- browser compromise does not expose workload or host credentials;
-- browser evidence is provenance-labeled and audit-linked;
-- its maintenance cost and attack surface are justified by measured use.
+- a published advisory for a pinned component reaches a rebuilt release within
+  a stated window;
+- a fresh setup from any release tag still succeeds after Alpine moves on.
 
-## Cross-cutting future work
+## More harnesses
 
-These items support multiple roadmap stages:
+Only Claude Code runs in the guest. The boundary is meant to be agent-agnostic;
+a second harness tests that claim.
 
-- reproducible and signed release artifacts;
-- software bills of materials and dependency provenance;
-- external audit witnessing and optional hardware-backed key protection;
-- clearer policy-authoring diagnostics and smaller accepted policies;
-- accessible trusted-approval UI and robust terminal repainting;
-- documented compatibility and migration rules for policy, audit, and admission formats.
+- one more coding agent, such as Codex CLI or Gemini CLI, with its provider
+  brokered by the trusted proxy like the existing ones;
+- the same credential, egress, provenance, and audit guarantees, shown by the
+  same E2E cases.
 
-### Per-turn content provenance
+Exit criteria:
 
-Replace the conservative session scalar as an authorization input with a floor
-derived from the exact content in each model request. This work must not infer
-meaning or trust a harness assertion. Its exit criteria are:
+- a second harness passes the E2E suite with no harness-specific trusted code;
+- the README states which guarantees depend on the harness, if any.
 
-- the broker records a content digest, rank, and source for every mediated
-  result it delivers;
-- each model request is walked at the trusted termination point, known content
-  inherits its recorded rank, and unmatched content fails closed at rank 0;
-- assistant blocks carry the floor of the turn that produced them, so summaries
-  retain influence while content removed by compaction can leave the read set;
-- subagent and model-mediated fetch results propagate through the same digest
-  rule;
-- a floor lift vouches for specific source/content references rather than a
-  fungible session number;
-- direct workspace reads have a separately reviewed attestation design, such as
-  admission-time clean-tree blob commitments plus untrusted normalization with
-  only digests crossing into the kernel;
-- replay, compaction, collision-boundary, unmatched-content, and cross-session
-  tests demonstrate fail-closed behavior.
+## Proxy protocol coverage
 
-The first increment, a shadow per-block digest log of every model request and
-response with `keel report --context` (D54), is implemented. It measures
-whether per-turn ranks would differ from the session floor before the larger
-trusted spend.
+The trusted proxy speaks HTTP/1.1 only and relays no WebSockets, so some tools
+and pages do not work.
 
-**Revised order (D79).** A cheaper baseline comes first: an operator-declared
-workspace rank bound to the accepted `HEAD`, with re-acceptance when `HEAD`
-moves and an exact-`HEAD` workspace (W4a); payload checks moved to
-enforcement on a trusted push diff; restart with an operator-written handoff
-in place of taint decay; schema-bounded extraction for reading untrusted
-input without dropping the floor; and lockfile inheritance, `npm ci` first
-(W4b, built as D85). Per-turn provenance, and the exit criteria above, are then built only
-if they beat that baseline on real sessions; dropping them is an acceptable
-outcome. See the [design revision](design/guest-confinement-attribution-and-turn-provenance.md#80-w4a-and-w4b-a-declared-rank-floor-d79).
+- WebSocket relay after the HTTP upgrade is judged, with the frames counted
+  against the same budgets;
+- HTTP/2 where a required endpoint needs it.
 
-## Explicit non-goals
+Exit criteria:
 
-The roadmap does not promise:
+- the payload checks and audit records cover upgraded connections;
+- the README limitation is removed or narrowed.
 
-- autonomous interpretation of whether an action is morally or semantically safe;
-- perfect prevention of data leakage through allowed output;
-- container-only isolation as a substitute for a VM boundary;
-- silent fallback from a failed strong isolation mode to a weaker one;
-- moving natural-language interpretation into the live authorization path;
-- an unbounded plugin system inside the trusted computing base;
-- production multi-tenancy before admission, teardown, evaluation, and Linux parity are complete.
+## Host V8 on Linux
 
-## How proposals enter the roadmap
+The lower-assurance `v8-sandboxed` profile is macOS-only; Linux refuses it.
+Supporting it needs a bubblewrap adapter for the Deno process, the same
+explicit `isolation:v8-sandboxed` grant, and the same conformance tests. Low
+priority while `vm-v8` works on both platforms.
 
-A design note may explore an idea without making it a commitment. To become roadmap work, a proposal should state:
+## Per-turn content provenance (conditional)
 
-1. the user or security problem;
-2. the trust-boundary effect;
-3. dependencies and migration cost;
-4. testable exit criteria;
-5. impact on trusted code and dependencies;
-6. failure and rollback behavior.
+Replace the session floor with one derived from the exact content of each model
+request, but only if it beats the current baseline on real sessions: a declared
+workspace rank, payload checks, restart in place of taint decay, schema-bounded
+extraction, and lockfile inheritance. Measure with `keel report --axes`, whose
+floor-only gates are the most this could remove. Dropping it is an acceptable
+outcome. See the
+[design note](design/guest-confinement-attribution-and-turn-provenance.md#80-w4a-and-w4b-a-declared-rank-floor-d79).
 
-Implemented design notes such as the [policy compiler](design/policy-compiler.md), [V8 isolation](design/v8-isolation.md), and [Bedrock SigV4 relay](design/bedrock-sigv4.md) remain design references rather than future roadmap entries.
+If built, it must fail closed: unmatched content ranks 0, a floor lift vouches
+for specific content rather than a session number, and direct workspace reads
+get their own reviewed attestation design.
+
+## Cross-cutting
+
+- signed release artifacts, and notarized macOS binaries;
+- a software bill of materials and dependency provenance;
+- ARM64 Linux on real hardware (it is tested only in a nested VM);
+- external audit witnessing and optional hardware-backed keys;
+- clearer policy-authoring diagnostics;
+- compatibility and migration rules for policy, audit, and admission formats.
+
+## Non-goals
+
+- judging whether an action is semantically or morally safe;
+- preventing all leakage through permitted output;
+- containers as a substitute for a VM boundary;
+- silently falling back to a weaker isolation mode;
+- natural-language interpretation in the live authorization path;
+- a plugin system inside the trusted computing base;
+- multi-tenant or fleet operation: Keel is a local, single-operator boundary.
+
+## Proposing work
+
+A design note may explore an idea without committing to it. To become roadmap
+work, a proposal states the problem, its effect on the trust boundary, its
+dependencies and cost, testable exit criteria, its trusted-code impact, and its
+failure and rollback behavior.

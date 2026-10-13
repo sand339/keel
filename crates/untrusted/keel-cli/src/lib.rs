@@ -20,7 +20,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub use setup::{DoctorReport, apply_runtime_config, configured_input_runtime, doctor, install};
+pub use setup::{
+    DoctorReport, apply_runtime_config, configured_input_runtime, doctor, install, install_reaper,
+    remove_reaper,
+};
 
 /// Identifies this crate as outside the trusted computing base.
 pub const TRUST_CLASS: &str = "untrusted";
@@ -69,6 +72,11 @@ pub enum Command {
     Setup {
         /// An unpacked release to install instead of building from source.
         prebuilt: Option<PathBuf>,
+    },
+    /// Install or remove the hourly crash-recovery job.
+    Reaper {
+        /// Install it, or remove it.
+        install: bool,
     },
     /// Check the local Keel runtime and current workspace.
     Doctor,
@@ -497,6 +505,12 @@ pub fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Comma
     };
     match command {
         "setup" if arguments.len() == 1 => Ok(Command::Setup { prebuilt: None }),
+        "setup" if arguments.len() == 2 && arguments[1] == "--install-reaper" => {
+            Ok(Command::Reaper { install: true })
+        }
+        "setup" if arguments.len() == 2 && arguments[1] == "--remove-reaper" => {
+            Ok(Command::Reaper { install: false })
+        }
         "setup" if arguments.len() == 3 && arguments[1] == "--prebuilt" => Ok(Command::Setup {
             prebuilt: Some(PathBuf::from(&arguments[2])),
         }),
@@ -3482,7 +3496,7 @@ pub fn write_runtime_request_in(
 /// Returns concise command help.
 #[must_use]
 pub const fn help() -> &'static str {
-    "usage:\n  keel setup [--prebuilt RELEASE_DIR]\n  keel doctor\n  keel mux [--workspace PATH] [RUN_OPTIONS] [-- CLAUDE_ARGS...]\n  keel run [--isolation vm|vm-v8|v8-sandboxed] [--provenance floor|gate-context] [--cpus N] [--memory GIB] [--reuse-connections] [--record-targets] [--ephemeral-workspace] [--schemas BUNDLE.json] [--keep-alive] [--idle-timeout HOURS] [--allow CAPABILITY] [--policy POLICY.json] [--continue SESSION] [--model MODEL] [--auth api-key|bedrock|openrouter] [--profile scoped --scope RULE|none|--scope-file FILE|--report REPORT [--exclude RULE]] [--model-token-budget N] [--model-cost-budget USD] HARNESS [ARGS...]\n  keel policy compile POLICY.md --output DRAFT.json [--translation RESULT.json]\n  keel policy compile --text TEXT --output DRAFT.json [--translation RESULT.json]\n  keel policy accept DRAFT.json --output POLICY.json\n  keel policy show POLICY.json\n  keel policy diff OLD.json NEW.json\n  keel attach SESSION\n  keel stop SESSION\n  keel recover SESSION | --all\n  keel status SESSION [--audit AUDIT.ndjson]\n  keel audit verify AUDIT.ndjson RUN_KEY_FILE\n  keel report AUDIT.ndjson RUN_KEY_FILE [AUDIT.ndjson RUN_KEY_FILE ...]\n  keel report --axes [SESSION ...]\n  keel report --context [SESSION ...]\n  keel export SESSION [SESSION ...] [--out FILE] [--otlp URL]\n  keel floor show SESSION [--state FLOOR.json]\n  keel floor lift SESSION [RANK]\n\ncapabilities:\n  egress:HOST\n  push:branch\n  push:ref:refs/heads/PATTERN\n  pr:create\n  pr:target:BRANCH\n  github:read-private-issues\n  deny:force-push\n  isolation:v8-sandboxed\n  workspace:public\n  workspace:own\n"
+    "usage:\n  keel setup [--prebuilt RELEASE_DIR]\n  keel setup --install-reaper | --remove-reaper\n  keel doctor\n  keel mux [--workspace PATH] [RUN_OPTIONS] [-- CLAUDE_ARGS...]\n  keel run [--isolation vm|vm-v8|v8-sandboxed] [--provenance floor|gate-context] [--cpus N] [--memory GIB] [--reuse-connections] [--record-targets] [--ephemeral-workspace] [--schemas BUNDLE.json] [--keep-alive] [--idle-timeout HOURS] [--allow CAPABILITY] [--policy POLICY.json] [--continue SESSION] [--model MODEL] [--auth api-key|bedrock|openrouter] [--profile scoped --scope RULE|none|--scope-file FILE|--report REPORT [--exclude RULE]] [--model-token-budget N] [--model-cost-budget USD] HARNESS [ARGS...]\n  keel policy compile POLICY.md --output DRAFT.json [--translation RESULT.json]\n  keel policy compile --text TEXT --output DRAFT.json [--translation RESULT.json]\n  keel policy accept DRAFT.json --output POLICY.json\n  keel policy show POLICY.json\n  keel policy diff OLD.json NEW.json\n  keel attach SESSION\n  keel stop SESSION\n  keel recover SESSION | --all\n  keel status SESSION [--audit AUDIT.ndjson]\n  keel audit verify AUDIT.ndjson RUN_KEY_FILE\n  keel report AUDIT.ndjson RUN_KEY_FILE [AUDIT.ndjson RUN_KEY_FILE ...]\n  keel report --axes [SESSION ...]\n  keel report --context [SESSION ...]\n  keel export SESSION [SESSION ...] [--out FILE] [--otlp URL]\n  keel floor show SESSION [--state FLOOR.json]\n  keel floor lift SESSION [RANK]\n\ncapabilities:\n  egress:HOST\n  push:branch\n  push:ref:refs/heads/PATTERN\n  pr:create\n  pr:target:BRANCH\n  github:read-private-issues\n  deny:force-push\n  isolation:v8-sandboxed\n  workspace:public\n  workspace:own\n"
 }
 
 #[cfg(test)]
@@ -3514,6 +3528,14 @@ mod tests {
         assert_eq!(
             parse_args(args(&["setup"])).unwrap(),
             Command::Setup { prebuilt: None }
+        );
+        assert_eq!(
+            parse_args(args(&["setup", "--install-reaper"])).unwrap(),
+            Command::Reaper { install: true }
+        );
+        assert_eq!(
+            parse_args(args(&["setup", "--remove-reaper"])).unwrap(),
+            Command::Reaper { install: false }
         );
         assert_eq!(
             parse_args(args(&["setup", "--prebuilt", "release"])).unwrap(),

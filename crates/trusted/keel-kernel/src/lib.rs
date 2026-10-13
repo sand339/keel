@@ -6808,6 +6808,9 @@ fn broker_loop(
             }
         }
     }
+    // Each client thread owns its guest relay and any upstream connection it
+    // reuses, so once all are joined no relay or pooled connection remains.
+    let open_at_stop = bridges.len();
     for bridge in bridges {
         let _ = bridge.join();
     }
@@ -6823,6 +6826,11 @@ fn broker_loop(
     );
     state.record_enforcement_state_with("shutdown", handoff.boundaries)?;
     if let Some(mut teardown) = handoff.teardown {
+        teardown.checks.push(TeardownCheck {
+            kind: "relay-sessions",
+            detail: format!("{open_at_stop} open at stop, all ended"),
+            unmet: None,
+        });
         teardown.checks.push(release_broker_socket(root));
         state.audit.record_run_teardown(teardown)?;
     }

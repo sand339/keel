@@ -910,6 +910,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]

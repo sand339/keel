@@ -173,11 +173,11 @@ fn release(teardown: &mut Teardown, record: &AuditRecord, pid: u32, expected: &E
     let fields = &record.payload.fields;
     let detail = fields.get("detail").map_or("", String::as_str);
     match fields.get("kind").map(String::as_str) {
-        Some(kind @ ("scratch" | "broker-dir")) => {
-            let (root, prefix) = if kind == "scratch" {
-                (env::temp_dir(), format!("keel-runtime-{pid}-"))
-            } else {
-                (PathBuf::from("/tmp"), format!("keel-kernel-{pid}-"))
+        Some(kind @ ("scratch" | "images" | "broker-dir")) => {
+            let (root, prefix) = match kind {
+                "scratch" => (env::temp_dir(), format!("keel-runtime-{pid}-")),
+                "images" => (env::temp_dir(), format!("keel-images-{pid}-")),
+                _ => (PathBuf::from("/tmp"), format!("keel-kernel-{pid}-")),
             };
             let path = Path::new(detail);
             let owned = root.canonicalize().ok().as_deref() == path.parent()
