@@ -405,7 +405,7 @@ an unadmitted host asks for approval.
 
 ## 6. Use a policy
 
-Keel can compile a constrained natural-language policy outside the trusted computing base. Compilation produces a draft; drafts cannot authorize a run until accepted.
+Keel can compile a constrained natural-language policy outside the trusted computing base. Compilation produces a draft; drafts cannot authorize a run until accepted. The compiler asks Claude Code on the host to translate the text, so `claude` must be installed and signed in on the host (or `KEEL_POLICY_TRANSLATOR` must name another translator); runs themselves need no host Claude Code.
 
 Compile from a file:
 
@@ -679,8 +679,9 @@ browser is first used.
   so a run's scope applies to it.
 - **Background traffic.** Chromium's own background calls to Google are turned
   off, so they cause no prompts.
-- **Protocols.** The proxy speaks HTTP/1.1 and does not yet relay WebSockets,
-  so pages that depend on WebSockets will not work fully.
+- **Protocols.** The proxy speaks HTTP/1.1 and does not relay WebSockets: the
+  upgrade response reaches the page, then the connection closes at the first
+  frame, so pages that depend on WebSockets will not work fully.
 - **Disabled features.** `agent-browser chat`, its cloud providers, and WebMCP
   are not usable: the first two need credentials the guest never holds, and
   WebMCP is switched off because it would surface tools defined by the page.
@@ -906,14 +907,17 @@ Connection reuse can reduce setup overhead:
 keel run --provenance floor --reuse-connections claude
 ~~~
 
-Continue from a prior Keel session when the selected harness supports it:
+Continue a prior Keel session's identity and directory:
 
 ~~~sh
 keel run --continue SESSION --provenance floor claude
 ~~~
 
-Continuation restores harness context, but it does not import authority from
-unsigned `floor.json`. The new broker starts at rank 0 because the workspace is
+The new run joins the session's directory, so its audit chain and receipt sit
+beside the earlier ones. The guest's own state does not carry over: each VM
+starts from the read-only image, so Claude Code begins a new conversation. Put
+anything the next run needs in the workspace. Continuation does not import
+authority from unsigned `floor.json`. The new broker starts at rank 0 because the workspace is
 directly exposed. Old approvals, grants, and lifts are not reusable
 authorizations; the stored history remains evidence for inspection only.
 

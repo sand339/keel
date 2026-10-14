@@ -21,6 +21,8 @@ use keel_input::{
     render_gate, safe_text, terminal_gate_channel,
 };
 use keel_kernel::GateDecision;
+#[cfg(target_os = "macos")]
+use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 use nix::sys::signal::{SigSet, Signal};
 use nix::unistd::{Pid, dup, getpgrp, tcgetpgrp};
 use std::{
@@ -48,6 +50,7 @@ use std::{
 };
 use teardown::{RunResources, RunSession};
 
+const HOST_V8_ON_LINUX: &str = "the host V8 profile has no Linux confinement yet; use vm-v8";
 /// This platform's VM backend, installed beside the runtime.
 const VM_BACKEND: &str = if cfg!(target_os = "linux") {
     "keel-ch"
@@ -188,6 +191,16 @@ fn lock_state(
         .lock()
         .map_err(|_| io::Error::other("trusted terminal state is unavailable"))
 }
+/// The renderer exits once its guest output ends, which can be just before the
+/// session marks itself shutting down. A notice it can no longer show is not
+/// an error; the trusted decision is unaffected.
+fn renderer_gone_is_harmless(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        other => other,
+    }
+}
+
 fn spawn_gate_receiver(
     controller: GateController,
     state: Arc<Mutex<InteractiveState>>,
@@ -213,11 +226,13 @@ fn spawn_gate_receiver(
                     drop(state);
                     let mut terminal = io::stdout().lock();
                     clear_cancelled_approval_screen(&mut terminal, trusted_screen, || {
-                        set_approval_notice(renderer.as_ref(), false)?;
-                        if let Some(renderer) = renderer.as_ref() {
-                            renderer_message(renderer, &[RENDER_REPAINT])?;
-                        }
-                        Ok(())
+                        renderer_gone_is_harmless(
+                            set_approval_notice(renderer.as_ref(), false).and_then(|()| {
+                                renderer.as_ref().map_or(Ok(()), |renderer| {
+                                    renderer_message(renderer, &[RENDER_REPAINT])
+                                })
+                            }),
+                        )
                     })?;
                     continue;
                 }
@@ -240,7 +255,7 @@ fn spawn_gate_receiver(
             let renderer = state.renderer.clone();
             state.approval_notice_shown = true;
             drop(state);
-            set_approval_notice(renderer.as_ref(), true)?;
+            renderer_gone_is_harmless(set_approval_notice(renderer.as_ref(), true))?;
             let mut terminal = io::stdout().lock();
             terminal.write_all(APPROVAL_TITLE_NOTICE)?;
             terminal.flush()?;
@@ -403,7 +418,7 @@ fn spawn_runtime(
         .ok_or("runtime backend has no parent directory")?;
     let installation_root = component_root.parent().unwrap_or(component_root);
     if cfg!(target_os = "linux") && isolation == "v8-sandboxed" {
-        return Err("the host V8 profile has no Linux confinement yet; use vm-v8".into());
+        return Err(HOST_V8_ON_LINUX.into());
     }
     let vm_backend = component_root.join(VM_BACKEND).canonicalize()?;
     let deno = component_root.join("deno").canonicalize()?;
@@ -628,7 +643,10 @@ fn bundled_component(name: &str, development_override: &str) -> Result<PathBuf, 
     {
         return Ok(PathBuf::from(path).canonicalize()?);
     }
-    let path = env::current_exe()?.with_file_name(name).canonicalize()?;
+    let path = env::current_exe()?.with_file_name(name);
+    let path = path
+        .canonicalize()
+        .map_err(|_| format!("bundled component is missing: {}", path.display()))?;
     if !path.is_file() {
         return Err(format!("bundled component is missing: {}", path.display()).into());
     }
@@ -1029,6 +1047,61 @@ fn terminal_dimensions() -> Option<(u16, u16)> {
     Some((rows, columns))
 }
 
+/// Waits for the operator's terminal to be resized.
+///
+/// Linux holds a blocked SIGWINCH pending for `sigwait`. macOS discards a
+/// signal whose disposition is the default "ignore" before it is ever held,
+/// so no resize would reach `sigwait` there; a kqueue signal filter records
+/// every attempt to deliver one, ignored or not.
+pub(crate) struct ResizeSignal {
+    #[cfg(not(target_os = "macos"))]
+    blocked: SigSet,
+    #[cfg(target_os = "macos")]
+    queue: Kqueue,
+}
+
+#[cfg(target_os = "macos")]
+fn resize_event() -> KEvent {
+    let signal = Signal::SIGWINCH as usize;
+    KEvent::new(
+        signal,
+        EventFilter::EVFILT_SIGNAL,
+        EvFlags::EV_ADD,
+        FilterFlag::empty(),
+        0,
+        0,
+    )
+}
+
+impl ResizeSignal {
+    /// Blocks SIGWINCH in the calling thread, so every thread spawned after
+    /// it inherits the block, and starts recording resizes.
+    pub(crate) fn new() -> nix::Result<Self> {
+        let mut blocked = SigSet::empty();
+        blocked.add(Signal::SIGWINCH);
+        blocked.thread_block()?;
+        #[cfg(target_os = "macos")]
+        {
+            let queue = Kqueue::new()?;
+            queue.kevent(&[resize_event()], &mut [], None)?;
+            Ok(Self { queue })
+        }
+        #[cfg(not(target_os = "macos"))]
+        Ok(Self { blocked })
+    }
+
+    /// Returns once the terminal has been resized since the last return.
+    pub(crate) fn wait(&self) -> nix::Result<()> {
+        #[cfg(target_os = "macos")]
+        return self
+            .queue
+            .kevent(&[], &mut [resize_event()], None)
+            .map(drop);
+        #[cfg(not(target_os = "macos"))]
+        self.blocked.wait().map(drop)
+    }
+}
+
 /// Stops SIGWINCH, SIGHUP, and SIGTERM from being delivered to a handler so
 /// each can be waited for, and returns the resize and termination sets.
 ///
@@ -1037,10 +1110,8 @@ fn terminal_dimensions() -> Option<(u16, u16)> {
 /// process in the runtime chain below this one handles SIGWINCH; each is either
 /// a byte filter or the VM host, and this process alone owns the operator's tty.
 /// Children that must stay stoppable are spawned through [`spawn_stoppable`].
-fn block_handled_signals() -> Result<(SigSet, SigSet), Box<dyn Error>> {
-    let mut winch = SigSet::empty();
-    winch.add(Signal::SIGWINCH);
-    winch.thread_block()?;
+fn block_handled_signals() -> Result<(ResizeSignal, SigSet), Box<dyn Error>> {
+    let winch = ResizeSignal::new()?;
     let mut termination = SigSet::empty();
     termination.add(Signal::SIGHUP);
     termination.add(Signal::SIGTERM);
@@ -1087,7 +1158,7 @@ fn renderer_resize(renderer: &RendererControl, rows: u16, columns: u16) -> io::R
 }
 
 fn spawn_resize_forwarder(
-    winch: SigSet,
+    winch: ResizeSignal,
     guest_input: Arc<Mutex<ChildStdin>>,
     renderer: RendererControl,
 ) {
@@ -1176,6 +1247,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         terminal_is_owned_by_this_process_group(),
     );
     if isolation == "v8-sandboxed" {
+        // Refuse before asking: a confirmation the run can never honor
+        // only teaches the operator to type it.
+        if cfg!(target_os = "linux") {
+            return Err(HOST_V8_ON_LINUX.into());
+        }
         confirm_host_v8_admission(trusted_approval_input)?;
     }
     confirm_task_admission(&mut intent, trusted_approval_input)?;
@@ -1470,11 +1546,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         released.escalated || stop_escalated.load(Ordering::Acquire),
         &released,
     )?;
-    gate_thread
+    let gate_result = gate_thread
         .join()
-        .map_err(|_| "gate receiver thread panicked")??;
+        .map_err(|_| "gate receiver thread panicked")?;
     drop(terminal_mode);
+    // The chain is sealed: name it even if the gate thread failed.
     report_audit_paths(&audit_path, &audit_key_path);
+    gate_result?;
     if !status.success() && !orderly_shutdown {
         return Err(format!("runtime exited with {status}").into());
     }

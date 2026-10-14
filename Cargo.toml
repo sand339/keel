@@ -26,7 +26,7 @@ publish = false
 [workspace.dependencies]
 cedar-policy = { version = "=4.13.0", default-features = false }
 libc = "=0.2.189"
-nix = { version = "=0.30.1", features = ["fs", "poll", "process", "signal", "socket", "term"] }
+nix = { version = "=0.30.1", features = ["event", "fs", "poll", "process", "signal", "socket", "term"] }
 pem = "=4.0.0"
 rcgen = { version = "=0.14.10", default-features = false, features = ["pem", "ring"] }
 rmcp = { version = "=3.4.0", default-features = false, features = ["client", "macros", "server", "transport-async-rw"] }

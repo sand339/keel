@@ -25,6 +25,9 @@ When documents disagree, current source and tests take precedence. Architecture 
   notes.
 - [End-to-end acceptance](E2E.md) — the headless suite and the manual runbook
   for operator decisions.
+- [Manual acceptance tests](MANUAL-TESTS.md) — a hands-on checklist of every
+  user flow: install, login, launch, work, approvals, recovery, and
+  adversarial checks from inside the guest.
 
 ## Design notes
 

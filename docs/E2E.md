@@ -82,6 +82,9 @@ is covered in-process by `broker_shutdown_propagates_durable_audit_failure`.
 
 ## 3. Manual runbook
 
+The cases below are the release minimum. For a full hands-on pass over every
+flow and option, use [Manual acceptance tests](MANUAL-TESTS.md).
+
 Run each case from an interactive terminal in a throwaway Git workspace.
 - **Keys.** When an approval is pending, the terminal title reads "Keel
   approval". Press `Ctrl-]` to open the trusted screen, then:

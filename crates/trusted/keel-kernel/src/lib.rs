@@ -4276,8 +4276,10 @@ fn model_path_allowed(model_host: &str, method: &str, path: &str) -> bool {
         return false;
     }
     let path = path.split('?').next().unwrap_or(path);
-    if model_host == "api.anthropic.com" {
-        return path == "/v1/messages";
+    match model_host {
+        "api.anthropic.com" => return path == "/v1/messages",
+        "openrouter.ai" => return path == "/api/v1/messages",
+        _ => {}
     }
     path.starts_with("/model/")
         && (path.ends_with("/invoke") || path.ends_with("/invoke-with-response-stream"))

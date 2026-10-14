@@ -9,8 +9,8 @@ use super::{
     ModelBudgetLimits, ModelBudgetRequest, Policy, PrincipalId, Processed, ProtectedState,
     ProvenanceMode, REPEATED_DENIAL_RULE, ReportedOutcomeEvent, SessionFacts, SessionSnapshot,
     SessionState, SourceRef, Stamped, StructuralRejectionEvent, Target, TerminalGate, Violation,
-    action_target_hash, intent_verdict, record_egress_failure, sha256, terminal_gate_channel,
-    violation_rules,
+    action_target_hash, intent_verdict, model_path_allowed, record_egress_failure, sha256,
+    terminal_gate_channel, violation_rules,
 };
 use std::{
     collections::BTreeSet,
@@ -2995,5 +2995,30 @@ fn a_pinned_fetch_keeps_the_declared_rank_only_for_the_pinned_bytes() {
         let report = broker.shutdown().unwrap();
         assert_eq!(*seen.lock().unwrap(), Some(pinned), "{path}");
         assert_eq!(report.session_facts.floor, floor, "{path} {body_sha512:?}");
+    }
+}
+
+#[test]
+fn each_provider_admits_only_its_own_message_path() {
+    for (host, path) in [
+        ("api.anthropic.com", "/v1/messages"),
+        ("api.anthropic.com", "/v1/messages?beta=true"),
+        ("openrouter.ai", "/api/v1/messages"),
+        ("openrouter.ai", "/api/v1/messages?beta=true"),
+        ("bedrock-runtime.us-west-2.amazonaws.com", "/model/m/invoke"),
+    ] {
+        assert!(model_path_allowed(host, "POST", path), "{host} {path}");
+    }
+    for (host, method, path) in [
+        ("openrouter.ai", "GET", "/api/v1/messages"),
+        ("openrouter.ai", "POST", "/api/v1/chat/completions"),
+        ("openrouter.ai", "POST", "/v1/messages"),
+        ("api.anthropic.com", "POST", "/api/v1/messages"),
+        ("api.anthropic.com", "POST", "/v1/complete"),
+    ] {
+        assert!(
+            !model_path_allowed(host, method, path),
+            "{host} {method} {path}"
+        );
     }
 }

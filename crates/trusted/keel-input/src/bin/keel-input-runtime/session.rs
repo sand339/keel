@@ -15,7 +15,7 @@ use nix::{
     libc,
     poll::{PollFd, PollFlags, poll},
     pty::{Winsize, openpty},
-    sys::signal::{SigSet, Signal, killpg},
+    sys::signal::{Signal, killpg},
     sys::termios::{InputFlags, LocalFlags, OutputFlags, SetArg, cfmakeraw, tcgetattr, tcsetattr},
     unistd::Pid,
 };
@@ -177,11 +177,9 @@ fn terminal_size() -> Option<(u16, u16)> {
 /// session. An operator who attaches from a different window, or who resizes
 /// this one, would otherwise leave the guest painting to the old geometry.
 fn spawn_resize_reporter(mut stream: UnixStream) -> io::Result<()> {
-    let mut winch = SigSet::empty();
-    winch.add(Signal::SIGWINCH);
     // Blocking the signal in this thread before any other is spawned is what
     // makes `wait` the only consumer of it.
-    winch.thread_block().map_err(io::Error::other)?;
+    let winch = super::ResizeSignal::new().map_err(io::Error::other)?;
     if let Some((rows, columns)) = terminal_size()
         && let Err(error) = stream
             .write_all(&encode_resize(rows, columns))

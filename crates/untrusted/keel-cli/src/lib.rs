@@ -1941,13 +1941,22 @@ fn session_state(audit: &Path, sealed: bool) -> &'static str {
             .parse::<u32>()
             .ok()
     });
+    // Linux `ps` cuts names to 15 bytes, so there the kernel's link to the
+    // executable names the writer; macOS `ps` reports its path.
     let alive = pid.is_some_and(|pid| {
-        ProcessCommand::new("/bin/ps")
-            .args(["-p", &pid.to_string(), "-o", "comm="])
-            .output()
-            .is_ok_and(|output| {
-                String::from_utf8_lossy(&output.stdout).contains("keel-input-runtime")
+        if cfg!(target_os = "linux") {
+            fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| {
+                exe.file_name()
+                    .is_some_and(|name| name == "keel-input-runtime")
             })
+        } else {
+            ProcessCommand::new("/bin/ps")
+                .args(["-p", &pid.to_string(), "-o", "comm="])
+                .output()
+                .is_ok_and(|output| {
+                    String::from_utf8_lossy(&output.stdout).contains("keel-input-runtime")
+                })
+        }
     });
     if alive { "active" } else { "interrupted" }
 }

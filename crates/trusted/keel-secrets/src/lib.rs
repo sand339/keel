@@ -36,7 +36,10 @@ pub const TRUSTED_CRATE: &str = "keel-secrets";
 
 const MAX_HTTP_REQUEST: usize = 1024 * 1024;
 const MAX_HTTP_RESPONSE: u64 = 16 * 1024 * 1024;
-const MAX_RESOLVED_ADDRESSES: usize = 8;
+/// Bounds the work one DNS answer can cause. Large CDNs answer with a dozen
+/// addresses per family (Cloudflare gives 24 for `registry.npmjs.org`);
+/// every address is still checked against the forbidden ranges.
+const MAX_RESOLVED_ADDRESSES: usize = 64;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REUSE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// A large model request can take minutes before its first streamed event,

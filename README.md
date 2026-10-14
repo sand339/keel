@@ -238,7 +238,7 @@ and a compromised host, hypervisor, or trusted dependency. See the
 - **Payload checks are verbatim:** paraphrased or re-encoded content is not detected.
 - **Extraction is schema-bounded:** tasks that need an issue's prose still read it raw.
 - **Shadow verdicts:** task intent and per-turn context are measured, not enforced.
-- **HTTP/1.1 only:** no WebSockets through the proxy.
+- **HTTP/1.1 only:** WebSocket upgrades close at the first frame.
 - **Chromium updates with the package lock,** and runs without its own sandbox inside the VM.
 - **No live browser view:** use the `agent-browser` CLI and its screenshots.
 - **Platforms:** Apple silicon macOS and Ubuntu 24.04+ (x86_64; ARM64 tested only nested); host V8 is macOS-only.

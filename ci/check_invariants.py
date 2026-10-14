@@ -59,7 +59,8 @@ CRATE_BUDGETS = {
     # D83: the extraction helper's channel, its job queue and frames, binding
     # each helper request to its job, and validating the result before delivery.
     # R1: the teardown record counts the relay sessions open at stop.
-    "keel-kernel": 6_037,
+    # Manual acceptance: OpenRouter's message path is a model request.
+    "keel-kernel": 6_039,
     # D22, D23, D25, and D28 moved 211 unclaimed lines from this evaluator-only
     # crate.
     # D31: immutable built-in restrictions beneath accepted policy.
@@ -175,7 +176,12 @@ CRATE_BUDGETS = {
     # unsupervised run's own signed receipt, and a pending approval's denial
     # at stop recorded in the teardown record, and admission hashing and the
     # backend booting private copies of the boot images.
-    "keel-input": 5_120,
+    # Manual acceptance: host V8 refused on Linux before its confirmation, and
+    # a renderer gone at shutdown no longer fails a run or hides its audit,
+    # and an early error names a missing component and the sealed audit.
+    # macOS resizes reach the guest: a kqueue signal filter replaces sigwait,
+    # which never sees a SIGWINCH there.
+    "keel-input": 5_195,
 }
 SENSITIVE_TYPES = {
     "keel-secrets": [

@@ -214,12 +214,17 @@ impl RunSession {
 impl Drop for RunSession {
     /// An early error: release, seal with stop reason `error`, and receipt.
     fn drop(&mut self) {
-        if self.broker.is_some() {
-            let released = self.resources.release();
-            if let Err(error) = self.end("error", released.escalated, &released) {
-                eprintln!("keel: {error}");
-            }
+        let Some(broker) = &self.broker else { return };
+        let (audit, key) = (
+            broker.audit_path().to_owned(),
+            broker.audit_key_path().to_owned(),
+        );
+        let released = self.resources.release();
+        if let Err(error) = self.end("error", released.escalated, &released) {
+            eprintln!("keel: {error}");
         }
+        // The chain is sealed: name it, as the normal ending does.
+        super::report_audit_paths(&audit, &key);
     }
 }
 

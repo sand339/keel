@@ -7,7 +7,10 @@
 # which are raw libc calls, and I2 forbids unsafe in trusted crates — so the safe
 # wrapper is the only way a trusted crate can do signal work at all. Moving it out
 # is not available either: the forwarder reads the operator tty, which I9 reserves
-# to keel-input exclusively. Pinned at =0.30.1 in the workspace manifest.
+# to keel-input exclusively. Pinned at =0.30.1 in the workspace manifest. On
+# macOS the wait is a kqueue signal filter (nix's `event` feature) instead,
+# because macOS discards a SIGWINCH left at its default disposition before
+# sigwait can see it.
 #
 # keel-kernel/nix: the broker polls the already-connected Unix relay descriptor
 # for hangup while a trusted approval is pending. Safe `poll(2)` access lets a
