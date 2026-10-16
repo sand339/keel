@@ -81,10 +81,13 @@ and its `.sha256` from the
 ~~~sh
 shasum -a 256 -c keel-VERSION-PLATFORM.tar.gz.sha256   # sha256sum -c on Linux
 tar -xzf keel-VERSION-PLATFORM.tar.gz
-./keel-VERSION-PLATFORM/install.sh                      # checks every file, then installs
+./keel-VERSION-PLATFORM/install.sh                      # checks every file for damage, then installs
 export PATH="$HOME/.local/bin:$PATH"
 keel doctor
 ~~~
+
+The checksums detect a damaged download. They are not signatures: they come
+from the same place as the tarball, so they do not prove who built it.
 
 On Ubuntu the host still needs KVM, your user in the `kvm` group, and
 `bubblewrap` (`sudo apt-get install -y bubblewrap`). Releases are built on

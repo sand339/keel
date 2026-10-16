@@ -61,6 +61,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         action_id: 1,
                         action_class: "GitPush".to_owned(),
                         exact_target: b"push refs/heads/main".to_vec(),
+                        summary: Vec::new(),
                         reasons: Vec::new(),
                         floor_history: vec![b"Host(evil.example,/issue/1)".to_vec()],
                         session_grant: None,

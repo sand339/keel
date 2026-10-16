@@ -89,13 +89,17 @@ git push private main
 git push public refs/heads/public:refs/heads/main
 ```
 
-Release tarballs are built per platform, on that platform, from a runtime
-`keel setup` installed from the release commit:
+Release tarballs are built per platform, on that platform, from a clean
+checkout of the release commit. The script refuses uncommitted changes and
+runs `keel setup` itself into a fresh directory, so nothing installed earlier
+ships:
 
 ```sh
-keel setup                       # from the checkout, on each platform
 ./spikes/package-release.sh      # writes target/dist/keel-VERSION-PLATFORM.tar.gz and .sha256
 ```
+
+The `.sha256` and the bundled `SHA256SUMS` detect a damaged download; they
+are not signatures.
 
 Set `KEEL_RELEASE_VERSION` (for example `0.1.0`) for a tagged release; it
 defaults to the workspace version and commit. Before publishing, install the

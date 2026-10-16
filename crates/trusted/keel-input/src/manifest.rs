@@ -6,7 +6,7 @@
 //! files itself after admission.
 
 use keel_kernel::RunAdmittedEvent;
-use keel_provenance::trusted_git_command;
+use keel_provenance::{content_filter_overrides, trusted_git_command};
 use ring::digest::{Context, SHA256, digest};
 use serde_json::Value;
 use std::{fmt::Write as _, fs::File, io::Read as _, path::Path};
@@ -34,7 +34,16 @@ pub fn workspace_state(workspace: &Path) -> (String, Option<bool>, Option<String
     };
     let head =
         git(&["rev-parse", "--verify", "--quiet", "HEAD"]).unwrap_or_else(|| "unborn".into());
-    let dirty = git(&["status", "--porcelain"]).map(|status| !status.is_empty());
+    // Status re-hashes changed files through any configured content filter,
+    // which would run repository-chosen commands here, on the host. Submodules
+    // carry their own configuration, so they are not descended into.
+    let dirty = content_filter_overrides(workspace)
+        .ok()
+        .and_then(|overrides| {
+            let mut arguments = overrides.iter().map(String::as_str).collect::<Vec<_>>();
+            arguments.extend(["status", "--porcelain", "--ignore-submodules=all"]);
+            git(&arguments).map(|status| !status.is_empty())
+        });
     let origin =
         git(&["config", "--get", "remote.origin.url"]).map(|url| match url.split_once("://") {
             Some((scheme, rest)) => format!(

@@ -46,10 +46,13 @@ impl Confinement {
     /// and pathname Unix sockets it can see, and sees only its own processes.
     /// The environment passes through from the launcher, which clears it.
     /// Capabilities are dropped, `no_new_privs` is set by bubblewrap itself,
-    /// and the child is killed if the launcher dies.
+    /// and the child is killed if the launcher dies. It runs in a new session
+    /// with no controlling terminal, so it cannot reach the operator's tty to
+    /// inject keystrokes through `TIOCSTI` or paint over the trusted screen.
     pub(super) fn arguments(&self, program: &Path, arguments: &[OsString]) -> Vec<OsString> {
         let mut argv: Vec<OsString> = [
             "--die-with-parent",
+            "--new-session",
             "--unshare-all",
             "--cap-drop",
             "ALL",

@@ -200,11 +200,18 @@ supervisor finds the owner through `/proc/net/tcp` and per-process file
 tables, walks its ancestry, and marks every ancestor that runs code the
 workload could have written:
 
-- executables or scripts under the workspace, `/tmp`, `/var/tmp`, or `/root`;
-- anything running from inside a `node_modules` under one of those roots.
+- an executable under the workspace, `/tmp`, `/var/tmp`, or `/root`;
+- any file under one of those roots named as an argument, which covers Git
+  hooks and scripts with or without a suffix;
+- a build or package runner (make, npm, cargo, and others) started in one of
+  those roots, or anything running from inside a `node_modules` there;
+- a process reparented to PID 1, which hides the ancestry that started it,
+  other than Keel's own tmux server.
 
 Read-only system paths, such as the guest's bundled browser server, are not
-workspace code: Landlock keeps the workload from writing them.
+workspace code: Landlock keeps the workload from writing them. The supervisor
+reads argv, which a process can rewrite, and cannot tell a command started
+through Keel's tmux server from one the harness started.
 
 The relay sends this ahead of its traffic as an origin frame. The host
 forwards it to the kernel, which stamps it on the action as a

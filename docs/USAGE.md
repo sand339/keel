@@ -47,7 +47,7 @@ export KEEL_BIN_DIR="$HOME/bin"
 export KEEL_CONFIG="$HOME/.keel/config.json"
 ~~~
 
-When an already-installed Keel binary is used from outside the checkout, KEEL_SOURCE_DIR can point setup at the source tree.
+Setup builds from the checkout the running `keel` was built from, wherever it is run; the directory it is run in plays no part. KEEL_SOURCE_DIR points it at another checkout, and a release install uses `keel setup --prebuilt RELEASE_DIR`.
 
 Re-run setup after changing guest components, trusted relays, the V8 runtime,
 the launcher, or the terminal renderer. Already-running sessions retain the
@@ -426,10 +426,11 @@ keel policy show .keel/policy.draft.json
 keel policy diff .keel/old-policy.json .keel/policy.draft.json
 ~~~
 
-Accept the exact reviewed artifact:
+Accept the exact reviewed artifact, naming the hash its review printed. A
+draft rewritten since you read it has another hash and is refused:
 
 ~~~sh
-keel policy accept .keel/policy.draft.json --output .keel/policy.json
+keel policy accept .keel/policy.draft.json --hash HASH --output .keel/policy.json
 ~~~
 
 Use it:
@@ -444,7 +445,7 @@ refuses any artifact whose hash is not in that ledger, because the artifact
 usually lives in the guest-writable workspace and its own status and hash can
 be recomputed by anything that can edit it. An artifact accepted before the
 ledger existed, or on another host, is recorded by running `keel policy accept`
-on it again after review.
+on it again after review, with the hash `keel policy show` prints.
 
 The compiler emits a closed intermediate representation and differential policy artifacts. Acceptance binds the reviewed artifact by hash; it does not prove that ambiguous natural language expressed the operator's intent.
 Its repository-scoped grants include `push:branch`, `pr:create`, the

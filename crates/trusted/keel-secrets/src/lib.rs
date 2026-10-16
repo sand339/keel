@@ -336,8 +336,13 @@ impl SystemEgressConnector {
                     .and_then(|(host, path)| github_repository_from_git_scope(host, path))
             });
         let mut vault = CredentialVault::new();
-        vault.signer = signer;
         let mut redactions = Vec::new();
+        // The signer's own secret and session token are redacted like every
+        // bound credential (KSR-058).
+        if let Some(signer) = &signer {
+            signer.redactions(&mut redactions)?;
+        }
+        vault.signer = signer;
         let git_scope = configure_git_binding(
             &mut vault,
             &mut redactions,
@@ -371,13 +376,13 @@ impl SystemEgressConnector {
                 &["POST"][..],
             ),
         ] {
-            let Some(credential) = credential else {
+            let Some(credential) = credential.map(Zeroizing::new) else {
                 continue;
             };
             if credential.is_empty() || credential.chars().any(char::is_control) {
                 return Err(format!("{host} credential is malformed"));
             }
-            redactions.extend([credential.clone(), sentinel.to_owned()]);
+            redactions.extend([(*credential).clone(), sentinel.to_owned()]);
             vault.insert(
                 CredentialBinding::new(
                     CredentialScope {
@@ -386,7 +391,7 @@ impl SystemEgressConnector {
                         path_prefix: path.to_owned(),
                     },
                     SecretBytes::new(sentinel.as_bytes().to_vec()),
-                    SecretBytes::new(credential.into_bytes()),
+                    SecretBytes::new(credential.as_bytes().to_vec()),
                 )
                 .map_err(|error| error.to_string())?,
             );
@@ -414,6 +419,8 @@ fn configure_git_binding(
     if !enabled || (credential.is_none() && host.is_none() && path.is_none()) {
         return Ok(None);
     }
+    // Wiped on every return, the refusals below included (KSR-060).
+    let credential = credential.map(Zeroizing::new);
     let (Some(credential), Some(host), Some(path)) = (credential, host, path) else {
         return Err("Git authorization, host, and path must be configured together".into());
     };
@@ -427,7 +434,7 @@ fn configure_git_binding(
         return Err("Git credential scope is malformed".to_owned());
     }
     let sentinel = SystemEgressConnector::GIT_SENTINEL.to_owned();
-    redactions.extend([credential.clone(), sentinel.clone()]);
+    redactions.extend([(*credential).clone(), sentinel.clone()]);
     vault.insert(
         CredentialBinding::new(
             CredentialScope {
@@ -440,7 +447,7 @@ fn configure_git_binding(
                 path_prefix: path,
             },
             SecretBytes::new(sentinel.as_bytes().to_vec()),
-            SecretBytes::new(credential.into_bytes()),
+            SecretBytes::new(credential.as_bytes().to_vec()),
         )
         .map_err(|error| error.to_string())?,
     );
@@ -454,14 +461,14 @@ fn configure_github_bindings(
     authorities: GitHubAuthorities,
     repository: Option<&str>,
 ) -> Result<(), String> {
-    let Some(credential) = credential else {
+    let Some(credential) = credential.map(Zeroizing::new) else {
         return Ok(());
     };
     if credential.is_empty() || credential.chars().any(char::is_control) {
         return Err("api.github.com credential is malformed".to_owned());
     }
     redactions.extend([
-        credential.clone(),
+        (*credential).clone(),
         SystemEgressConnector::GITHUB_SENTINEL.to_owned(),
     ]);
     let mut insert = |methods: &[&str], path_prefix: String| -> Result<(), String> {
@@ -1057,17 +1064,25 @@ impl CredentialVault {
     }
 }
 
+/// Only the exact spelling of each GitHub effect carries the credential: the
+/// kernel requires its one-use permit for that spelling, so a variant it does
+/// not recognize, such as a trailing or doubled slash, must not be authorized
+/// here either (KSR-039).
 fn github_api_path(method: &str, path: &str, scope_prefix: &str) -> bool {
     let path = path.split('?').next().unwrap_or(path);
-    let fields = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    let Some(fields) = path
+        .strip_prefix('/')
+        .map(|path| path.split('/').collect::<Vec<_>>())
+    else {
+        return false;
+    };
+    let name = |field: &str| !field.is_empty() && !field.contains('%');
     match (method, fields.as_slice()) {
-        ("POST", ["repos", owner, repository, "pulls"]) => {
-            !owner.is_empty() && !repository.is_empty()
-        }
+        ("POST", ["repos", owner, repository, "pulls"]) => name(owner) && name(repository),
         ("GET", ["repos", owner, repository, "issues", number]) => {
             scope_prefix != "/repos"
-                && !owner.is_empty()
-                && !repository.is_empty()
+                && name(owner)
+                && name(repository)
                 && number.parse::<u64>().is_ok_and(|number| number > 0)
         }
         _ => false,
@@ -1141,7 +1156,11 @@ fn replace_credential_header(
     let credential_text =
         std::str::from_utf8(credential).map_err(|error| TlsError::new("credential", error))?;
     let mut matched = false;
-    let mut output = Vec::with_capacity(request.len() + credential.len());
+    // Room for the credential and for the space normalization can add to each
+    // header, so the buffer is never reallocated after the credential is in
+    // it, which would free an unwiped copy (KSR-060).
+    let mut output =
+        Vec::with_capacity(request.len() + credential.len() + headers.matches("\r\n").count() + 1);
     output.extend_from_slice(request_line.as_bytes());
     output.extend_from_slice(b"\r\n");
     for line in lines {
@@ -1152,9 +1171,9 @@ fn replace_credential_header(
             name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("x-api-key");
         let trimmed = value.trim();
         let replacement = if trimmed == sentinel_text {
-            Some(credential_text.to_owned())
+            Some(Zeroizing::new(credential_text.to_owned()))
         } else if let Some(token) = trimmed.strip_prefix("Bearer ") {
-            (token == sentinel_text).then(|| format!("Bearer {credential_text}"))
+            (token == sentinel_text).then(|| Zeroizing::new(format!("Bearer {credential_text}")))
         } else {
             None
         };
@@ -1204,6 +1223,14 @@ fn request_line(request: &[u8]) -> Result<(&str, &str), TlsError> {
         .ok_or_else(|| TlsError("HTTP version is missing".to_owned()))?;
     if fields.next().is_some() || !version.starts_with("HTTP/") {
         return Err(TlsError("HTTP request line is malformed".to_owned()));
+    }
+    // Inside a TLS session this proxy terminated, only the origin form names
+    // the host it authenticated. An absolute or authority form, or `*`, can
+    // route upstream to a host no policy named (KSR-047).
+    if !path.starts_with('/') || path.starts_with("//") || path.contains('#') {
+        return Err(TlsError(format!(
+            "HTTP request target `{path}` is not in origin form"
+        )));
     }
     Ok((method, path))
 }
@@ -1617,6 +1644,20 @@ impl SigV4Signer {
         Ok(output)
     }
 
+    /// Adds the secret access key and session token held now to `redactions`.
+    fn redactions(&self, redactions: &mut Vec<String>) -> Result<(), String> {
+        let held = self
+            .credentials
+            .lock()
+            .map_err(|_| "AWS credential custody is unavailable".to_owned())?;
+        let text = |secret: &SecretBytes| {
+            secret.expose(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        };
+        redactions.push(text(&held.secret_access_key));
+        redactions.extend(held.session_token.as_ref().map(text));
+        Ok(())
+    }
+
     /// Builds the `Authorization` value, refreshing credentials that are close
     /// enough to expiry that this request could outlive them.
     fn authorization(
@@ -1641,7 +1682,7 @@ impl SigV4Signer {
                         .to_owned(),
                 ));
             };
-            *held = resolve_credential_process(command).map_err(TlsError)?;
+            *held = resolve_credential_process(command, true).map_err(TlsError)?;
             if held.stale(now) {
                 return Err(TlsError(
                     "KEEL_AWS_CREDENTIAL_PROCESS returned credentials that are already expiring; \
@@ -1914,27 +1955,95 @@ fn resolve_aws_credentials(source: &AwsCredentialSource) -> Result<AwsCredential
                 expires_at: None,
             })
         }
-        AwsCredentialSource::Process(command) => resolve_credential_process(command),
+        AwsCredentialSource::Process(command) => resolve_credential_process(command, false),
     }
 }
 
 /// Runs the operator-named credential command and reads its JSON.
-fn resolve_credential_process(command: &str) -> Result<AwsCredentials, String> {
-    let output = std::process::Command::new("sh")
+/// How long the credential command may run. A refresh holds the signer's
+/// credentials while it runs, so every Bedrock request waits on it (KSR-059).
+const CREDENTIAL_PROCESS_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// Runs the operator-named credential command and reads its JSON. At launch
+/// its stderr goes to the operator, since that is where "run aws sso login"
+/// appears; on a refresh mid-run the error can reach the audit log, so the
+/// command's own words are left out (KSR-058).
+fn resolve_credential_process(command: &str, refresh: bool) -> Result<AwsCredentials, String> {
+    resolve_credential_process_within(command, refresh, CREDENTIAL_PROCESS_TIMEOUT)
+}
+
+fn resolve_credential_process_within(
+    command: &str,
+    refresh: bool,
+    timeout: Duration,
+) -> Result<AwsCredentials, String> {
+    use std::io::Read as _;
+    let mut child = std::process::Command::new("sh")
         .arg("-c")
         .arg(command)
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|error| format!("KEEL_AWS_CREDENTIAL_PROCESS could not be run: {error}"))?;
-    if !output.status.success() {
-        // The command's stderr is the operator's own tooling talking about the
-        // operator's own session, and it is where "run aws sso login" appears.
-        return Err(format!(
-            "KEEL_AWS_CREDENTIAL_PROCESS exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+    // Each reader's buffer is wiped when it is dropped, even when the
+    // command is abandoned below and the reader outlives this call.
+    let read = |mut pipe: Box<dyn std::io::Read + Send>| {
+        std::thread::spawn(move || {
+            let mut bytes = Zeroizing::new(Vec::new());
+            let _ = pipe.read_to_end(&mut bytes);
+            bytes
+        })
+    };
+    let stdout = read(Box::new(
+        child
+            .stdout
+            .take()
+            .ok_or("credential process has no stdout")?,
+    ));
+    let stderr = read(Box::new(
+        child
+            .stderr
+            .take()
+            .ok_or("credential process has no stderr")?,
+    ));
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("KEEL_AWS_CREDENTIAL_PROCESS could not be awaited: {error}"))?
+        {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "KEEL_AWS_CREDENTIAL_PROCESS did not finish within {} seconds",
+                timeout.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let stdout = stdout
+        .join()
+        .map_err(|_| "credential process reader failed")?;
+    let stderr = stderr
+        .join()
+        .map_err(|_| "credential process reader failed")?;
+    if !status.success() {
+        return Err(if refresh {
+            format!(
+                "KEEL_AWS_CREDENTIAL_PROCESS exited with {status} while renewing credentials; \
+                 run it yourself to see why"
+            )
+        } else {
+            format!(
+                "KEEL_AWS_CREDENTIAL_PROCESS exited with {status}: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            )
+        });
     }
-    let stdout = Zeroizing::new(output.stdout);
     parse_credential_process_output(&stdout)
 }
 

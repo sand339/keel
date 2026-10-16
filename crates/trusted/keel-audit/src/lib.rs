@@ -841,6 +841,9 @@ pub struct VerificationStatus {
     pub sealed: bool,
     /// Record digest of the seal, which a teardown receipt names as the tip.
     pub seal_hash: Option<[u8; 32]>,
+    /// Whether the stream ends in a partial record, as a writer killed while
+    /// writing one leaves it. The authenticated prefix before it stands.
+    pub truncated: bool,
 }
 
 /// Authenticates the complete available stream and reports whether it is sealed.
@@ -898,13 +901,32 @@ fn walk_verified_file(
     let mut expected_run_id: Option<String> = None;
     let mut sealed = false;
     let mut seal_hash = None;
-    for line in BufReader::new(file).lines() {
+    let mut truncated = false;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader
+            .read_until(b'\n', &mut line)
+            .map_err(|error| AuditError::Io(error.to_string()))?
+            == 0
+        {
+            break;
+        }
         if sealed {
             return Err(AuditError::SealNotTerminal);
         }
-        let line = line.map_err(|error| AuditError::Io(error.to_string()))?;
-        let record: AuditRecord = serde_json::from_str(&line)
-            .map_err(|error| AuditError::Serialization(error.to_string()))?;
+        let complete = line.last() == Some(&b'\n');
+        let record: AuditRecord = match serde_json::from_slice(&line) {
+            Ok(record) => record,
+            // Every record is written with its newline, so only the last one
+            // can lack it, and only when its writer died mid-record (KSR-043).
+            Err(_) if !complete => {
+                truncated = true;
+                break;
+            }
+            Err(error) => return Err(AuditError::Serialization(error.to_string())),
+        };
         if record.seq != expected_seq {
             return Err(AuditError::Sequence {
                 expected: expected_seq,
@@ -961,6 +983,7 @@ fn walk_verified_file(
         records: logical_records,
         sealed,
         seal_hash,
+        truncated,
     })
 }
 

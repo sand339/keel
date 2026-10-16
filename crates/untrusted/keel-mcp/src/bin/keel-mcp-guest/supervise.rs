@@ -34,8 +34,24 @@ const MAX_ARGUMENTS: usize = 8;
 const MAX_ARGUMENT_BYTES: usize = 160;
 /// Paths the workload may write: code that runs from them is workspace code.
 const WRITABLE_ROOTS: &[&str] = &["/workspace/", "/tmp/", "/var/tmp/", "/root/"];
-const SCRIPT_SUFFIXES: &[&str] = &[
-    ".js", ".mjs", ".cjs", ".ts", ".py", ".sh", ".rb", ".pl", ".php",
+/// Programs that run what a file in their working directory says: started in
+/// a writable directory, they run workspace code (KSR-044).
+const BUILD_RUNNERS: &[&str] = &[
+    "make",
+    "gmake",
+    "ninja",
+    "just",
+    "rake",
+    "cargo",
+    "npm",
+    "npx",
+    "yarn",
+    "pnpm",
+    "bun",
+    "npm-cli.js",
+    "npx-cli.js",
+    "yarn.js",
+    "pnpm.cjs",
 ];
 
 /// One process in an attributed connection's ancestry, nearest first.
@@ -160,11 +176,21 @@ pub fn attribute(local_port: u16, peer_port: u16) -> Origin {
             _ => break,
         }
     }
+    // A process that left its parent for PID 1 hides the ancestry that
+    // started it, so it is treated as workspace code. Keel's own tmux server
+    // daemonizes on every run and is the one expected orphan (KSR-044).
+    let orphaned = current > 1
+        && parent_of(current) == Some(1)
+        && chain.last().is_some_and(|top| !is_keel_tmux(top));
     Origin {
         known: true,
-        workspace_code: chain.iter().any(|process| process.workspace_code),
+        workspace_code: orphaned || chain.iter().any(|process| process.workspace_code),
         chain,
     }
+}
+
+fn is_keel_tmux(process: &Process) -> bool {
+    process.exe == "/usr/bin/tmux" && process.argv.windows(2).any(|pair| pair == ["-L", "keel"])
 }
 
 /// The inode of the client socket `127.0.0.1:peer_port -> 127.0.0.1:local_port`.
@@ -231,29 +257,36 @@ pub fn describe(pid: u32) -> Process {
 }
 
 /// Whether a process runs code the workload could have written: an
-/// executable or script argument under a writable root, which includes any
-/// `node_modules` there. Read-only system paths, such as the guest's bundled
-/// browser server, are not workspace code: Landlock keeps the workload from
-/// writing them.
+/// executable under a writable root, any file there named as an argument,
+/// which includes hooks and scripts without a suffix, or a build runner
+/// started there (KSR-044). Read-only system paths, such as the guest's
+/// bundled browser server, are not workspace code: Landlock keeps the
+/// workload from writing them.
 fn runs_workspace_code(exe: &str, argv: &[String], cwd: &Path) -> bool {
-    let writable = |path: &str| {
-        let absolute = if path.starts_with('/') {
+    let resolve = |path: &str| {
+        if path.starts_with('/') {
             PathBuf::from(path)
         } else {
             cwd.join(path)
-        };
-        let absolute = absolute.display().to_string();
+        }
+    };
+    let writable = |path: &Path| {
+        let absolute = path.display().to_string();
         WRITABLE_ROOTS.iter().any(|root| absolute.starts_with(root))
     };
-    writable(exe)
-        || (writable(&cwd.display().to_string())
-            && cwd.display().to_string().contains("/node_modules/"))
+    let runner = |path: &str| {
+        Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| BUILD_RUNNERS.contains(&name))
+    };
+    let in_writable = writable(&cwd.join(""));
+    writable(&resolve(exe))
+        || (in_writable && cwd.display().to_string().contains("/node_modules/"))
+        || (in_writable && (runner(exe) || argv.get(1).is_some_and(|program| runner(program))))
         || argv.iter().skip(1).any(|argument| {
-            !argument.starts_with('-')
-                && SCRIPT_SUFFIXES
-                    .iter()
-                    .any(|suffix| argument.ends_with(suffix))
-                && writable(argument)
+            let path = resolve(argument);
+            !argument.starts_with('-') && writable(&path) && path.is_file()
         })
 }
 
@@ -272,5 +305,47 @@ pub fn query(local_port: u16, peer_port: u16) -> Vec<u8> {
     match BufReader::new(stream.take(4096)).read_line(&mut line) {
         Ok(_) if !line.trim().is_empty() => line.trim().as_bytes().to_vec(),
         _ => unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::runs_workspace_code;
+    use std::{fs, path::Path};
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    /// KSR-044: hooks, suffix-less scripts, and build runners started in the
+    /// workspace are workspace code; the harness's own commands are not.
+    #[test]
+    fn workspace_code_covers_hooks_scripts_and_build_runners() {
+        let root = Path::new("/tmp/keel-attribution-test");
+        let _ = fs::remove_dir_all(root);
+        fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        fs::write(root.join(".git/hooks/post-commit"), "#!/bin/sh\n").unwrap();
+        fs::write(root.join("release"), "#!/usr/bin/python3\n").unwrap();
+        let shell = strings(&["/bin/sh", ".git/hooks/post-commit"]);
+        assert!(runs_workspace_code("/bin/sh", &shell, root));
+        let python = strings(&["python3", "release"]);
+        assert!(runs_workspace_code("/usr/bin/python3", &python, root));
+        let npm = strings(&["node", "/usr/lib/node_modules/npm/bin/npm-cli.js", "test"]);
+        assert!(runs_workspace_code("/usr/bin/node", &npm, root));
+        assert!(runs_workspace_code(
+            "/usr/bin/make",
+            &strings(&["make"]),
+            root
+        ));
+        let push = strings(&["git", "push", "origin", "main"]);
+        assert!(!runs_workspace_code("/usr/bin/git", &push, root));
+        let inline = strings(&["bash", "-c", "git push origin main"]);
+        assert!(!runs_workspace_code("/bin/bash", &inline, root));
+        assert!(!runs_workspace_code(
+            "/usr/bin/make",
+            &strings(&["make"]),
+            Path::new("/usr/src")
+        ));
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -686,15 +686,31 @@ fn run_policy_command(command: Command) -> Result<ExitCode, Box<dyn std::error::
                 Ok(ExitCode::from(2))
             } else {
                 println!(
-                    "Verified draft written to {}\nReview it, then run:\n  keel policy accept {} --output .keel/policy.json",
+                    "Verified draft written to {}\nReview it, then run:\n  keel policy accept {} --hash {} --output .keel/policy.json",
                     output.display(),
-                    shell_path(&output)
+                    shell_path(&output),
+                    artifact.hash()
                 );
                 Ok(ExitCode::SUCCESS)
             }
         }
-        Command::PolicyAccept { draft, output } => {
+        Command::PolicyAccept {
+            draft,
+            hash,
+            output,
+        } => {
             let mut artifact = PolicyArtifact::load(&draft)?;
+            // The hash binds acceptance to the draft the operator reviewed; a
+            // file rewritten since then has another (KSR-046).
+            if artifact.hash() != hash {
+                print!("{}", artifact.review());
+                eprintln!(
+                    "keel: {} has hash {}, not the reviewed {hash}; review it again before accepting",
+                    draft.display(),
+                    artifact.hash()
+                );
+                return Ok(ExitCode::from(2));
+            }
             print!("{}", artifact.review());
             // An artifact accepted elsewhere, or before the host ledger
             // existed, is recorded as-is once reviewed here.

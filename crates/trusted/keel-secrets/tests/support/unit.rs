@@ -6,8 +6,9 @@ use super::{
     encode_lower_hex, forward_http_once, is_forbidden_ip, model_budget_request,
     parse_credential_process_output, parse_model_usage, parse_utc_timestamp,
     prepare_upstream_request_with_authorizer, proxy_plain_http_once, proxy_tls_http,
-    read_http_request_optional, relay_http_response, runtime_model_provider_from,
-    sanitize_model_request, sigv4_signature, sigv4_timestamps, terminate_http_once,
+    read_http_request_optional, relay_http_response, replace_credential_header,
+    resolve_credential_process_within, runtime_model_provider_from, sanitize_model_request,
+    sigv4_signature, sigv4_timestamps, terminate_http_once,
 };
 use keel_audit::{AuditPayload, AuditWriter, RunKey};
 use keel_kernel::EgressRequestAuthorizer;
@@ -2114,4 +2115,70 @@ fn a_pinned_response_is_held_until_its_digest_is_recorded() {
     assert_eq!(&*delivered.lock().unwrap(), response);
     let expected = ring::digest::digest(&ring::digest::SHA512, b"tarball");
     assert_eq!(&authorizer.recorded.unwrap()[..], expected.as_ref());
+}
+
+/// KSR-058: the signer's secret and session token are redacted, and a refresh
+/// mid-run keeps the credential command's own output out of its error.
+#[test]
+fn signer_secrets_are_redacted_and_refresh_errors_carry_no_command_output() {
+    let signer = SigV4Signer {
+        host: "bedrock-runtime.us-east-1.amazonaws.com".to_owned(),
+        region: "us-east-1".to_owned(),
+        source: AwsCredentialSource::Environment,
+        credentials: super::Mutex::new(AwsCredentials {
+            access_key_id: "ASIAEXAMPLE".to_owned(),
+            secret_access_key: SecretBytes::new("secret".as_bytes()),
+            session_token: Some(SecretBytes::new("session-token".as_bytes())),
+            expires_at: None,
+        }),
+    };
+    let mut redactions = Vec::new();
+    signer.redactions(&mut redactions).unwrap();
+    assert_eq!(redactions, ["secret", "session-token"]);
+
+    let command = "echo 'leaked-token' >&2; exit 3";
+    let at_launch =
+        resolve_credential_process_within(command, false, std::time::Duration::from_secs(10))
+            .err()
+            .unwrap();
+    assert!(at_launch.contains("leaked-token"), "{at_launch}");
+    let refresh =
+        resolve_credential_process_within(command, true, std::time::Duration::from_secs(10))
+            .err()
+            .unwrap();
+    assert!(!refresh.contains("leaked-token"), "{refresh}");
+}
+
+/// KSR-059: a credential command that hangs is killed at its deadline.
+#[test]
+fn a_hung_credential_command_is_killed_at_its_deadline() {
+    let started = std::time::Instant::now();
+    let error =
+        resolve_credential_process_within("sleep 30", true, std::time::Duration::from_millis(200))
+            .err()
+            .unwrap();
+    assert!(error.contains("did not finish"), "{error}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+/// KSR-060: headers written without a space each grow the request by one
+/// byte; the buffer holding the credential is sized for that up front, so it
+/// is never reallocated, which would free an unwiped copy.
+#[test]
+fn the_injected_request_buffer_is_never_reallocated() {
+    let mut request = "GET /v1 HTTP/1.1\r\nauthorization:SENTINEL\r\n".to_owned();
+    for header in 0..200 {
+        std::fmt::Write::write_fmt(&mut request, format_args!("x-{header}:v\r\n")).unwrap();
+    }
+    request.push_str("\r\n");
+    let headers = request.len() - 4;
+    let lines = request[..headers].matches("\r\n").count() + 1;
+    let credential = b"real-credential";
+    let output = replace_credential_header(request.as_bytes(), b"SENTINEL", credential).unwrap();
+    assert_eq!(output.capacity(), request.len() + credential.len() + lines);
+    assert!(
+        output
+            .windows(credential.len())
+            .any(|window| window == credential)
+    );
 }

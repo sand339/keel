@@ -106,6 +106,7 @@ fn trusted_screen_renders_exact_action_and_provenance_safely() {
             action_id: 42,
             action_class: "GitPush".to_owned(),
             exact_target: b"diff --git\n+\x1b[2Jmalicious".to_vec(),
+            summary: Vec::new(),
             reasons: vec![GateReason {
                 rule: "git:force-push".to_owned(),
                 detail: "default branch update\x1b[2J".to_owned(),
@@ -234,7 +235,10 @@ fn terminal_gate_renders_the_kernel_action_and_returns_operator_approval() {
     );
     let target = String::from_utf8(pending.payload().exact_target.clone()).unwrap();
     assert!(target.contains("refs/heads/main"));
-    assert!(target.contains("diff --git a/Cargo.toml\n+\u{1b}[2Jdep"));
+    assert!(target.contains("  \u{2502} diff --git a/Cargo.toml\n  \u{2502} +\u{1b}[2Jdep"));
+    let summary = String::from_utf8(pending.payload().summary.clone()).unwrap();
+    assert!(summary.contains("refs [\"refs/heads/main\"]") && summary.contains("force "));
+    assert!(!summary.contains('\n'), "{summary}");
     pending.decide(GateDecision::Approve).unwrap();
 
     worker.join().unwrap().unwrap();
@@ -243,5 +247,33 @@ fn terminal_gate_renders_the_kernel_action_and_returns_operator_approval() {
     assert_eq!(
         audit[0].gate.as_ref().unwrap().decision,
         GateDecision::Approve
+    );
+}
+
+/// KSR-040: invisible format characters are shown, and the action being
+/// decided is named next to the prompt whatever the target's length.
+#[test]
+fn trusted_screen_escapes_format_characters_and_names_the_action_at_the_prompt() {
+    assert_eq!(
+        safe_text("a\u{202e}b\u{2066}c\u{200b}".as_bytes()),
+        "a\\u{202e}b\\u{2066}c\\u{200b}"
+    );
+    let screen = render_gate(
+        &GatePayload {
+            action_id: 7,
+            action_class: "External".to_owned(),
+            exact_target: b"recipient: \"o/r\"".to_vec(),
+            summary: b"\"github\" \"open-pr\" to \"o/r\"\n\x1b[2J".to_vec(),
+            reasons: Vec::new(),
+            floor_history: Vec::new(),
+            session_grant: None,
+        },
+        ApprovalMethod::Confirm,
+        None,
+    );
+    let lines = screen.lines().collect::<Vec<_>>();
+    assert_eq!(
+        lines[lines.len() - 2],
+        "this decides action 7 (External): \"github\" \"open-pr\" to \"o/r\" \\x1b[2J"
     );
 }

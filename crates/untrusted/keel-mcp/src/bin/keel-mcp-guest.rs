@@ -408,22 +408,46 @@ mod linux {
             result
         });
         io::copy(&mut host_reader, &mut guest_writer)?;
-        let _ = guest_writer.shutdown(Shutdown::Write);
+        // Once the host side is done, the upload has nowhere to go; ending
+        // both directions frees a thread an idle guest would hold (KSR-055).
+        let _ = guest_writer.shutdown(Shutdown::Both);
         upload
             .join()
             .map_err(|_| io::Error::other("TCP upload thread panicked"))??;
         Ok(())
     }
 
+    /// Connections one relay bridges at once; more are closed on arrival.
+    const MAX_RELAY_CONNECTIONS: usize = 256;
+
+    /// Bridges loopback connections to the host. The workload can exhaust the
+    /// relay's descriptors, so a failed accept is retried rather than ending
+    /// the relay for the rest of the run, and open connections are bounded
+    /// (KSR-055).
     fn relay(local_port: u16, vsock_port: u32, attributed: bool) -> io::Result<()> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, local_port))?;
         super::confine::drop_to_service_uid()?;
+        let open = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         for stream in listener.incoming() {
-            let stream = stream?;
+            let stream = match stream {
+                Ok(stream) => stream,
+                Err(error) => {
+                    eprintln!("keel guest relay accept failed: {error}");
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+            };
+            if open.fetch_add(1, std::sync::atomic::Ordering::AcqRel) >= MAX_RELAY_CONNECTIONS {
+                open.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                drop(stream);
+                continue;
+            }
+            let open = std::sync::Arc::clone(&open);
             thread::spawn(move || {
                 if let Err(error) = bridge_tcp(stream, vsock_port, attributed) {
                     eprintln!("keel guest relay failed: {error}");
                 }
+                open.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             });
         }
         Ok(())

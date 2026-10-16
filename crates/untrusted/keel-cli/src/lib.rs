@@ -95,6 +95,8 @@ pub enum Command {
     PolicyAccept {
         /// Draft artifact path.
         draft: PathBuf,
+        /// The artifact hash from the review the operator read.
+        hash: String,
         /// Accepted artifact destination.
         output: PathBuf,
     },
@@ -952,10 +954,39 @@ fn parse_memory(value: &str) -> Result<usize, CliError> {
         .ok_or_else(invalid)
 }
 
+/// `keel policy accept DRAFT --hash HASH --output POLICY`, flags in either order.
+fn parse_policy_accept(arguments: &[OsString]) -> Result<Command, CliError> {
+    match arguments {
+        [draft, first, first_value, second, second_value]
+            if [first.to_str(), second.to_str()] == [Some("--hash"), Some("--output")]
+                || [first.to_str(), second.to_str()] == [Some("--output"), Some("--hash")] =>
+        {
+            let (hash, output) = if first == "--hash" {
+                (first_value, second_value)
+            } else {
+                (second_value, first_value)
+            };
+            Ok(Command::PolicyAccept {
+                draft: PathBuf::from(draft),
+                hash: hash
+                    .to_str()
+                    .ok_or_else(|| CliError::new("policy accept --hash must be text"))?
+                    .to_owned(),
+                output: PathBuf::from(output),
+            })
+        }
+        _ => Err(CliError::new(
+            "usage: keel policy accept DRAFT.json --hash HASH --output POLICY.json\n\
+             HASH is the hash `keel policy compile` or `keel policy show` printed for the \
+             draft you reviewed",
+        )),
+    }
+}
+
 fn parse_policy(arguments: &[OsString]) -> Result<Command, CliError> {
     let Some(operation) = arguments.first().and_then(|value| value.to_str()) else {
         return Err(CliError::new(
-            "usage: keel policy compile POLICY.md --output DRAFT.json [--translation RESULT.json]\n       keel policy compile --text TEXT --output DRAFT.json [--translation RESULT.json]\n       keel policy accept DRAFT.json --output POLICY.json\n       keel policy show POLICY.json\n       keel policy diff OLD.json NEW.json",
+            "usage: keel policy compile POLICY.md --output DRAFT.json [--translation RESULT.json]\n       keel policy compile --text TEXT --output DRAFT.json [--translation RESULT.json]\n       keel policy accept DRAFT.json --hash HASH --output POLICY.json\n       keel policy show POLICY.json\n       keel policy diff OLD.json NEW.json",
         ));
     };
     match operation {
@@ -1026,15 +1057,7 @@ fn parse_policy(arguments: &[OsString]) -> Result<Command, CliError> {
                 translation,
             })
         }
-        "accept" => match &arguments[1..] {
-            [draft, flag, output] if flag == "--output" => Ok(Command::PolicyAccept {
-                draft: PathBuf::from(draft),
-                output: PathBuf::from(output),
-            }),
-            _ => Err(CliError::new(
-                "usage: keel policy accept DRAFT.json --output POLICY.json",
-            )),
-        },
+        "accept" => parse_policy_accept(&arguments[1..]),
         "show" => match &arguments[1..] {
             [artifact] => Ok(Command::PolicyShow {
                 artifact: PathBuf::from(artifact),
@@ -1945,9 +1968,12 @@ fn session_state(audit: &Path, sealed: bool) -> &'static str {
     // executable names the writer; macOS `ps` reports its path.
     let alive = pid.is_some_and(|pid| {
         if cfg!(target_os = "linux") {
+            // `keel setup` replaces the executable of a running session, and
+            // Linux then marks the link to it (KSR-048).
             fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| {
-                exe.file_name()
-                    .is_some_and(|name| name == "keel-input-runtime")
+                exe.file_name().and_then(OsStr::to_str).is_some_and(|name| {
+                    name.strip_suffix(" (deleted)").unwrap_or(name) == "keel-input-runtime"
+                })
             })
         } else {
             ProcessCommand::new("/bin/ps")
@@ -3505,7 +3531,7 @@ pub fn write_runtime_request_in(
 /// Returns concise command help.
 #[must_use]
 pub const fn help() -> &'static str {
-    "usage:\n  keel setup [--prebuilt RELEASE_DIR]\n  keel setup --install-reaper | --remove-reaper\n  keel doctor\n  keel mux [--workspace PATH] [RUN_OPTIONS] [-- CLAUDE_ARGS...]\n  keel run [--isolation vm|vm-v8|v8-sandboxed] [--provenance floor|gate-context] [--cpus N] [--memory GIB] [--reuse-connections] [--record-targets] [--ephemeral-workspace] [--schemas BUNDLE.json] [--keep-alive] [--idle-timeout HOURS] [--allow CAPABILITY] [--policy POLICY.json] [--continue SESSION] [--model MODEL] [--auth api-key|bedrock|openrouter] [--profile scoped --scope RULE|none|--scope-file FILE|--report REPORT [--exclude RULE]] [--model-token-budget N] [--model-cost-budget USD] HARNESS [ARGS...]\n  keel policy compile POLICY.md --output DRAFT.json [--translation RESULT.json]\n  keel policy compile --text TEXT --output DRAFT.json [--translation RESULT.json]\n  keel policy accept DRAFT.json --output POLICY.json\n  keel policy show POLICY.json\n  keel policy diff OLD.json NEW.json\n  keel attach SESSION\n  keel stop SESSION\n  keel recover SESSION | --all\n  keel status SESSION [--audit AUDIT.ndjson]\n  keel audit verify AUDIT.ndjson RUN_KEY_FILE\n  keel report AUDIT.ndjson RUN_KEY_FILE [AUDIT.ndjson RUN_KEY_FILE ...]\n  keel report --axes [SESSION ...]\n  keel report --context [SESSION ...]\n  keel export SESSION [SESSION ...] [--out FILE] [--otlp URL]\n  keel floor show SESSION [--state FLOOR.json]\n  keel floor lift SESSION [RANK]\n\ncapabilities:\n  egress:HOST\n  push:branch\n  push:ref:refs/heads/PATTERN\n  pr:create\n  pr:target:BRANCH\n  github:read-private-issues\n  deny:force-push\n  isolation:v8-sandboxed\n  workspace:public\n  workspace:own\n"
+    "usage:\n  keel setup [--prebuilt RELEASE_DIR]\n  keel setup --install-reaper | --remove-reaper\n  keel doctor\n  keel mux [--workspace PATH] [RUN_OPTIONS] [-- CLAUDE_ARGS...]\n  keel run [--isolation vm|vm-v8|v8-sandboxed] [--provenance floor|gate-context] [--cpus N] [--memory GIB] [--reuse-connections] [--record-targets] [--ephemeral-workspace] [--schemas BUNDLE.json] [--keep-alive] [--idle-timeout HOURS] [--allow CAPABILITY] [--policy POLICY.json] [--continue SESSION] [--model MODEL] [--auth api-key|bedrock|openrouter] [--profile scoped --scope RULE|none|--scope-file FILE|--report REPORT [--exclude RULE]] [--model-token-budget N] [--model-cost-budget USD] HARNESS [ARGS...]\n  keel policy compile POLICY.md --output DRAFT.json [--translation RESULT.json]\n  keel policy compile --text TEXT --output DRAFT.json [--translation RESULT.json]\n  keel policy accept DRAFT.json --hash HASH --output POLICY.json\n  keel policy show POLICY.json\n  keel policy diff OLD.json NEW.json\n  keel attach SESSION\n  keel stop SESSION\n  keel recover SESSION | --all\n  keel status SESSION [--audit AUDIT.ndjson]\n  keel audit verify AUDIT.ndjson RUN_KEY_FILE\n  keel report AUDIT.ndjson RUN_KEY_FILE [AUDIT.ndjson RUN_KEY_FILE ...]\n  keel report --axes [SESSION ...]\n  keel report --context [SESSION ...]\n  keel export SESSION [SESSION ...] [--out FILE] [--otlp URL]\n  keel floor show SESSION [--state FLOOR.json]\n  keel floor lift SESSION [RANK]\n\ncapabilities:\n  egress:HOST\n  push:branch\n  push:ref:refs/heads/PATTERN\n  pr:create\n  pr:target:BRANCH\n  github:read-private-issues\n  deny:force-push\n  isolation:v8-sandboxed\n  workspace:public\n  workspace:own\n"
 }
 
 #[cfg(test)]
@@ -3557,6 +3583,39 @@ mod tests {
         assert!(parse_args(args(&["doctor", "--unknown"])).is_err());
     }
 
+    /// KSR-046: acceptance names the reviewed hash, with the flags in either
+    /// order.
+    #[test]
+    fn policy_acceptance_names_the_reviewed_hash() {
+        assert!(
+            parse_args(args(&[
+                "policy",
+                "accept",
+                "draft.json",
+                "--output",
+                "policy.json"
+            ]))
+            .is_err()
+        );
+        assert_eq!(
+            parse_args(args(&[
+                "policy",
+                "accept",
+                "draft.json",
+                "--output",
+                "policy.json",
+                "--hash",
+                "abc",
+            ]))
+            .unwrap(),
+            Command::PolicyAccept {
+                draft: PathBuf::from("draft.json"),
+                hash: "abc".to_owned(),
+                output: PathBuf::from("policy.json"),
+            }
+        );
+    }
+
     #[test]
     fn parses_policy_lifecycle_and_run_selection() {
         assert_eq!(
@@ -3597,12 +3656,15 @@ mod tests {
                 "policy",
                 "accept",
                 "draft.json",
+                "--hash",
+                "abc",
                 "--output",
                 "policy.json",
             ]))
             .unwrap(),
             Command::PolicyAccept {
                 draft: PathBuf::from("draft.json"),
+                hash: "abc".to_owned(),
                 output: PathBuf::from("policy.json"),
             }
         );
@@ -3665,12 +3727,15 @@ mod tests {
                 "constitution",
                 "accept",
                 "draft.json",
+                "--hash",
+                "abc",
                 "--output",
                 "policy.json",
             ]))
             .unwrap(),
             Command::PolicyAccept {
                 draft: PathBuf::from("draft.json"),
+                hash: "abc".to_owned(),
                 output: PathBuf::from("policy.json"),
             }
         );

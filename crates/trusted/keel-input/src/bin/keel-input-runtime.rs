@@ -16,9 +16,9 @@ mod teardown;
 
 use keel_audit::RunKey;
 use keel_input::{
-    GateController, InputEvent, InputGate, PendingApproval, RuntimeBroker, RuntimeIntent,
-    SECURE_ATTENTION, TerminalControl, TerminalControlReader, encode_resize, push_keystroke,
-    render_gate, safe_text, terminal_gate_channel,
+    GateController, InputEvent, InputGate, MAX_TERMINAL_DIMENSION, PendingApproval, RuntimeBroker,
+    RuntimeIntent, SECURE_ATTENTION, TerminalControl, TerminalControlReader, encode_resize,
+    push_keystroke, render_gate, safe_text, terminal_gate_channel,
 };
 use keel_kernel::GateDecision;
 #[cfg(target_os = "macos")]
@@ -480,7 +480,7 @@ fn spawn_runtime(
     #[cfg(target_os = "linux")]
     let virtiofsd = component_root.join("virtiofsd").canonicalize()?;
     create_bind_target(&guest_events)?;
-    let mut command = confined_command(
+    let mut command = start_gated_command(
         &runtime,
         || {
             let allowed_child = if isolation == "v8-sandboxed" {
@@ -630,8 +630,13 @@ fn spawn_runtime(
     if let Some(listener) = inherited_v8_proxy.as_ref() {
         command.env("KEEL_V8_PROXY_FD", listener.as_raw_fd().to_string());
     }
+    let (gate, mut start) = io::pipe()?;
+    let inherited_gate = dup(&gate)?;
+    command.env("KEEL_START_FD", inherited_gate.as_raw_fd().to_string());
     let backend = resources.backend(spawn_stoppable(&mut command, termination)?);
+    drop((inherited_gate, gate));
     broker.record_resource("backend-group", format!("pgid {}", backend.id()))?;
+    start.write_all(b"start\n")?;
     Ok(())
 }
 
@@ -715,6 +720,40 @@ fn trusted_scratch(label: &str) -> Result<PathBuf, Box<dyn Error>> {
     Err("cannot create a unique trusted runtime directory".into())
 }
 
+/// Terminal devices no confined child may open. Every child's standard
+/// streams are pipes, so it holds no terminal descriptor; with one it could
+/// inject keystrokes into the trusted input queue through `TIOCSTI`, or paint
+/// over the trusted screen. Bubblewrap's `--new-session` closes the same path
+/// on Linux. New pseudo-terminals from `/dev/ptmx` are not the operator's.
+const SB_DENY_TERMINALS: &str = r#"(deny file-read* file-write* file-ioctl
+  (literal "/dev/tty") (literal "/dev/console")
+  (regex #"^/dev/tty[a-z]") (regex #"^/dev/pty[a-z]"))"#;
+
+/// Host services through which a confined child could act outside its
+/// sandbox, whatever its file and network rules say (KSR-035): read the
+/// clipboard, open a URL or application, send Apple Events to another
+/// application, reach the window server, resolve names (a DNS channel even
+/// with IP denied), start background URL sessions, or share files. The
+/// security daemons hold the operator's keychain.
+const SB_DENY_HOST_SERVICES: &str = r#"(deny mach-lookup
+  (global-name "com.apple.SecurityServer")
+  (global-name "com.apple.securityd")
+  (global-name "com.apple.securityd.general")
+  (global-name "com.apple.securityd.xpc")
+  (global-name-regex #"^com\.apple\.pasteboard\.")
+  (global-name "com.apple.coreservices.launchservicesd")
+  (global-name "com.apple.coreservices.quarantine-resolver")
+  (global-name-regex #"^com\.apple\.lsd\.")
+  (global-name "com.apple.coreservices.appleevents")
+  (global-name-regex #"^com\.apple\.ae\.")
+  (global-name-regex #"^com\.apple\.windowserver")
+  (global-name-regex #"^com\.apple\.dock\.")
+  (global-name "com.apple.mDNSResponder")
+  (global-name "com.apple.dnssd.service")
+  (global-name-regex #"^com\.apple\.nsurlsessiond")
+  (global-name "com.apple.sharingd")
+  (global-name "com.apple.FileProvider"))"#;
+
 fn sb_string(path: &Path) -> String {
     path.to_string_lossy()
         .replace('\\', "\\\\")
@@ -740,18 +779,63 @@ fn confined_command(
     profile: impl FnOnce() -> String,
     confinement: impl FnOnce() -> confine::Confinement,
 ) -> Command {
+    let (confiner, arguments) = confined_invocation(program, profile, confinement);
+    let mut command = Command::new(confiner);
+    command.args(arguments);
+    command
+}
+
+/// The confining program and its arguments for running `program`.
+fn confined_invocation(
+    program: &Path,
+    profile: impl FnOnce() -> String,
+    confinement: impl FnOnce() -> confine::Confinement,
+) -> (std::ffi::OsString, Vec<std::ffi::OsString>) {
     #[cfg(target_os = "linux")]
     {
-        let mut command = Command::new(confine::BWRAP);
-        command.args(confinement().arguments(program, &[]));
-        command
+        let _ = profile;
+        (
+            std::ffi::OsString::from(confine::BWRAP),
+            confinement().arguments(program, &[]),
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let mut command = Command::new("/usr/bin/sandbox-exec");
-        command.args(["-p", &profile()]).arg(program);
-        command
+        let _ = confinement;
+        (
+            std::ffi::OsString::from("/usr/bin/sandbox-exec"),
+            vec![
+                std::ffi::OsString::from("-p"),
+                std::ffi::OsString::from(profile()),
+                program.as_os_str().to_owned(),
+            ],
+        )
     }
+}
+
+/// Holds a confined command until the runtime has made its process group
+/// durable in the audit chain. The shell waits for one line on an inherited
+/// pipe, closes it, and becomes the confiner, keeping its process id and so
+/// the recorded group. A runtime that dies first closes the pipe, and the
+/// command ends without running (KSR-054). Bash, because dash cannot redirect
+/// a descriptor above 9.
+const START_GATE: &str = "IFS= read -r go <&\"$KEEL_START_FD\" && [ \"$go\" = start ] || exit 125; \
+     eval \"exec $KEEL_START_FD<&-\"; unset KEEL_START_FD; exec \"$@\"";
+
+const START_GATE_SHELL: &str = "/bin/bash";
+
+fn start_gated_command(
+    program: &Path,
+    profile: impl FnOnce() -> String,
+    confinement: impl FnOnce() -> confine::Confinement,
+) -> Command {
+    let (confiner, arguments) = confined_invocation(program, profile, confinement);
+    let mut command = Command::new(START_GATE_SHELL);
+    command
+        .args(["-c", START_GATE, "keel-start"])
+        .arg(confiner)
+        .args(arguments);
+    command
 }
 
 /// Creates an empty file a confined child may write, because bubblewrap
@@ -824,11 +908,8 @@ fn runtime_sandbox_profile(
 {}
 (deny network-bind (local ip))
 {}
-(deny mach-lookup
-  (global-name "com.apple.SecurityServer")
-  (global-name "com.apple.securityd")
-  (global-name "com.apple.securityd.general")
-  (global-name "com.apple.securityd.xpc"))"#,
+{}
+{}"#,
         sb_string(workspace),
         sb_ancestor_literals(workspace),
         sb_string(components),
@@ -852,6 +933,8 @@ fn runtime_sandbox_profile(
         sb_string(broker),
         tcp_outbound,
         tcp_inbound,
+        SB_DENY_HOST_SERVICES,
+        SB_DENY_TERMINALS,
     )
 }
 
@@ -881,10 +964,14 @@ fn spawn_extract_helper(
   (subpath "/dev") (subpath "/private/var/db") (literal "/private/etc/localtime"))))
 (deny file-write*)
 (deny process-fork)
-(deny process-exec (require-not (literal "{}")))"#,
+(deny process-exec (require-not (literal "{}")))
+{}
+{}"#,
         sb_string(&socket),
         sb_string(components),
         sb_string(&helper),
+        SB_DENY_HOST_SERVICES,
+        SB_DENY_TERMINALS,
     );
     let provider = keel_secrets::runtime_model_provider()?;
     let mut command = confined_command(
@@ -946,13 +1033,12 @@ fn renderer_sandbox_profile(renderer: &Path) -> String {
 (deny file-write*)
 (deny process-fork)
 (deny process-exec (require-not (literal "{}")))
-(deny mach-lookup
-  (global-name "com.apple.SecurityServer")
-  (global-name "com.apple.securityd")
-  (global-name "com.apple.securityd.general")
-  (global-name "com.apple.securityd.xpc"))"#,
+{}
+{}"#,
         sb_string(components),
         sb_string(renderer),
+        SB_DENY_HOST_SERVICES,
+        SB_DENY_TERMINALS,
     )
 }
 
@@ -1044,7 +1130,10 @@ fn terminal_dimensions() -> Option<(u16, u16)> {
     if rows == 0 || columns == 0 || dimensions.next().is_some() {
         return None;
     }
-    Some((rows, columns))
+    Some((
+        rows.min(MAX_TERMINAL_DIMENSION),
+        columns.min(MAX_TERMINAL_DIMENSION),
+    ))
 }
 
 /// Waits for the operator's terminal to be resized.
@@ -1443,6 +1532,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Arc::clone(&guest_input),
         Arc::clone(&renderer_control),
     );
+    // Only Keel's own supervisor sends control messages. A directly attached
+    // terminal sends none, so there every byte is the operator's (KSR-052).
+    let supervised = input_source.as_deref() == Some(std::ffi::OsStr::new("trusted-supervisor"));
     let input_state = Arc::clone(&interactive);
     let input_renderer = Arc::clone(&renderer_control);
     let input_shutdown = Arc::clone(&shutdown_requested);
@@ -1474,7 +1566,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             // down this same stream. A directly attached terminal sends no
             // control messages and reaches the guest through SIGWINCH instead.
             keystrokes.clear();
-            let controls = reader.split(&bytes[..count], &mut keystrokes);
+            let controls = if supervised {
+                reader.split(&bytes[..count], &mut keystrokes)
+            } else {
+                keystrokes.extend_from_slice(&bytes[..count]);
+                Vec::new()
+            };
             forward.clear();
             for byte in &keystrokes {
                 if route_input(&input_state, *byte, &mut forward)? {

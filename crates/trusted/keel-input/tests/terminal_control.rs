@@ -62,11 +62,11 @@ fn a_resize_message_split_one_byte_per_read_is_still_decoded() {
 
 #[test]
 fn a_size_whose_bytes_look_like_control_bytes_is_not_reparsed() {
-    // 0x0707 rows puts two literal prefix bytes inside the payload. Treating
-    // them as the start of new messages would drop the resize and eat the
-    // keystrokes that follow it.
+    // 0x0307 rows and 0x0207 columns put literal prefix bytes inside the
+    // payload. Treating them as the start of new messages would drop the
+    // resize and eat the keystrokes that follow it.
     let mut reader = TerminalControlReader::new();
-    let mut stream = encode_resize(0x0707, 0x0772).to_vec();
+    let mut stream = encode_resize(0x0307, 0x0207).to_vec();
     stream.extend_from_slice(b"ls");
     let (keystrokes, controls) = split(&mut reader, &stream);
 
@@ -74,8 +74,8 @@ fn a_size_whose_bytes_look_like_control_bytes_is_not_reparsed() {
     assert_eq!(
         controls,
         vec![TerminalControl::Resize {
-            rows: 0x0707,
-            columns: 0x0772
+            rows: 0x0307,
+            columns: 0x0207
         }]
     );
 }
@@ -149,4 +149,70 @@ fn an_unknown_message_is_dropped_instead_of_typed() {
 
     assert_eq!(keystrokes, b"k");
     assert!(controls.is_empty());
+}
+
+/// KSR-052: a literal Ctrl-G the operator types crosses the attach client,
+/// the supervisor, and the runtime as a keystroke, never as a message.
+#[test]
+fn a_typed_control_byte_survives_every_hop() {
+    let mut client = Vec::new();
+    for byte in [
+        TERMINAL_CONTROL,
+        b'q',
+        TERMINAL_CONTROL,
+        b's',
+        b'a',
+        b'b',
+        b'c',
+        b'd',
+    ] {
+        push_keystroke(&mut client, byte);
+    }
+    client.extend_from_slice(&encode_resize(40, 120));
+    let mut supervisor = TerminalControlReader::new();
+    let mut forwarded = Vec::new();
+    let relayed = supervisor.relay(&client, &mut forwarded);
+    assert_eq!(
+        relayed,
+        [TerminalControl::Resize {
+            rows: 40,
+            columns: 120
+        }]
+    );
+    let (keystrokes, controls) = split(&mut TerminalControlReader::new(), &forwarded);
+    assert!(controls.is_empty(), "{controls:?}");
+    assert_eq!(
+        keystrokes,
+        [
+            TERMINAL_CONTROL,
+            b'q',
+            TERMINAL_CONTROL,
+            b's',
+            b'a',
+            b'b',
+            b'c',
+            b'd'
+        ]
+    );
+}
+
+/// KSR-052: a size the renderer cannot draw is dropped, not forwarded.
+#[test]
+fn an_undrawable_resize_is_dropped() {
+    let mut reader = TerminalControlReader::new();
+    for (rows, columns) in [(0, 80), (24, 0), (1001, 80), (24, 24_930)] {
+        let (keystrokes, controls) = split(&mut reader, &encode_resize(rows, columns));
+        assert!(
+            keystrokes.is_empty() && controls.is_empty(),
+            "{rows}x{columns}"
+        );
+    }
+    let (_, controls) = split(&mut reader, &encode_resize(1000, 1000));
+    assert_eq!(
+        controls,
+        [TerminalControl::Resize {
+            rows: 1000,
+            columns: 1000
+        }]
+    );
 }

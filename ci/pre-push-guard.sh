@@ -4,11 +4,12 @@
 # To github.com/sand339/keel (public), only the local `public` branch may be
 # pushed, and only while it shares no history with `main`. Every other
 # remote is unrestricted.
-remote_url=$2
+# GitHub matches owner and repository names in any case, with or without a
+# trailing slash or `.git`, so the URL is normalized before it is matched.
+remote_url=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]' | sed -e 's#/*$##' -e 's#\.git$##' -e 's#/*$##')
 
 case "$remote_url" in
-    *github.com/sand339/keel | *github.com/sand339/keel.git | \
-    *github.com:sand339/keel | *github.com:sand339/keel.git) ;;
+    *github.com/sand339/keel | *github.com:sand339/keel) ;;
     *) exit 0 ;;
 esac
 

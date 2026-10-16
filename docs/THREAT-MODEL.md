@@ -167,8 +167,14 @@ Process origins reported by the guest's PID 1 supervisor are claims, not
 evidence. A compromised guest kernel or supervisor can report any origin, so
 Keel uses an origin only to add a violation. A Git push or pull request whose
 ancestry includes workspace code reaches the gate; an origin can never remove
-a violation or raise a rank. Attribution can miss a process that exits before
-its connection is examined; such connections are reported as unknown.
+a violation or raise a rank. Workspace code is an executable under a
+guest-writable root, any file there named as an argument (a Git hook or a
+script with or without a suffix), a build or package runner started in a
+writable directory, or a process reparented to PID 1 other than Keel's own
+tmux server. Attribution can miss a process that exits before its connection
+is examined; such connections are reported as unknown. It also reads argv,
+which a process can rewrite, and cannot tell a command started through Keel's
+tmux server from one the harness started.
 
 The boundary does not defend against:
 
@@ -455,8 +461,10 @@ The following are not current guarantees:
 
 - exclusive custody of the boot images: admission hashes, and the backend boots, private copies of the kernel, initramfs, and root disk, but a process of the same user can still race that copy;
 - a receipt from a crashed supervisor; every run that opens a chain ends with a signed receipt, its supervisor's or its own, with the chain's local tamper evidence and no more;
-- authenticated crash recovery: `keel recover` acts only on resources the authenticated chain names and refuses foreign process groups and paths, but its record is unsigned, it runs only when invoked (by `keel run`, `keel attach`, `keel recover`, or the opt-in hourly reaper), and a backend killed before its record was written is missed;
+- authenticated crash recovery: `keel recover` acts only on resources the authenticated chain names and refuses foreign process groups and paths, but its record is unsigned, it runs only when invoked (by `keel run`, `keel attach`, `keel recover`, or the opt-in hourly reaper), and the backend does not start until its record is durable;
 - erasure of every copy of a credential: Keel wipes its own buffers, but not the process environment it inherited, nor `ring`'s derived signing keys;
+- authenticity of a release: the checksums beside a release, and the
+  `SHA256SUMS` inside it, detect a damaged download but are not signatures;
 - external audit witnessing or hardware-backed attestation;
 - per-turn provenance reconstructed from the exact content in each model
   request; current direct-workspace exposure fails closed at rank zero.

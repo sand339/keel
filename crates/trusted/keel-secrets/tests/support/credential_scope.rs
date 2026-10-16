@@ -178,6 +178,30 @@ fn runtime_model_and_github_credentials_are_exactly_scoped() {
             "combined authority must retain its exact binding: {request}"
         );
     }
+    // KSR-039: the kernel requires a one-use permit only for the exact shape,
+    // so every other spelling of it must not carry the credential.
+    for variant in [
+        "POST /repos/owner/repo/pulls/",
+        "POST //repos/owner/repo/pulls",
+        "POST /repos//owner/repo/pulls",
+        "POST /repos/owner%2Frepo/x/pulls",
+        "GET /repos/owner/repo/issues/42/",
+    ] {
+        assert!(
+            combined
+                .vault
+                .inject(
+                    &github_target,
+                    format!(
+                        "{variant} HTTP/1.1\r\nAuthorization: Bearer {}\r\n\r\n",
+                        SystemEgressConnector::GITHUB_SENTINEL
+                    )
+                    .as_bytes(),
+                )
+                .is_err(),
+            "a non-canonical spelling must not carry the credential: {variant}"
+        );
+    }
     for forbidden in [
         "GET /repos/owner/repo/issues/0",
         "GET /repos/owner/repo/issues/42/comments",
@@ -366,5 +390,26 @@ fn the_openrouter_key_is_injected_only_as_a_bearer_on_its_messages_endpoint() {
                 .is_err(),
             "{host}{path} must not receive the OpenRouter key"
         );
+    }
+}
+
+/// KSR-047: inside a terminated TLS session only an origin-form target is
+/// read; an absolute or authority form, `*`, or a fragment is refused before
+/// any authorization or credential.
+#[test]
+fn only_origin_form_request_targets_are_read() {
+    let line = |target: &str| format!("POST {target} HTTP/1.1\r\nHost: a.example\r\n\r\n");
+    assert_eq!(
+        request_line(line("/upload?x=1").as_bytes()).unwrap(),
+        ("POST", "/upload?x=1")
+    );
+    for target in [
+        "https://other.example/upload",
+        "other.example:443",
+        "*",
+        "//other.example/upload",
+        "/upload#fragment",
+    ] {
+        assert!(request_line(line(target).as_bytes()).is_err(), "{target}");
     }
 }

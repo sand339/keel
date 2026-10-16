@@ -4,8 +4,8 @@
 pub use keel_provenance::ProvenanceEvent;
 use keel_provenance::{
     ClassifiedResult, Confidentiality, DenialOrigin, DenialScope, FloorObservation, IntentFlags,
-    LockfilePins, ModelOutputIndex, PayloadIndex, PushedBlob, Rank, SchemaRegistry, SessionFacts,
-    SourceRef, TaskAdmission, derive_push, is_protected_path, receive_pack_commands,
+    LockfilePins, ModelOutputIndex, PayloadIndex, PushedBlob, PushedContent, Rank, SchemaRegistry,
+    SessionFacts, SourceRef, TaskAdmission, derive_push, is_protected_path, receive_pack_commands,
 };
 use nix::{
     errno::Errno,
@@ -32,7 +32,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
         mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
     },
     thread::{self, JoinHandle},
@@ -1063,14 +1063,16 @@ impl GateRequest<'_> {
                 }
                 if let Some(origin) = &self.action.stamped.origin {
                     target.push_str("\nissued by (guest-reported): ");
-                    target.push_str(if origin.known {
-                        &origin.summary
+                    // Guest-reported, so it may not start a line of its own.
+                    if origin.known {
+                        target.extend(origin.summary.escape_debug());
                     } else {
-                        "unknown process"
-                    });
+                        target.push_str("unknown process");
+                    }
                 }
                 target.into_bytes()
             },
+            summary: gate_summary(&self.action.asserted.target).into_bytes(),
             reasons: self
                 .violations
                 .iter()
@@ -1102,6 +1104,93 @@ impl GateRequest<'_> {
     }
 }
 
+/// The protected paths a push changes and the protected content it adds, as
+/// the kernel derived them from the pushed objects.
+fn protected_view(content: &PushedContent) -> Option<String> {
+    let added = content
+        .blobs
+        .iter()
+        .filter(|blob| is_protected_path(&blob.path))
+        .collect::<Vec<_>>();
+    let mut paths = content.protected_paths.clone();
+    paths.extend(added.iter().map(|blob| blob.path.clone()));
+    if paths.is_empty() {
+        return None;
+    }
+    let mut view = format!("derived by Keel; protected paths changed: {paths:?}");
+    for blob in added {
+        let _ = fmt::Write::write_fmt(
+            &mut view,
+            format_args!(
+                "\n--- {:?} as pushed\n{}",
+                blob.path,
+                blob.text
+                    .as_deref()
+                    .unwrap_or("(binary or too large to show)")
+            ),
+        );
+    }
+    Some(view)
+}
+
+/// Lines of one untrusted block the trusted screen shows.
+const QUOTED_LINES: usize = 80;
+/// Characters of one untrusted line the trusted screen shows.
+const QUOTED_LINE_CHARS: usize = 240;
+
+/// Shows untrusted multi-line text, such as a pull-request body or a diff,
+/// inside a gutter. No line of it can then pass for one of the trusted
+/// screen's own, and a bounded height keeps it from scrolling the action's
+/// header away from the prompt (KSR-040).
+fn quoted_block(text: &str) -> String {
+    let mut block = String::new();
+    let lines = text.lines().collect::<Vec<_>>();
+    for line in lines.iter().take(QUOTED_LINES) {
+        block.push_str("  \u{2502} ");
+        let mut characters = line.chars();
+        block.extend(characters.by_ref().take(QUOTED_LINE_CHARS));
+        if characters.next().is_some() {
+            block.push_str(" [line truncated]");
+        }
+        block.push('\n');
+    }
+    if lines.len() > QUOTED_LINES {
+        let _ = fmt::Write::write_fmt(
+            &mut block,
+            format_args!("  ({} more lines not shown)\n", lines.len() - QUOTED_LINES),
+        );
+    }
+    block.pop();
+    block
+}
+
+/// One line restating what an action does, painted beside the prompt after
+/// any untrusted text, so a long target cannot leave the operator deciding on
+/// what that text claims instead (KSR-040).
+fn gate_summary(target: &Target) -> String {
+    match target {
+        Target::Git {
+            remote,
+            refs,
+            is_force,
+            is_default_branch,
+            touches_manifest,
+            ..
+        } => format!(
+            "remote {remote:?}, refs {refs:?}, force {is_force}, default branch \
+             {is_default_branch}, manifest or CI {touches_manifest}"
+        ),
+        Target::External {
+            service,
+            recipient,
+            operation,
+            ..
+        } => format!("{service:?} {operation:?} to {recipient:?}"),
+        Target::Command { program, arguments } => format!("{program:?} {arguments:?}"),
+        _ => render_gate_target(target).replace('\n', ", "),
+    }
+}
+
 fn render_gate_target(target: &Target) -> String {
     match target {
         Target::Workspace { path } => format!("path: {path:?}"),
@@ -1124,7 +1213,9 @@ fn render_gate_target(target: &Target) -> String {
         } => format!(
             "remote: {remote:?}\nrefs: {refs:#?}\nforce: {is_force}\ndefault branch: \
              {is_default_branch}\ntouches manifest or CI: {touches_manifest}\nprotected diff:\n{}",
-            manifest_diff.as_deref().unwrap_or("(none)")
+            manifest_diff
+                .as_deref()
+                .map_or_else(|| "  (none)".to_owned(), quoted_block)
         ),
         Target::External {
             service,
@@ -1132,7 +1223,8 @@ fn render_gate_target(target: &Target) -> String {
             operation,
             detail,
         } => format!(
-            "service: {service:?}\noperation: {operation:?}\nrecipient: {recipient:?}\ndetail:\n{detail}"
+            "service: {service:?}\noperation: {operation:?}\nrecipient: {recipient:?}\ndetail:\n{}",
+            quoted_block(detail)
         ),
         Target::FloorLift {
             session_id,
@@ -1151,6 +1243,8 @@ pub struct GatePayload {
     pub action_class: String,
     /// Exact command, diff, recipient, or other target bytes.
     pub exact_target: Vec<u8>,
+    /// The security-relevant parts of the target on one line.
+    pub summary: Vec<u8>,
     /// Complete policy and kernel reasons for escalation.
     pub reasons: Vec<GateReason>,
     /// Concrete provenance sources, most recent first.
@@ -1981,6 +2075,7 @@ impl<P: Policy> Kernel<P> {
         denial_scope: DenialScope,
         violations: &[Violation],
         outcome: GateOutcome,
+        shown_history: &[FloorObservation],
         audit: &mut impl AuditSink,
     ) -> Result<GateTelemetry, KernelError> {
         let GateOutcome {
@@ -2028,10 +2123,18 @@ impl<P: Policy> Kernel<P> {
         let mut current = action.clone();
         current.stamped.session = self.session.snapshot();
         let reasons = self.reasons(&current, denial_scope)?;
-        if reasons.iter().any(|reason| {
-            reason.rule.starts_with("deny:")
-                || !violations.iter().any(|shown| shown.rule == reason.rule)
-        }) {
+        // A lift vouches for the read-set it displayed. Its reasons do not
+        // depend on that set, so a source read during the wait is caught by
+        // comparing the set itself (KSR-036).
+        let lift_changed = action.asserted.class == ActionClass::LiftFloor
+            && (self.session.facts.floor_history != shown_history
+                || self.session.facts.floor != action.stamped.session.floor);
+        if lift_changed
+            || reasons.iter().any(|reason| {
+                reason.rule.starts_with("deny:")
+                    || !violations.iter().any(|shown| shown.rule == reason.rule)
+            })
+        {
             self.session.release();
             let denial = observe_denial(
                 &mut self.session.facts,
@@ -2406,7 +2509,7 @@ impl<P: Policy> Kernel<P> {
             denial_scope,
             violations,
             needs_gate,
-            ..
+            floor_history,
         } = pending;
         let gate_telemetry = if needs_gate {
             let outcome = outcome.unwrap_or(GateOutcome {
@@ -2414,7 +2517,14 @@ impl<P: Policy> Kernel<P> {
                 authority: "unavailable",
                 time_to_decision_ms: 0,
             });
-            Some(self.conclude_gate(&action, denial_scope, &violations, outcome, audit)?)
+            Some(self.conclude_gate(
+                &action,
+                denial_scope,
+                &violations,
+                outcome,
+                &floor_history,
+                audit,
+            )?)
         } else {
             None
         };
@@ -3114,6 +3224,10 @@ const MAX_PENDING_EFFECT_PERMITS: usize = 64;
 /// An abandoned logical authorization must not become a reusable capability.
 const EFFECT_PERMIT_TTL: Duration = Duration::from_mins(2);
 const MAX_BROKER_CLIENTS: usize = 64;
+/// Established bridges, such as keep-alive egress sessions, are bounded
+/// separately, so they cannot hold every slot that a Git, pull-request, or
+/// extraction request needs to be decided in (KSR-057).
+const MAX_BROKER_BRIDGES: usize = 512;
 const BROKER_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(500);
 const MINIMUM_RANK_RULE: &str = "kernel:minimum-rank";
 const REPEATED_DENIAL_RULE: &str = "repeated-denials-same-scope";
@@ -5500,7 +5614,7 @@ impl BrokerState {
             && path
                 .split('?')
                 .next()
-                .is_some_and(|path| path.ends_with("/pulls")))
+                .is_some_and(|path| path.trim_end_matches('/').ends_with("/pulls")))
             || (method == "POST"
                 && path
                     .split('?')
@@ -5833,29 +5947,44 @@ impl BrokerState {
         let Target::Git {
             remote,
             refs,
+            is_force,
             is_default_branch,
             touches_manifest,
-            ..
+            manifest_diff,
         } = &mut asserted.target
         else {
             return (IntegrityVerdict::Uninspectable, FlowVerdict::NotChecked);
         };
-        if let Ok((updates, _)) = receive_pack_commands(body)
-            && updates.iter().all(|update| valid_git_ref(&update.name))
-        {
-            *refs = updates.iter().map(|update| update.name.clone()).collect();
-            *is_default_branch |= updates
-                .iter()
-                .any(|update| inspection.default_branches.contains(&update.name));
+        // The relay's refs and flags are never kept in place of the body's.
+        // A body whose commands cannot all be read is treated as every
+        // gated kind of push at once (KSR-037).
+        match receive_pack_commands(body) {
+            Ok((updates, _)) if updates.iter().all(|update| valid_git_ref(&update.name)) => {
+                *refs = updates.iter().map(|update| update.name.clone()).collect();
+                *is_default_branch |= updates
+                    .iter()
+                    .any(|update| inspection.default_branches.contains(&update.name));
+            }
+            _ => {
+                *is_force = true;
+                *is_default_branch = true;
+                *touches_manifest = true;
+                return (IntegrityVerdict::Uninspectable, FlowVerdict::NotChecked);
+            }
         }
         let Ok(content) = derived else {
             *touches_manifest = true;
             return (IntegrityVerdict::Uninspectable, FlowVerdict::NotChecked);
         };
-        *touches_manifest |= content
-            .blobs
-            .iter()
-            .any(|blob| is_protected_path(&blob.path));
+        // KSR-038, KSR-045: deletions, rewrites of admitted history, and
+        // protected paths removed or overwritten are derived here as well.
+        *is_force |= content.rewrites;
+        // The gate shows what the kernel derived, not the relay's diff, which
+        // can leave out every commit of a new branch but its tip (KSR-042).
+        if let Some(view) = protected_view(&content) {
+            *touches_manifest = true;
+            *manifest_diff = Some(view);
+        }
         let integrity = IntegrityVerdict::of_push(
             &content.blobs,
             *is_default_branch,
@@ -6752,6 +6881,21 @@ fn release_broker_socket(root: &Path) -> TeardownCheck {
     }
 }
 
+/// Whether the broker takes one more connection, given how many are still
+/// being decided and how many client threads, bridges included, are open.
+const fn admits_broker_client(deciding: usize, open: usize) -> bool {
+    deciding < MAX_BROKER_CLIENTS && open < MAX_BROKER_BRIDGES
+}
+
+/// One broker connection still being decided; dropped once it is.
+struct Deciding(Arc<AtomicUsize>);
+
+impl Drop for Deciding {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn broker_loop(
     listeners: [&UnixListener; 2],
     state: &Arc<Mutex<BrokerState>>,
@@ -6761,6 +6905,7 @@ fn broker_loop(
     stop: &Arc<AtomicBool>,
 ) -> Result<BrokerReport, String> {
     let mut bridges = Vec::new();
+    let deciding = Arc::new(AtomicUsize::new(0));
     while !stop.load(Ordering::Acquire) {
         let mut idle = true;
         for (index, listener) in listeners.iter().enumerate() {
@@ -6768,29 +6913,33 @@ fn broker_loop(
             match listener.accept() {
                 Ok((stream, _)) => {
                     idle = false;
-                    if bridges.len() >= MAX_BROKER_CLIENTS {
-                        let mut stream = stream;
-                        let _ = stream.write_all(&[EGRESS_DENIED]);
-                        let _ = stream.flush();
-                    } else {
+                    if admits_broker_client(deciding.load(Ordering::Acquire), bridges.len()) {
                         let state = Arc::clone(state);
                         let diagnostics = diagnostics.map(Path::to_path_buf);
                         let shutdown = Arc::clone(stop);
+                        deciding.fetch_add(1, Ordering::AcqRel);
+                        let decided = Deciding(Arc::clone(&deciding));
                         let client = thread::Builder::new()
                             .name("keel-broker-client".to_owned())
                             .spawn(move || {
-                                if let Ok(Some(bridge)) = handle_broker_connection(
+                                let handled = handle_broker_connection(
                                     stream,
                                     &state,
                                     diagnostics.as_deref(),
                                     &shutdown,
                                     extractor,
-                                ) {
+                                );
+                                drop(decided);
+                                if let Ok(Some(bridge)) = handled {
                                     let _ = bridge.join();
                                 }
                             })
                             .map_err(|error| error.to_string())?;
                         bridges.push(client);
+                    } else {
+                        let mut stream = stream;
+                        let _ = stream.write_all(&[EGRESS_DENIED]);
+                        let _ = stream.flush();
                     }
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {}

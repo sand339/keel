@@ -575,8 +575,9 @@ fn forward_input(
             return Ok(());
         }
     };
+    // The runtime decodes this stream again.
     let mut keystrokes = Vec::with_capacity(count);
-    let controls = input.split(&buffer[..count], &mut keystrokes);
+    let controls = input.relay(&buffer[..count], &mut keystrokes);
     if !keystrokes.is_empty() {
         terminal.write_all(&keystrokes)?;
     }
@@ -938,16 +939,15 @@ fn launcher_sandbox_profile(
   (subpath "/Library/Apple") (literal "/private/etc/localtime"))))
 (deny file-write* (require-not (literal "{}")))
 (deny process-exec (require-not (literal "{}")))
-(deny mach-lookup
-  (global-name "com.apple.SecurityServer")
-  (global-name "com.apple.securityd")
-  (global-name "com.apple.securityd.general")
-  (global-name "com.apple.securityd.xpc"))"#,
+{}
+{}"#,
         super::sb_string(start),
         super::sb_string(workspace_root),
         super::sb_string(renderer_root),
         super::sb_string(result),
         super::sb_string(renderer),
+        super::SB_DENY_HOST_SERVICES,
+        super::SB_DENY_TERMINALS,
     )
 }
 

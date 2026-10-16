@@ -8,9 +8,9 @@ use nix::unistd::Pid;
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
-    env,
     error::Error,
     fs, io,
+    os::unix::fs::MetadataExt as _,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -96,6 +96,7 @@ pub(super) fn recover_directory(
     expected: &Expected,
 ) -> io::Result<Vec<(PathBuf, BTreeMap<String, String>)>> {
     let mut written = Vec::new();
+    let user = fs::metadata(directory)?.uid();
     let mut chains = fs::read_dir(directory)?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -116,8 +117,18 @@ pub(super) fn recover_directory(
         let Ok(key) = fs::read_to_string(chain.with_extension("key")) else {
             continue;
         };
-        let key = RunKey::from_hex(&key).map_err(io::Error::other)?;
-        let (records, status) = read_verified_prefix(&chain, &key).map_err(io::Error::other)?;
+        // One chain that cannot be read must not stop the others, or the
+        // supervisor files after them, from being recovered (KSR-043).
+        let prefix = RunKey::from_hex(&key)
+            .and_then(|key| read_verified_prefix(&chain, &key))
+            .map_err(|error| error.to_string());
+        let (records, status) = match prefix {
+            Ok(prefix) => prefix,
+            Err(error) => {
+                eprintln!("keel: {}: not recovered: {error}", chain.display());
+                continue;
+            }
+        };
         if status.sealed {
             continue;
         }
@@ -126,7 +137,7 @@ pub(super) fn recover_directory(
             .iter()
             .filter(|record| record.payload.event == "kernel.run-resource")
         {
-            release(&mut teardown, record, pid, expected);
+            release(&mut teardown, record, pid, user, expected);
         }
         let checks = teardown.into_checks();
         let record = RecoveryRecord {
@@ -169,19 +180,39 @@ pub(super) fn recover_directory(
 /// Releases one recorded resource after checking it is still what the run
 /// created: a path of the run's own naming in the temporary directory, or a
 /// process group of Keel components that has not been reused since.
-fn release(teardown: &mut Teardown, record: &AuditRecord, pid: u32, expected: &Expected) {
+/// `user` owns the session directory, and so every directory the run made.
+fn release(
+    teardown: &mut Teardown,
+    record: &AuditRecord,
+    pid: u32,
+    user: u32,
+    expected: &Expected,
+) {
     let fields = &record.payload.fields;
     let detail = fields.get("detail").map_or("", String::as_str);
     match fields.get("kind").map(String::as_str) {
         Some(kind @ ("scratch" | "images" | "broker-dir")) => {
-            let (root, prefix) = match kind {
-                "scratch" => (env::temp_dir(), format!("keel-runtime-{pid}-")),
-                "images" => (env::temp_dir(), format!("keel-images-{pid}-")),
-                _ => (PathBuf::from("/tmp"), format!("keel-kernel-{pid}-")),
+            let prefix = match kind {
+                "scratch" => format!("keel-runtime-{pid}-"),
+                "images" => format!("keel-images-{pid}-"),
+                _ => format!("keel-kernel-{pid}-"),
             };
+            // The run recorded the canonical path it created under its own
+            // temporary root, which this process's `TMPDIR` need not match
+            // (KSR-053). The path must still be one the run would create: its
+            // naming, a private directory of this user, or already gone.
             let path = Path::new(detail);
-            let owned = root.canonicalize().ok().as_deref() == path.parent()
-                && file_name(path).starts_with(&prefix);
+            let parent = path.parent().filter(|parent| parent.is_absolute());
+            let ours = match fs::symlink_metadata(path) {
+                Ok(metadata) => {
+                    metadata.is_dir() && metadata.uid() == user && metadata.mode() & 0o777 == 0o700
+                }
+                Err(error) => error.kind() == io::ErrorKind::NotFound,
+            };
+            let owned = parent
+                .is_some_and(|parent| parent.canonicalize().ok().as_deref() == Some(parent))
+                && file_name(path).starts_with(&prefix)
+                && ours;
             if owned {
                 teardown.remove_dir(kind, path);
             } else {
@@ -292,7 +323,10 @@ fn executable_name(pid: i32, reported: &str) -> Option<String> {
     let path = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
     #[cfg(not(target_os = "linux"))]
     let path = PathBuf::from(reported);
-    Some(path.file_name()?.to_str()?.to_owned())
+    let name = path.file_name()?.to_str()?;
+    // An executable replaced while it runs, as `keel setup` does, is still the
+    // same program; Linux marks the link to it (KSR-041).
+    Some(name.strip_suffix(" (deleted)").unwrap_or(name).to_owned())
 }
 
 #[cfg(test)]

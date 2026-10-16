@@ -368,6 +368,11 @@ impl RuntimeIntent {
         if let Some((registry, _)) = &self.extraction {
             items.extend(registry.describe());
         }
+        // A pinned policy is named here, so a run cannot bind one the
+        // operator did not mean to admit without it showing (KSR-046).
+        if let Some(hash) = &self.policy_bundle_hash {
+            items.push(format!("policy bundle: {}", safe_text(hash.as_bytes())));
+        }
         items.join("\r\n  ")
     }
 
@@ -1288,6 +1293,7 @@ pub fn render_gate(
     method: ApprovalMethod,
     challenge: Option<&str>,
 ) -> String {
+    use std::fmt::Write as _;
     let mut screen = format!(
         "KEEL TRUSTED SCREEN\napproval\naction id: {}\nclass: {}\ntarget:\n{}\nreasons:\n",
         payload.action_id,
@@ -1320,6 +1326,14 @@ pub fn render_gate(
         screen.push_str(&safe_text(grant));
         screen.push('\n');
     }
+    // Next to the prompt, so it stays on screen however long the target is.
+    let _ = writeln!(
+        screen,
+        "this decides action {} ({}): {}",
+        payload.action_id,
+        safe_text(payload.action_class.as_bytes()),
+        safe_text(&payload.summary).replace('\n', " ")
+    );
     match method {
         ApprovalMethod::Confirm => {
             if payload.session_grant.is_some() {
@@ -1358,6 +1372,8 @@ pub const TERMINAL_CONTROL_RESIZE: u8 = b's';
 pub const TERMINAL_CONTROL_FLOOR_LIFT: u8 = b'f';
 /// Requests an orderly shutdown from the trusted runtime owner.
 pub const TERMINAL_CONTROL_SHUTDOWN: u8 = b'q';
+/// The largest terminal row or column count the renderer draws.
+pub const MAX_TERMINAL_DIMENSION: u16 = 1000;
 /// The key the guest harness already treats as "repaint the screen".
 pub const REDRAW_KEY: u8 = 0x0c;
 /// Trusted mux command-mode toggle.
@@ -1556,6 +1572,19 @@ impl TerminalControlReader {
         }
     }
 
+    /// Decodes one hop's stream for a hop that decodes it again: appends the
+    /// keystrokes in `bytes` to `forward` still escaped, so a literal control
+    /// byte the operator typed stays a keystroke (KSR-052), and returns the
+    /// messages they carried.
+    pub fn relay(&mut self, bytes: &[u8], forward: &mut Vec<u8>) -> Vec<TerminalControl> {
+        let mut keystrokes = Vec::with_capacity(bytes.len());
+        let controls = self.split(bytes, &mut keystrokes);
+        for byte in keystrokes {
+            push_keystroke(forward, byte);
+        }
+        controls
+    }
+
     /// Appends the keystrokes in `bytes` and returns the messages they carried.
     pub fn split(&mut self, bytes: &[u8], keystrokes: &mut Vec<u8>) -> Vec<TerminalControl> {
         let mut controls = Vec::new();
@@ -1588,10 +1617,14 @@ impl TerminalControlReader {
                     payload[*filled] = *byte;
                     *filled += 1;
                     if *filled == payload.len() {
-                        controls.push(TerminalControl::Resize {
-                            rows: u16::from_be_bytes([payload[0], payload[1]]),
-                            columns: u16::from_be_bytes([payload[2], payload[3]]),
-                        });
+                        let rows = u16::from_be_bytes([payload[0], payload[1]]);
+                        let columns = u16::from_be_bytes([payload[2], payload[3]]);
+                        // A size the renderer cannot draw would end the run
+                        // (KSR-052), so it is dropped here.
+                        let drawable = 1..=MAX_TERMINAL_DIMENSION;
+                        if drawable.contains(&rows) && drawable.contains(&columns) {
+                            controls.push(TerminalControl::Resize { rows, columns });
+                        }
                         self.state = ControlState::Text;
                     }
                 }
@@ -1616,16 +1649,29 @@ impl Default for InputGate {
 /// Converts untrusted bytes into terminal-safe text.
 ///
 /// Newlines and tabs are preserved for readable diffs. Every other control
-/// character is rendered as a visible hexadecimal escape.
+/// character is rendered as a visible hexadecimal escape, and so is every
+/// invisible format character, such as a bidirectional override, that could
+/// make untrusted text display differently from what it says.
 #[must_use]
 pub fn safe_text(input: &[u8]) -> String {
+    use std::fmt::Write as _;
     let mut output = String::new();
     for character in String::from_utf8_lossy(input).chars() {
         match character {
             '\n' | '\t' => output.push(character),
             value if value.is_control() => {
-                use std::fmt::Write as _;
                 write!(output, "\\x{:02x}", u32::from(value))
+                    .expect("writing to a String cannot fail");
+            }
+            '\u{ad}'
+            | '\u{61c}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}' => {
+                write!(output, "\\u{{{:04x}}}", u32::from(character))
                     .expect("writing to a String cannot fail");
             }
             value => output.push(value),

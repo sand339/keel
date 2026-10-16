@@ -119,6 +119,7 @@ pub fn install(prebuilt: Option<&Path>) -> Result<String, CliError> {
         Artifacts::release(&release)
     } else {
         let source = source_root()?;
+        println!("Building the runtime from {}", source.display());
         build_from_source(&source)?;
         Artifacts::checkout(&source)
     };
@@ -714,17 +715,15 @@ fn source_root() -> Result<PathBuf, CliError> {
     if let Some(path) = env::var_os("KEEL_SOURCE_DIR") {
         return canonical_source(Path::new(&path));
     }
-    let current = env::current_dir().map_err(io_error)?;
-    for candidate in current.ancestors() {
-        if candidate.join("Cargo.toml").is_file()
-            && candidate.join("spikes/build-phase1-image.sh").is_file()
-        {
-            return canonical_source(candidate);
-        }
-    }
-    Err(CliError::new(
-        "cannot find a Keel source checkout; run from it or set KEEL_SOURCE_DIR",
-    ))
+    // The checkout this keel was built from, never one found above the
+    // working directory, whose scripts would run unconfined (KSR-049).
+    let built = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    canonical_source(&built).map_err(|_| {
+        CliError::new(
+            "this keel was not built from a checkout on this host; install a release with \
+             `keel setup --prebuilt RELEASE_DIR`, or set KEEL_SOURCE_DIR to a Keel checkout",
+        )
+    })
 }
 
 fn canonical_source(path: &Path) -> Result<PathBuf, CliError> {
@@ -1170,12 +1169,12 @@ fn check_guest_kernel(report: &mut CheckReport, kernel: &Path) {
 mod tests {
     use super::{
         CONFIG_VERSION, CheckReport, RuntimeConfig, install_launcher, release_platform,
-        sha256_file, verify_release,
+        sha256_file, source_root, verify_release,
     };
     use std::{
         fmt::Write as _,
         fs,
-        path::PathBuf,
+        path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1196,6 +1195,18 @@ mod tests {
         }
         fs::write(root.join("SHA256SUMS"), sums).unwrap();
         root
+    }
+
+    /// KSR-049: the source is the checkout this binary was built from, not one
+    /// found above the working directory.
+    #[test]
+    fn setup_builds_from_the_checkout_it_was_built_from() {
+        if std::env::var_os("KEEL_SOURCE_DIR").is_some() {
+            return;
+        }
+        let checkout =
+            fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..")).unwrap();
+        assert_eq!(source_root().unwrap(), checkout);
     }
 
     #[test]

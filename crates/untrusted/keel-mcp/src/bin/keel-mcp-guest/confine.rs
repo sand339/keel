@@ -639,3 +639,129 @@ pub fn check_from_inside() -> ConfinementPreflight {
         landlock_abi: landlock_abi().unwrap_or(0),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AUDIT_ARCH, DENIED_SYSCALLS, NAMESPACE_FLAGS, RET_ALLOW, RET_KILL_PROCESS, errno,
+        seccomp_program,
+    };
+
+    /// Runs the filter as the kernel would on one call: the classic BPF
+    /// subset the program uses, over `seccomp_data`. A jump out of the
+    /// program, or an instruction outside the subset, fails the test.
+    #[allow(clippy::cast_possible_truncation)]
+    fn verdict(arch: u32, nr: u32, args: [u64; 6]) -> u32 {
+        let program = seccomp_program();
+        let word = |offset: u32| match offset {
+            0 => nr,
+            4 => arch,
+            offset if offset >= 16 && (offset - 16) % 8 == 0 => {
+                args[((offset - 16) / 8) as usize] as u32
+            }
+            offset => panic!("load from offset {offset}"),
+        };
+        let (mut pc, mut accumulator) = (0_usize, 0_u32);
+        loop {
+            let instruction = program
+                .get(pc)
+                .unwrap_or_else(|| panic!("pc {pc} past the end"));
+            let code = u32::from(instruction.code);
+            pc += 1;
+            match code {
+                c if c == libc::BPF_LD | libc::BPF_W | libc::BPF_ABS => {
+                    accumulator = word(instruction.k);
+                }
+                c if c == libc::BPF_ALU | libc::BPF_AND | libc::BPF_K => {
+                    accumulator &= instruction.k;
+                }
+                c if c == libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K
+                    || c == libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K =>
+                {
+                    let taken = if c & 0xf0 == libc::BPF_JEQ {
+                        accumulator == instruction.k
+                    } else {
+                        accumulator >= instruction.k
+                    };
+                    pc += usize::from(if taken {
+                        instruction.jt
+                    } else {
+                        instruction.jf
+                    });
+                }
+                c if c == libc::BPF_RET | libc::BPF_K => return instruction.k,
+                c => panic!("instruction {c:#x} at {}", pc - 1),
+            }
+        }
+    }
+
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    fn call(nr: libc::c_long, args: [u64; 6]) -> u32 {
+        verdict(AUDIT_ARCH, nr as u32, args)
+    }
+
+    /// KSR-056: every rule of the filter, its argument checks, and the ABI
+    /// prologue, interpreted over the program as built.
+    #[test]
+    #[allow(clippy::cast_sign_loss)]
+    fn the_seccomp_filter_enforces_every_rule() {
+        let eperm = errno(libc::EPERM);
+        assert_eq!(
+            verdict(0x4000_0003, libc::SYS_read as u32, [0; 6]),
+            RET_KILL_PROCESS
+        );
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            verdict(
+                AUDIT_ARCH,
+                super::X32_SYSCALL_BIT | libc::SYS_unshare as u32,
+                [0; 6]
+            ),
+            RET_KILL_PROCESS
+        );
+        for nr in DENIED_SYSCALLS {
+            assert_eq!(call(*nr, [0; 6]), eperm, "syscall {nr}");
+        }
+        assert_eq!(call(libc::SYS_clone3, [0; 6]), errno(libc::ENOSYS));
+        let sigchld = libc::SIGCHLD as u64;
+        assert_eq!(call(libc::SYS_clone, [sigchld, 0, 0, 0, 0, 0]), RET_ALLOW);
+        for flag in [libc::CLONE_NEWUSER, libc::CLONE_NEWNS, libc::CLONE_NEWNET] {
+            let flags = u64::from(flag as u32) | sigchld;
+            assert_eq!(
+                call(libc::SYS_clone, [flags, 0, 0, 0, 0, 0]),
+                eperm,
+                "{flag:#x}"
+            );
+        }
+        assert_ne!(NAMESPACE_FLAGS, 0);
+        let seccomp = libc::PR_SET_SECCOMP as u64;
+        assert_eq!(call(libc::SYS_prctl, [seccomp, 0, 0, 0, 0, 0]), eperm);
+        let name = libc::PR_SET_NAME as u64;
+        assert_eq!(call(libc::SYS_prctl, [name, 0, 0, 0, 0, 0]), RET_ALLOW);
+        let socket = |domain: libc::c_int, kind: libc::c_int, protocol: libc::c_int| {
+            call(
+                libc::SYS_socket,
+                [domain as u64, kind as u64, protocol as u64, 0, 0, 0],
+            )
+        };
+        assert_eq!(socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0), eperm);
+        assert_eq!(socket(libc::AF_PACKET, libc::SOCK_RAW, 0), eperm);
+        assert_eq!(
+            socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE),
+            RET_ALLOW
+        );
+        assert_eq!(
+            socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_AUDIT),
+            eperm
+        );
+        assert_eq!(socket(libc::AF_INET, libc::SOCK_STREAM, 0), RET_ALLOW);
+        assert_eq!(socket(libc::AF_INET6, libc::SOCK_DGRAM, 0), RET_ALLOW);
+        assert_eq!(socket(libc::AF_INET, libc::SOCK_RAW, 1), eperm);
+        assert_eq!(
+            socket(libc::AF_INET6, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 58),
+            eperm
+        );
+        assert_eq!(socket(libc::AF_UNIX, libc::SOCK_STREAM, 0), RET_ALLOW);
+        assert_eq!(call(libc::SYS_read, [0; 6]), RET_ALLOW);
+    }
+}

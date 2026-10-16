@@ -197,7 +197,7 @@ Use a disposable private repository with an HTTPS origin and the `KEEL_GIT_*` va
 | Y1 | `keel policy compile --text "Allow HTTPS to example.com and require approval for Git push." --output d.json` | A draft |
 | Y2 | `keel policy show d.json`, `keel policy diff old.json d.json` | Readable rules and a diff |
 | Y3 | `keel mux --policy d.json` without accepting | Refused: not accepted |
-| Y4 | `keel policy accept d.json --output p.json`, `keel mux --policy p.json` | The run uses it |
+| Y4 | `keel policy accept d.json --hash HASH --output p.json` with the hash Y2 showed, `keel mux --policy p.json` | The run uses it; a wrong hash, or a draft edited after review, is refused |
 | Y5 | Edit one rule in `p.json`, run with it | Refused: hash not in the accepted ledger |
 | Y6 | In a clone with a GitHub origin, compile and accept "For repository OWNER/NAME: never allow Git push", then ask for a push | Denied with no prompt (`deny:policy:…`); approval cannot override. A host-specific deny such as "deny HTTPS to example.com" is refused at compile time, since policy rules cannot express it |
 

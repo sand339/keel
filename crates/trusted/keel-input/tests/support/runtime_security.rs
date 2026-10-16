@@ -453,3 +453,186 @@ fn runtime_sandbox_connects_only_to_the_assigned_broker_socket() {
     drop(other_listener);
     fs::remove_dir_all(scratch).expect("remove scratch");
 }
+
+/// A confined child holding the operator's terminal could inject keystrokes
+/// with `TIOCSTI` or paint over the trusted screen, so no profile may open a
+/// terminal device even though `/dev` is otherwise readable.
+#[cfg(target_os = "macos")]
+#[test]
+fn confined_children_cannot_open_a_terminal() {
+    let _sandbox_guard = SANDBOX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pty = nix::pty::openpty(None, None).expect("open a pseudo-terminal");
+    let terminal = nix::unistd::ttyname(&pty.slave).expect("terminal path");
+    let opens = |profile: Option<&str>, path: &Path| {
+        let mut command = Command::new("/usr/bin/sandbox-exec");
+        match profile {
+            Some(profile) => command.args(["-p", profile, "/bin/bash"]),
+            None => command.args(["-p", "(version 1)\n(allow default)", "/bin/bash"]),
+        };
+        command
+            .arg("-c")
+            .arg(format!(": < '{}'", path.display()))
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("sandbox-exec")
+            .success()
+    };
+    assert!(
+        opens(None, &terminal),
+        "control: the terminal opens unconfined"
+    );
+    let workspace = std::env::current_dir().expect("workspace");
+    let runtime = runtime_sandbox_profile(
+        [
+            Path::new("/bin/bash"),
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            Path::new("/nonexistent/keel-git-helpers"),
+        ],
+        Path::new("/nonexistent/keel-git-data"),
+        &workspace,
+        [
+            Path::new("/nonexistent/keel-components"),
+            Path::new("/nonexistent/keel-images"),
+        ],
+        Path::new("/dev/null"),
+        [
+            Path::new("/nonexistent/keel-scratch"),
+            Path::new("/dev/null"),
+        ],
+        Path::new("/tmp/keel-test-broker.sock"),
+        None,
+    );
+    let renderer = renderer_sandbox_profile(Path::new("/bin/bash"));
+    for (name, profile) in [("runtime", &runtime), ("renderer", &renderer)] {
+        assert!(
+            opens(Some(profile), Path::new("/dev/null")),
+            "{name}: /dev/null stays usable"
+        );
+        assert!(
+            !opens(Some(profile), &terminal),
+            "{name} opened {}",
+            terminal.display()
+        );
+        assert!(
+            !opens(Some(profile), Path::new("/dev/tty")),
+            "{name} opened /dev/tty"
+        );
+    }
+}
+
+/// KSR-035: the clipboard, `LaunchServices`, and name resolution are host
+/// services a confined child could use to read secrets or reach the network
+/// around its sandbox. Each probe works unconfined and fails confined.
+#[cfg(target_os = "macos")]
+#[test]
+fn confined_children_cannot_reach_host_services() {
+    let _sandbox_guard = SANDBOX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let probes: [(&str, &[&str], &str); 3] = [
+        ("/usr/bin/pbpaste", &[], ""),
+        (
+            "/usr/bin/lsappinfo",
+            &["info", "-only", "name", "Finder"],
+            "Finder",
+        ),
+        (
+            "/usr/bin/dscacheutil",
+            &["-q", "host", "-a", "name", "localhost"],
+            "address",
+        ),
+    ];
+    let reaches = |profile: &str, program: &str, arguments: &[&str], expected: &str| {
+        let output = Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", profile, program])
+            .args(arguments)
+            .stdin(Stdio::null())
+            .output()
+            .expect("sandbox-exec");
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains(expected)
+    };
+    let workspace = std::env::current_dir().expect("workspace");
+    for (program, arguments, expected) in probes {
+        assert!(
+            reaches("(version 1)\n(allow default)", program, arguments, expected),
+            "control: {program} works unconfined"
+        );
+        let runtime = runtime_sandbox_profile(
+            [
+                Path::new(program),
+                Path::new("/usr/bin/true"),
+                Path::new("/usr/bin/true"),
+                Path::new("/nonexistent/keel-git-helpers"),
+            ],
+            Path::new("/nonexistent/keel-git-data"),
+            &workspace,
+            [
+                Path::new("/nonexistent/keel-components"),
+                Path::new("/nonexistent/keel-images"),
+            ],
+            Path::new("/dev/null"),
+            [
+                Path::new("/nonexistent/keel-scratch"),
+                Path::new("/dev/null"),
+            ],
+            Path::new("/tmp/keel-test-broker.sock"),
+            None,
+        );
+        let renderer = renderer_sandbox_profile(Path::new(program));
+        for (name, profile) in [("runtime", &runtime), ("renderer", &renderer)] {
+            assert!(
+                !reaches(profile, program, arguments, expected),
+                "{name} sandbox reached a host service through {program}"
+            );
+        }
+    }
+}
+
+/// KSR-054: the backend's confiner starts only once the runtime says so, and
+/// a runtime that dies first leaves nothing running.
+#[test]
+fn the_start_gate_runs_the_command_only_after_start() {
+    use std::os::fd::AsRawFd as _;
+    let gated = |start: Option<&[u8]>| {
+        let (gate, mut writer) = std::io::pipe().unwrap();
+        // Above 9, as the runtime's own descriptors are, which dash cannot
+        // redirect.
+        let mut held = Vec::new();
+        let inherited = loop {
+            let fd = nix::unistd::dup(&gate).unwrap();
+            if fd.as_raw_fd() > 9 {
+                break fd;
+            }
+            held.push(fd);
+        };
+        drop(held);
+        let child = Command::new(super::START_GATE_SHELL)
+            .args(["-c", super::START_GATE, "keel-start", "/bin/sh", "-c"])
+            .arg(format!(
+                "echo ran; [ -e /dev/fd/{} ] && echo leaked; true",
+                inherited.as_raw_fd()
+            ))
+            .env("KEEL_START_FD", inherited.as_raw_fd().to_string())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop((inherited, gate));
+        if let Some(start) = start {
+            // The gate may already have refused and closed its end.
+            let _ = writer.write_all(start);
+        }
+        drop(writer);
+        let output = child.wait_with_output().unwrap();
+        (
+            output.status.code(),
+            String::from_utf8(output.stdout).unwrap(),
+        )
+    };
+    assert_eq!(gated(Some(b"start\n")), (Some(0), "ran\n".to_owned()));
+    assert_eq!(gated(None), (Some(125), String::new()));
+    assert_eq!(gated(Some(b"other\n")), (Some(125), String::new()));
+}

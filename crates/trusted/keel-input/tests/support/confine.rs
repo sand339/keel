@@ -21,6 +21,7 @@ fn a_confined_child_sees_only_its_paths_and_no_network() {
 
     assert!(window(&["--unshare-all"]), "every namespace is unshared");
     assert!(window(&["--die-with-parent"]));
+    assert!(window(&["--new-session"]), "no controlling terminal");
     assert!(window(&["--cap-drop", "ALL"]));
     assert!(!argv.iter().any(|argument| argument == "--share-net"));
     assert!(window(&["--ro-bind", "/opt/keel", "/opt/keel"]));

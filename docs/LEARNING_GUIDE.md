@@ -1038,6 +1038,7 @@ keel policy show .keel/policy.draft.json
 
 keel policy accept \
   .keel/policy.draft.json \
+  --hash HASH \
   --output .keel/policy.json
 
 keel mux --policy .keel/policy.json

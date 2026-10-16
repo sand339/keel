@@ -14,6 +14,7 @@ fi
 cargo test --workspace --all-targets
 cargo test --workspace --doc
 python3 ci/check_invariants.py
+sh ci/test-pre-push-guard.sh
 
 if command -v cargo-deny >/dev/null 2>&1; then
     cargo deny check

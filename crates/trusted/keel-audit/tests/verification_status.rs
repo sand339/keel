@@ -37,7 +37,8 @@ fn authenticated_prefix_is_reported_but_not_accepted_as_complete() {
         keel_audit::VerificationStatus {
             records: 1,
             sealed: false,
-            seal_hash: None
+            seal_hash: None,
+            truncated: false
         }
     );
     assert_eq!(
@@ -56,6 +57,19 @@ fn authenticated_prefix_is_reported_but_not_accepted_as_complete() {
         read_verified_prefix(&path, &RunKey::new([32; 32])).is_err(),
         "a wrong key authenticates nothing"
     );
+    // KSR-043: a writer killed mid-record leaves a partial last line. The
+    // prefix before it still reads; a malformed complete line still fails.
+    let first = complete.lines().next().unwrap();
+    let second = complete.lines().nth(1).unwrap();
+    fs::write(&path, format!("{first}\n{}", &second[..second.len() / 2])).unwrap();
+    let (records, status) = read_verified_prefix(&path, &RunKey::new([31; 32])).unwrap();
+    assert_eq!(records.len(), 1);
+    assert!(status.truncated && !status.sealed);
+    fs::write(&path, format!("{first}\n{}\n", &second[..second.len() / 2])).unwrap();
+    assert!(matches!(
+        inspect_file(&path, &RunKey::new([31; 32])),
+        Err(AuditError::Serialization(_))
+    ));
     fs::remove_dir_all(root).unwrap();
 }
 

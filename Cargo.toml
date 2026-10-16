@@ -32,7 +32,7 @@ rcgen = { version = "=0.14.10", default-features = false, features = ["pem", "ri
 rmcp = { version = "=3.4.0", default-features = false, features = ["client", "macros", "server", "transport-async-rw"] }
 ring = "=0.17.14"
 regorus = { version = "=0.5.0", default-features = false, features = ["std"] }
-rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.145"
 tokio = { version = "=1.47.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }

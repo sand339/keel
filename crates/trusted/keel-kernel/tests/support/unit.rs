@@ -9,8 +9,8 @@ use super::{
     ModelBudgetLimits, ModelBudgetRequest, Policy, PrincipalId, Processed, ProtectedState,
     ProvenanceMode, REPEATED_DENIAL_RULE, ReportedOutcomeEvent, SessionFacts, SessionSnapshot,
     SessionState, SourceRef, Stamped, StructuralRejectionEvent, Target, TerminalGate, Violation,
-    action_target_hash, intent_verdict, model_path_allowed, record_egress_failure, sha256,
-    terminal_gate_channel, violation_rules,
+    action_target_hash, intent_verdict, model_path_allowed, protected_view, record_egress_failure,
+    render_gate_target, sha256, terminal_gate_channel, violation_rules,
 };
 use std::{
     collections::BTreeSet,
@@ -1715,6 +1715,19 @@ fn github_pull_request_permit_matches_exact_request_and_is_consumed_once() {
         host: "api.github.com".to_owned(),
         port: 443,
     };
+    // KSR-039: a trailing slash is the same effect, so it needs the permit,
+    // and the permit is bound to the exact path that was approved.
+    assert!(
+        state
+            .authorize_http(
+                &target,
+                "POST",
+                "/repos/acme/widget/pulls/",
+                sha256(&body),
+                None,
+            )
+            .is_err()
+    );
     assert!(
         state
             .authorize_http(
@@ -2689,6 +2702,41 @@ fn pushes_are_judged_from_their_own_bytes() {
         protected,
         "content the kernel cannot read is treated as protected"
     );
+
+    // KSR-037, KSR-038: the relay claims a quiet feature-branch push.
+    let flags = |state: &mut BrokerState, body: &[u8]| {
+        let mut asserted = push(&["refs/heads/topic"], false, false);
+        let (integrity, _) = state.inspect_push(&inspection, &mut asserted, body);
+        let Target::Git {
+            is_force,
+            is_default_branch,
+            touches_manifest,
+            ..
+        } = asserted.target
+        else {
+            unreachable!()
+        };
+        (integrity, is_force, is_default_branch, touches_manifest)
+    };
+    let line = |text: String| format!("{:04x}{text}", text.len() + 4).into_bytes();
+    let zero = "0".repeat(admitted.len());
+    // One unreadable ref name next to a default-branch update.
+    let mut hidden = line(format!(
+        "{admitted} {notes} refs/heads/main\0report-status\n"
+    ));
+    hidden.extend(line(format!("{zero} {notes} refs/heads/x y\n")));
+    hidden.extend_from_slice(b"0000");
+    assert_eq!(
+        flags(&mut state, &hidden),
+        (IntegrityVerdict::Uninspectable, true, true, true),
+        "a body the kernel cannot fully read gates as every kind of push"
+    );
+    let mut deletion = line(format!(
+        "{admitted} {zero} refs/heads/topic\0report-status\n"
+    ));
+    deletion.extend_from_slice(b"0000");
+    let (_, force, ..) = flags(&mut state, &deletion);
+    assert!(force, "a deletion is a force push whatever the relay says");
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -3021,4 +3069,138 @@ fn each_provider_admits_only_its_own_message_path() {
             "{host} {method} {path}"
         );
     }
+}
+
+/// KSR-040: guest-supplied detail cannot forge the trusted header or scroll
+/// the real one away from the prompt.
+#[test]
+fn untrusted_gate_text_is_quoted_and_bounded() {
+    let forged = format!(
+        "{{\"title\":\"x\"}}{}KEEL TRUSTED SCREEN\naction id: 12\nrecipient: \"owner/expected\"",
+        "\n".repeat(200)
+    );
+    let rendered = render_gate_target(&Target::External {
+        service: "github".to_owned(),
+        recipient: "attacker/repo".to_owned(),
+        operation: "create-pull-request".to_owned(),
+        detail: forged,
+    });
+    assert!(rendered.contains("recipient: \"attacker/repo\""));
+    let after_header = rendered.split_once("detail:\n").expect("detail section").1;
+    assert!(
+        after_header
+            .lines()
+            .all(|line| line.starts_with("  \u{2502} ") || line.starts_with("  (")),
+        "every untrusted line is inside the gutter:\n{after_header}"
+    );
+    assert!(after_header.lines().count() <= 81, "the block is bounded");
+    assert!(after_header.contains("more lines not shown"));
+
+    let long = render_gate_target(&Target::External {
+        service: "github".to_owned(),
+        recipient: "o/r".to_owned(),
+        operation: "create-pull-request".to_owned(),
+        detail: "y".repeat(10_000),
+    });
+    assert!(long.contains("[line truncated]") && long.len() < 1_000);
+}
+
+/// KSR-036: a lift vouches for the read-set it displayed, so content read
+/// while the operator answers it is not silently vouched for as well.
+#[test]
+fn a_floor_lift_is_refused_when_the_read_set_changed_during_its_prompt() {
+    use super::GateOutcome;
+    use keel_provenance::{ClassifiedResult, Rank};
+
+    let state = |floor: u8| {
+        let mut facts = SessionFacts::default();
+        facts.floor = floor;
+        BrokerState::new(
+            "lift".to_owned(),
+            BTreeSet::new(),
+            BTreeSet::new(),
+            "api.anthropic.com".to_owned(),
+            facts,
+            ProvenanceMode::Floor,
+            Box::new(Allow),
+            Box::new(TestConnector {
+                address: "127.0.0.1:9".parse().expect("socket address"),
+                observed_method: "GET",
+                observed_path: "/",
+                model_budget: None,
+            }),
+            Box::new(DiscardAudit),
+            Box::new(Harness::default()),
+            ModelBudgetLimits::default(),
+        )
+        .expect("broker state")
+    };
+    let approve = || {
+        Some(GateOutcome {
+            decision: GateDecision::Approve,
+            authority: "operator",
+            time_to_decision_ms: 1,
+        })
+    };
+
+    let mut quiet = state(0);
+    let begun = quiet
+        .begin_lift_floor(2)
+        .map_err(drop)
+        .expect("lift begins");
+    assert_eq!(quiet.finish_lift_floor(begun, approve()), Ok(2));
+
+    let mut busy = state(0);
+    let begun = busy.begin_lift_floor(2).map_err(drop).expect("lift begins");
+    busy.kernel.session.observe_result(
+        ClassifiedResult::new(
+            Rank::UntrustedContent,
+            SourceRef::Host {
+                host: "attacker.example".to_owned(),
+                path: "/injection".to_owned(),
+            },
+        ),
+        1,
+    );
+    assert!(busy.finish_lift_floor(begun, approve()).is_err());
+    assert_eq!(busy.kernel.session().floor(), 0, "the floor stays down");
+}
+
+/// KSR-042: the gate's protected view is derived from the pushed objects:
+/// every protected path the push changes, and the protected content it adds.
+#[test]
+fn the_protected_view_comes_from_the_derived_push() {
+    use keel_provenance::{PushedBlob, PushedContent};
+    let mut content = PushedContent::default();
+    assert_eq!(protected_view(&content), None);
+    content.blobs.push(PushedBlob {
+        path: "README.md".to_owned(),
+        text: Some("readme".to_owned()),
+    });
+    assert_eq!(protected_view(&content), None, "nothing protected");
+    content.blobs.push(PushedBlob {
+        path: ".github/workflows/x.yml".to_owned(),
+        text: Some("on: push".to_owned()),
+    });
+    content.protected_paths.insert("package.json".to_owned());
+    let view = protected_view(&content).unwrap();
+    assert!(view.starts_with(
+        "derived by Keel; protected paths changed: {\".github/workflows/x.yml\", \"package.json\"}"
+    ));
+    assert!(view.contains("--- \".github/workflows/x.yml\" as pushed\non: push"));
+    assert!(!view.contains("readme"));
+}
+
+/// KSR-057: established bridges do not use up the slots in which new
+/// connections are decided, so Git and extraction requests still get in.
+#[test]
+fn established_bridges_do_not_lock_out_new_requests() {
+    use super::{MAX_BROKER_BRIDGES, MAX_BROKER_CLIENTS, admits_broker_client};
+    assert!(admits_broker_client(0, MAX_BROKER_CLIENTS));
+    assert!(admits_broker_client(MAX_BROKER_CLIENTS - 1, 200));
+    assert!(!admits_broker_client(
+        MAX_BROKER_CLIENTS,
+        MAX_BROKER_CLIENTS
+    ));
+    assert!(!admits_broker_client(0, MAX_BROKER_BRIDGES));
 }

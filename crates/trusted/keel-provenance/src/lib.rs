@@ -68,6 +68,60 @@ pub fn trusted_git_command() -> Command {
     command
 }
 
+/// Global options that empty every content filter `repository` configures.
+///
+/// A `filter.<driver>.clean`, `smudge`, or `process` command runs whenever Git
+/// converts worktree content, as `git status` does for a file whose stat data
+/// changed, and attributes can name a driver from the worktree's
+/// `.gitattributes` or `.git/info/attributes`. Both are writable by untrusted
+/// code, and no fixed override can name every driver, so each one the
+/// repository's configuration defines is listed and emptied. Reading the
+/// configuration runs nothing.
+///
+/// # Errors
+///
+/// Returns an error when the configuration cannot be read, or names a driver
+/// that cannot be overridden on the command line; the caller must then not run
+/// a command that converts content.
+pub fn content_filter_overrides(repository: &Path) -> Result<Vec<String>, String> {
+    let output = trusted_git_command()
+        .arg("-C")
+        .arg(repository)
+        .args(["config", "--name-only", "--get-regexp", r"^filter\."])
+        .output()
+        .map_err(|error| format!("read Git filter configuration: {error}"))?;
+    // Exit status 1 means no key matched.
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err("read Git filter configuration: git config failed".to_owned());
+    }
+    let listing = String::from_utf8(output.stdout)
+        .map_err(|_| "Git filter configuration is not UTF-8".to_owned())?;
+    let mut drivers = listing
+        .lines()
+        .filter_map(|key| Some(key.strip_prefix("filter.")?.rsplit_once('.')?.0))
+        .collect::<Vec<_>>();
+    drivers.sort_unstable();
+    drivers.dedup();
+    let mut overrides = Vec::new();
+    for driver in drivers {
+        if driver.contains(['=', '\n', '\r']) {
+            return Err(format!("Git filter driver {driver:?} cannot be disabled"));
+        }
+        for (variable, value) in [
+            ("clean", ""),
+            ("smudge", ""),
+            ("process", ""),
+            ("required", "false"),
+        ] {
+            overrides.extend([
+                "-c".to_owned(),
+                format!("filter.{driver}.{variable}={value}"),
+            ]);
+        }
+    }
+    Ok(overrides)
+}
+
 /// Trusted provenance ranks, ordered from untrusted to operator instruction.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]

@@ -42,6 +42,13 @@ pub struct PushedContent {
     pub updates: Vec<RefUpdate>,
     /// Every new blob reachable from a pushed commit, at each of its paths.
     pub blobs: Vec<PushedBlob>,
+    /// Whether an update deletes a ref, or replaces a commit of admitted
+    /// history with one that does not descend from it.
+    pub rewrites: bool,
+    /// Protected paths an update changes relative to its old commit, or to
+    /// the admitted `HEAD` when the old commit is absent or outside admitted
+    /// history: deleted, or given admitted content, as well as added to.
+    pub protected_paths: BTreeSet<String>,
 }
 
 /// Splits a receive-pack request into its ref commands and the offset of its
@@ -107,11 +114,17 @@ pub fn receive_pack_commands(body: &[u8]) -> Result<(Vec<RefUpdate>, usize), Str
 pub fn derive_push(body: &[u8], base: &Path, scratch: &Path) -> Result<PushedContent, String> {
     let (updates, offset) = receive_pack_commands(body)?;
     let mut content = PushedContent {
+        // Deleting a ref discards its history exactly as a force push does.
+        rewrites: (updates.iter()).any(|update| is_zero(&update.new) && !is_zero(&update.old)),
         updates,
         blobs: Vec::new(),
+        protected_paths: BTreeSet::new(),
     };
     let pack = &body[offset..];
+    let head = admitted_head(base)?;
     if pack.is_empty() {
+        // A ref moved to a commit the remote already holds is compared too.
+        compare_with_admitted(base, head.as_deref(), &BTreeSet::new(), &mut content)?;
         return Ok(content);
     }
     let git = |arguments: &[&str]| {
@@ -174,6 +187,7 @@ pub fn derive_push(body: &[u8], base: &Path, scratch: &Path) -> Result<PushedCon
         .filter_map(|line| line.split_whitespace().nth(1).map(str::to_owned))
         .collect::<Vec<_>>();
     let new = missing_from(base, &in_pack)?;
+    compare_with_admitted(scratch, head.as_deref(), &new, &mut content)?;
     for update in content
         .updates
         .iter()
@@ -203,6 +217,122 @@ pub fn derive_push(body: &[u8], base: &Path, scratch: &Path) -> Result<PushedCon
         }
     }
     Ok(content)
+}
+
+/// Marks rewrites of admitted history and the protected paths each update
+/// changes. `repository` holds admitted history and the push's objects;
+/// `added` are the objects the push adds to it; `head` is the admitted
+/// `HEAD`, against which a new ref, or one whose old commit is not admitted,
+/// is compared (KSR-042).
+fn compare_with_admitted(
+    repository: &Path,
+    head: Option<&str>,
+    added: &BTreeSet<String>,
+    content: &mut PushedContent,
+) -> Result<(), String> {
+    let git = |arguments: &[&str]| {
+        trusted_git_command()
+            .arg("-C")
+            .arg(repository)
+            .args(arguments)
+            .output()
+            .map_err(|error| error.to_string())
+    };
+    for update in content
+        .updates
+        .iter()
+        .filter(|update| !is_zero(&update.new))
+    {
+        let commit = format!("{}^{{commit}}", update.old);
+        let against = if is_zero(&update.old) {
+            head
+        } else if git(&["cat-file", "-e", &commit])?.status.success() {
+            let ancestry = git(&["merge-base", "--is-ancestor", &update.old, &update.new])?;
+            match ancestry.status.code() {
+                Some(0) => {}
+                Some(1) => content.rewrites = true,
+                _ => return Err("cannot compare a pushed commit with admitted history".to_owned()),
+            }
+            Some(update.old.as_str())
+        } else {
+            // An old commit outside admitted history, such as this run's own
+            // earlier push, is only ever reached through commits the push
+            // adds; one that is not is a rewrite (KSR-038).
+            content.rewrites |= !reaches_through_added(&git, &update.new, &update.old, added)?;
+            head
+        };
+        let Some(against) = against else {
+            continue;
+        };
+        let changed = git(&[
+            "diff-tree",
+            "-r",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            against,
+            &update.new,
+        ])?;
+        if !changed.status.success() {
+            return Err("cannot compare a pushed tree with admitted history".to_owned());
+        }
+        content.protected_paths.extend(
+            changed
+                .stdout
+                .split(|byte| *byte == 0)
+                .map(|path| String::from_utf8_lossy(path).into_owned())
+                .filter(|path| is_protected_path(path)),
+        );
+    }
+    Ok(())
+}
+
+/// The commit admitted history's `HEAD` names, if it names one.
+fn admitted_head(base: &Path) -> Result<Option<String>, String> {
+    let output = trusted_git_command()
+        .arg("-C")
+        .arg(base)
+        .args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+        .output()
+        .map_err(|error| error.to_string())?;
+    Ok(output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned()))
+}
+
+/// Whether `old` is `new` or a parent of a commit the push adds that `new`
+/// reaches. Admitted history cannot reach a commit it does not hold, so only
+/// added commits are walked.
+fn reaches_through_added(
+    git: &impl Fn(&[&str]) -> Result<std::process::Output, String>,
+    new: &str,
+    old: &str,
+    added: &BTreeSet<String>,
+) -> Result<bool, String> {
+    let mut pending = vec![new.to_owned()];
+    let mut walked = BTreeSet::new();
+    while let Some(commit) = pending.pop() {
+        if commit == old {
+            return Ok(true);
+        }
+        if !added.contains(&commit) || !walked.insert(commit.clone()) {
+            continue;
+        }
+        let object = git(&["cat-file", "commit", &commit])?;
+        if !object.status.success() {
+            return Err("a pushed commit cannot be read".to_owned());
+        }
+        pending.extend(
+            object
+                .stdout
+                .split(|byte| *byte == b'\n')
+                .take_while(|line| !line.is_empty())
+                .filter_map(|line| line.strip_prefix(b"parent "))
+                .map(|parent| String::from_utf8_lossy(parent).into_owned()),
+        );
+    }
+    Ok(false)
 }
 
 /// The objects among `objects` that `base` does not hold.

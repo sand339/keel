@@ -192,6 +192,17 @@ fn untrusted_model_budget_can_narrow_but_elevation_requires_admission() {
         .expect("an elevated untrusted budget requires trusted admission");
     assert!(admission.contains("token ceiling=2000000"));
     assert!(admission.contains("cost ceiling=25000000 micro-USD (USD 25.000000)"));
+    assert!(!admission.contains("policy bundle"));
+    // KSR-046: a pinned policy is named on the admission screen.
+    let pinned = parse(
+        r#"{"session_id":"pinned","allow":[],"policy_bundle_hash":"ab12","provenance":"floor","harness":"none","harness_args":[],"model_token_budget":2000000,"model_cost_budget_microusd":25000000}"#,
+    );
+    assert!(
+        pinned
+            .task_admission()
+            .unwrap()
+            .contains("policy bundle: ab12")
+    );
     assert_eq!(
         elevated.start_kernel_broker().err().unwrap(),
         "elevated model budget requires trusted task admission"
@@ -222,11 +233,21 @@ fn push(path: &Path, force: bool) -> u8 {
     stream.write_all(&1_u16.to_be_bytes()).unwrap();
     write_wire_string(&mut stream, "refs/heads/topic");
     stream.write_all(&[u8::from(force), 0, 0, 0]).unwrap();
-    let body = b"0000";
-    let digest = ring::digest::digest(&ring::digest::SHA256, body);
+    // A well-formed receive-pack command creating the ref, with no pack: the
+    // kernel derives the push from the body, and gates one it cannot read as
+    // every kind of push at once.
+    let command = format!(
+        "{} {} refs/heads/topic\0report-status\n",
+        "0".repeat(40),
+        "1".repeat(40)
+    );
+    let body = format!("{:04x}{command}0000", command.len() + 4).into_bytes();
+    let digest = ring::digest::digest(&ring::digest::SHA256, &body);
     stream.write_all(digest.as_ref()).unwrap();
-    stream.write_all(&4_u32.to_be_bytes()).unwrap();
-    stream.write_all(body).unwrap();
+    stream
+        .write_all(&u32::try_from(body.len()).unwrap().to_be_bytes())
+        .unwrap();
+    stream.write_all(&body).unwrap();
     stream.flush().unwrap();
     let mut response = [0];
     stream.read_exact(&mut response).unwrap();

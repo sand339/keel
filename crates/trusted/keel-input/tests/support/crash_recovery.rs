@@ -1,9 +1,14 @@
+#[cfg(target_os = "linux")]
+use super::executable_name;
 use super::{Expected, elapsed_seconds, recover_directory};
 use keel_audit::{AuditPayload, AuditWriter, Redactor, RunKey};
 use std::{
     collections::BTreeMap,
     env, fs,
-    os::unix::process::{CommandExt as _, ExitStatusExt as _},
+    os::unix::{
+        fs::PermissionsExt as _,
+        process::{CommandExt as _, ExitStatusExt as _},
+    },
     path::{Path, PathBuf},
     process::{Child, Command},
     time::{SystemTime, UNIX_EPOCH},
@@ -72,6 +77,12 @@ fn chain(directory: &Path, pid: u32, resources: &[(&str, String)], sealed: bool)
     path
 }
 
+/// A directory made as the runtime makes its own: private to this user.
+fn private_dir(path: &Path) {
+    fs::create_dir(path).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
 fn group_leader() -> Child {
     Command::new("/bin/sleep")
         .arg("30")
@@ -94,18 +105,18 @@ fn recovery_releases_what_the_interrupted_chain_names() {
         .canonicalize()
         .unwrap()
         .join(format!("keel-runtime-{DEAD_PID}-{}", nonce()));
-    fs::create_dir(&scratch).unwrap();
+    private_dir(&scratch);
     fs::write(scratch.join("launch"), "x").unwrap();
     let broker = Path::new("/tmp")
         .canonicalize()
         .unwrap()
         .join(format!("keel-kernel-{DEAD_PID}-{}", nonce()));
-    fs::create_dir(&broker).unwrap();
+    private_dir(&broker);
     let unrelated = env::temp_dir()
         .canonicalize()
         .unwrap()
         .join(format!("keel-unrelated-{}", nonce()));
-    fs::create_dir(&unrelated).unwrap();
+    private_dir(&unrelated);
     // After a real crash the orphaned leader is reaped by launchd; here the
     // test is its parent, so a thread reaps it as recovery ends the group.
     let backend = group_leader();
@@ -216,6 +227,85 @@ fn sealed_chains_and_live_writers_are_left_alone() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+/// KSR-043: a record torn by the crash ends the chain's authenticated prefix,
+/// and a chain that cannot be read at all does not stop the next one.
+#[test]
+fn a_torn_tail_is_recovered_and_an_unreadable_chain_is_skipped() {
+    let directory = session();
+    let unreadable = chain(&directory, DEAD_PID - 1, &[], false);
+    fs::write(&unreadable, "not a record\n").unwrap();
+    let scratch = env::temp_dir()
+        .canonicalize()
+        .unwrap()
+        .join(format!("keel-runtime-{DEAD_PID}-{}", nonce()));
+    private_dir(&scratch);
+    let torn = chain(
+        &directory,
+        DEAD_PID,
+        &[("scratch", scratch.display().to_string())],
+        true,
+    );
+    let text = fs::read_to_string(&torn).unwrap();
+    let lines = text.lines().collect::<Vec<_>>();
+    let seal = lines[lines.len() - 1];
+    fs::write(
+        &torn,
+        format!(
+            "{}\n{}",
+            lines[..lines.len() - 1].join("\n"),
+            &seal[..seal.len() / 2]
+        ),
+    )
+    .unwrap();
+
+    let written = recover_directory(&directory, &sleeping_backend()).unwrap();
+    assert_eq!(written.len(), 1, "{written:?}");
+    assert!(
+        written[0]
+            .0
+            .ends_with(format!("audit-{DEAD_PID}-1-0.recovery.json"))
+    );
+    assert!(!scratch.exists(), "the torn chain's scratch is released");
+    fs::remove_dir_all(directory).unwrap();
+}
+
+/// KSR-041: `keel setup` renames a new runtime over a running one, which is
+/// still the runtime.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_runtime_replaced_while_it_runs_is_still_the_runtime() {
+    let directory = session();
+    let program = directory.join("keel-input-runtime");
+    fs::copy("/bin/sleep", &program).unwrap();
+    // Another test's fork can briefly hold the copy open for writing.
+    let mut child = (0..50)
+        .find_map(|_| match Command::new(&program).arg("30").spawn() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                None
+            }
+            spawned => Some(spawned.unwrap()),
+        })
+        .unwrap();
+    let replacement = directory.join("replacement");
+    fs::copy("/bin/sleep", &replacement).unwrap();
+    fs::rename(&replacement, &program).unwrap();
+    let pid = i32::try_from(child.id()).unwrap();
+    assert!(
+        fs::read_link(format!("/proc/{pid}/exe"))
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(" (deleted)")
+    );
+    assert_eq!(
+        executable_name(pid, "").as_deref(),
+        Some("keel-input-runtime")
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
 #[test]
 fn ps_elapsed_time_is_parsed_in_every_shape() {
     assert_eq!(elapsed_seconds("07"), Some(7));
@@ -223,4 +313,34 @@ fn ps_elapsed_time_is_parsed_in_every_shape() {
     assert_eq!(elapsed_seconds("02:01:07"), Some(7267));
     assert_eq!(elapsed_seconds("3-02:01:07"), Some(266_467));
     assert_eq!(elapsed_seconds("x:07"), None);
+}
+
+/// KSR-053: a directory the chain names is released wherever the run's own
+/// temporary root was, but not one that is shared or another user's to make.
+#[test]
+fn recorded_directories_are_checked_by_ownership_not_by_root() {
+    let directory = session();
+    let elsewhere = directory.canonicalize().unwrap().join("tmpdir");
+    private_dir(&elsewhere);
+    let scratch = elsewhere.join(format!("keel-runtime-{DEAD_PID}-0"));
+    private_dir(&scratch);
+    let shared = elsewhere.join(format!("keel-images-{DEAD_PID}-0"));
+    fs::create_dir(&shared).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+    chain(
+        &directory,
+        DEAD_PID,
+        &[
+            ("scratch", scratch.display().to_string()),
+            ("images", shared.display().to_string()),
+        ],
+        false,
+    );
+    let written = recover_directory(&directory, &sleeping_backend()).unwrap();
+    let checks = &written[0].1;
+    assert!(checks["0.scratch"].starts_with("ok: "), "{checks:?}");
+    assert!(!scratch.exists());
+    assert!(checks["1.images"].starts_with("unmet: "), "{checks:?}");
+    assert!(shared.exists());
+    fs::remove_dir_all(directory).unwrap();
 }

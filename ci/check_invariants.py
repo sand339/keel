@@ -60,7 +60,13 @@ CRATE_BUDGETS = {
     # each helper request to its job, and validating the result before delivery.
     # R1: the teardown record counts the relay sessions open at stop.
     # Manual acceptance: OpenRouter's message path is a model request.
-    "keel-kernel": 6_039,
+    # KSR-036: a floor lift is bound to the read-set it displayed; KSR-037,
+    # KSR-038: push refs and force come from the body, never the relay;
+    # KSR-039: a trailing slash is still the PR effect; KSR-040: untrusted
+    # gate text is quoted and bounded, and the action restated beside the prompt.
+    # KSR-042: the gate's protected view is derived from the pushed objects;
+    # KSR-057: established bridges are bounded apart from connections being decided.
+    "keel-kernel": 6_152,
     # D22, D23, D25, and D28 moved 211 unclaimed lines from this evaluator-only
     # crate.
     # D31: immutable built-in restrictions beneath accepted policy.
@@ -81,7 +87,13 @@ CRATE_BUDGETS = {
     # D81: push derivation from the receive-pack body with host Git, and the
     # shared tree and object readers.
     # D83: the extraction schema grammar and validator, moved from keel-policy.
-    "keel-provenance": 2_041,
+    # KSR-034: content filters the repository configures are emptied before
+    # trusted Git converts worktree content.
+    # KSR-038, KSR-045: rewrites of admitted history and protected paths
+    # changed relative to the old commit are derived from the push, including a
+    # push with no pack and one over an old commit outside admitted history.
+    # KSR-042: a new ref is compared with the admitted HEAD.
+    "keel-provenance": 2_186,
     # D22-D25 moved 160 lines of unused headroom to the kernel and input path;
     # D28 moved the remaining 3.
     # D31: public-key audit verification without persisted signing material.
@@ -98,7 +110,8 @@ CRATE_BUDGETS = {
     # D75: the kernel.run-resource record.
     # D83: the kernel.extraction record.
     # R1: the redactor wipes every credential form it holds.
-    "keel-audit": 1_448,
+    # KSR-043: a record torn by a crash ends the authenticated prefix.
+    "keel-audit": 1_467,
     # D16 moved 200 lines here from keel-input for the eventstream usage decoder.
     # The trusted input path is complete, so its surplus was sized for work that
     # Phase 2 has since finished. D17 then added 700 with no donor at all: SigV4
@@ -125,7 +138,11 @@ CRATE_BUDGETS = {
     # D84: AWS session tokens masked in every relayed response.
     # R1: wiping every buffer that held an injected credential or session
     # token, and the credential-process and `gh` output.
-    "keel-secrets": 3_566,
+    # KSR-039: GitHub effects carry the credential only in their exact spelling.
+    # KSR-047: origin-form targets only; KSR-058: the signer's secrets are
+    # redacted; KSR-059: the credential command has a deadline; KSR-060:
+    # credential copies are wiped and the injected request never reallocates.
+    "keel-secrets": 3_652,
     # D20 added 100 from keel-provenance for the display seam tracker: the trusted
     # terminal owner has to know where a sequence or character ends before it
     # writes a notice into the guest's stream or resumes one after a takeover.
@@ -181,7 +198,15 @@ CRATE_BUDGETS = {
     # and an early error names a missing component and the sealed audit.
     # macOS resizes reach the guest: a kqueue signal filter replaces sigwait,
     # which never sees a SIGWINCH there.
-    "keel-input": 5_195,
+    # KSR-033: no confined child may open a terminal device (macOS profiles);
+    # KSR-034: admission status runs with repository filters disabled.
+    # KSR-035: host services denied to every macOS sandbox profile; KSR-040:
+    # format characters escaped and the action summarized at the prompt.
+    # KSR-041, KSR-043, KSR-053: recovery survives a replaced runtime, a torn
+    # record, and another TMPDIR; KSR-046: the pinned policy is named at
+    # admission; KSR-052: typed control bytes reach the guest and sizes are
+    # bounded; KSR-054: the backend starts only once its group is recorded.
+    "keel-input": 5_340,
 }
 SENSITIVE_TYPES = {
     "keel-secrets": [
