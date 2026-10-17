@@ -36,21 +36,21 @@ RUSTSEC-2026-0346 through 0349 against rustls 0.23.45.
 | KSR-041 | P2 | Linux: reinstalling Keel during a live session makes recovery treat the live run as crashed and delete its broker dir, scratch and images | Fixed and verified |
 | KSR-042 | P2 | gitd's protected diff for a new ref covers only the tip commit against its first parent, so the operator gate shows an incomplete or '(none)' diff | Fixed and verified |
 | KSR-043 | P2 | A torn final record aborts the whole recovery pass and the session can never be recovered | Fixed and verified |
-| KSR-044 | P2 | Guest attribution misses git hooks, Makefile/npm scripts, suffix-less interpreters and reparented processes, so the documented 'workspace-code push reaches the gate' rule is bypassable | Fixed and verified; residual noted |
+| KSR-044 | P2 | Guest attribution misses git hooks, Makefile/npm scripts, suffix-less interpreters and reparented processes, so the documented 'workspace-code push reaches the gate' rule is bypassable | Fixed and verified |
 | KSR-045 | P2 | Trusted push derivation misses deletions, copies of admitted blobs, and force/delete, leaving the protected flags to untrusted gitd | Fixed and verified |
 | KSR-046 | P2 | `keel policy accept` does not confirm, and does not bind to the draft the operator reviewed | Fixed and verified |
 | KSR-047 | P2 | Absolute-form request targets inside terminated TLS are authorized and forwarded verbatim | Fixed and verified |
 | KSR-048 | P2 | Linux liveness check treats a live session as crashed once `keel setup` replaces keel-input-runtime, and auto-recovery then deletes its live resources and attach socket | Fixed and verified |
 | KSR-049 | P2 | `keel setup` builds and installs the trusted runtime from whatever checkout-looking directory is above the current directory | Fixed and verified |
 | KSR-050 | P2 | macOS build path omits `cargo build --locked`, so release binaries can silently resolve dependencies outside Cargo.lock | Fixed and verified |
-| KSR-051 | P2 | Release verification proves integrity, not authenticity: the verifier, the SHA256SUMS and install.sh all ship in the tarball they check, and the only outside check is a co-hosted unsigned .sha256 | Partly fixed: wording; signing open |
+| KSR-051 | P2 | Release verification proves integrity, not authenticity: the verifier, the SHA256SUMS and install.sh all ship in the tarball they check, and the only outside check is a co-hosted unsigned .sha256 | Fixed: keyless signing; first signed release pending |
 | KSR-052 | P2 | Operator Ctrl-G is eaten as a control prefix; Ctrl-G q shuts the run down and Ctrl-G s + 4 keys kills the renderer | Fixed and verified |
 | KSR-053 | P3 | Recovery's temp-root assumptions differ from where the run created its resources (Linux broker dir under TMPDIR, reaper's TMPDIR) | Fixed and verified |
 | KSR-054 | P3 | The backend group is recorded only after spawn, so a crash in that window leaves an orphaned VM that recovery reports as clean | Fixed and verified |
 | KSR-055 | P3 | Guest TCP relay exits permanently on a transient accept() error; the workload can kill egress/Git/MCP relays by exhausting their descriptors | Fixed and verified |
-| KSR-056 | P3 | No test or preflight probe covers the x86_64 x32/i386 kill path or the seccomp BPF jump offsets | Fixed: static test; runtime probe open |
+| KSR-056 | P3 | No test or preflight probe covers the x86_64 x32/i386 kill path or the seccomp BPF jump offsets | Fixed and verified |
 | KSR-057 | P3 | Long-lived egress bridges count against MAX_BROKER_CLIENTS, so busy workloads lock out Git, PR, and extraction requests | Fixed and verified |
-| KSR-058 | P3 | SigV4 secret key and session token are never registered with the audit Redactor | Fixed; residual: refreshed values |
+| KSR-058 | P3 | SigV4 secret key and session token are never registered with the audit Redactor | Fixed and verified |
 | KSR-059 | P3 | credential_process refresh runs with no timeout while holding the signer mutex | Fixed and verified |
 | KSR-060 | P3 | Credential copies are dropped without zeroization despite the 'every buffer is wiped' contract | Fixed and verified |
 | KSR-061 | P3 | package-release.sh ships whatever is installed under ~/.local/share/keel, labeled with the checkout's current HEAD | Fixed and verified |
@@ -178,8 +178,13 @@ script suffix. It now also counts any argument naming an existing file under a
 writable root, which covers Git hooks and scripts without a suffix; build and
 package runners (make, npm, cargo, and others) started in a writable directory;
 and an ancestry cut off by reparenting to PID 1, except Keel's own tmux server.
-Residual: attribution remains the guest's own claim; a process can rewrite its
-argv, and a command started through Keel's tmux server is attributed to it.
+A process found to run workspace code when it execs keeps that mark, keyed by
+process id and start time, however it rewrites its argv afterwards; and a
+command in a tmux pane other than Keel's own, which is the server's first
+child, is workspace code. Residual: attribution remains the guest's own claim,
+the exec-time mark is read from a lossy event stream shortly after the exec,
+and a process that rewrites its argv before that read is judged by the
+rewrite.
 
 ### KSR-046: accepting the reviewed policy
 
@@ -207,8 +212,12 @@ into a fresh install directory, so nothing installed earlier ships.
 
 The tarball's `.sha256` and the bundled `SHA256SUMS` come from the same place as
 the release, so they detect damage, not tampering. The README, the release
-script, and `install.sh` now say so. Signing the release is open: it needs a
-decision on the tool and on who holds the key.
+script, and `install.sh` now say so. `KEEL_RELEASE_SIGN=1 package-release.sh`
+signs the tarball with Sigstore's keyless flow: a short-lived certificate bound
+to the maintainer's GitHub login, a public transparency-log entry, and no key
+kept anywhere. The README verifies the bundle with `cosign verify-blob`,
+installed from outside the tarball, before unpacking. The first signed release
+needs the maintainer's interactive login, so it is pending.
 
 ### KSR-052: the operator's Ctrl-G
 
@@ -240,15 +249,18 @@ side has ended releases its guest side.
 
 A unit test now interprets the filter as built, for every denied call, the
 clone, prctl, and socket argument cases, x32 numbers, and a foreign
-architecture, and fails on any jump out of the program. A runtime probe that
-issues an x32 call from the guest is still open.
+architecture, and fails on any jump out of the program. The guest's preflight
+also forks two children that issue an x32 call and an `int 0x80` compat call;
+the host refuses an `x86_64` guest unless both were killed by `SIGSYS`.
 
 ### KSR-057: bridges and the broker's slots
 
 Long-lived egress bridges counted against the 64 broker slots, so they could
 lock out Git, pull-request, and extraction requests. Only connections still
 being decided count against those slots now; established bridges have their
-own bound of 512.
+own bound of 512. A request frame must also arrive whole within ten seconds,
+not only each read within half a second, so a client that drips one byte at a
+time cannot hold a slot.
 
 ### KSR-058, KSR-059, KSR-060: AWS and credential custody
 
@@ -256,8 +268,10 @@ The SigV4 signer's secret key and session token are now registered with the
 audit redactor, and a refresh mid-run keeps the credential command's output out
 of its error. The credential command has a one-minute deadline and is killed at
 it. Every per-request copy of an injected credential is wiped, and the buffer it
-is written into is sized so it never reallocates. Residual: credentials
-obtained by a later refresh are not added to the redactor.
+is written into is sized so it never reallocates. The redactor is now one
+shared set, and credentials obtained by a later refresh join it before they
+are used. Its `Debug` output, which listed every secret it held, now shows
+only a count.
 
 ### KSR-062: the pre-push guard
 

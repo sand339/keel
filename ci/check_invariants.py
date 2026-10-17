@@ -65,8 +65,9 @@ CRATE_BUDGETS = {
     # KSR-039: a trailing slash is still the PR effect; KSR-040: untrusted
     # gate text is quoted and bounded, and the action restated beside the prompt.
     # KSR-042: the gate's protected view is derived from the pushed objects;
-    # KSR-057: established bridges are bounded apart from connections being decided.
-    "keel-kernel": 6_152,
+    # KSR-057: established bridges are bounded apart from connections being
+    # decided, and a request frame has an overall deadline.
+    "keel-kernel": 6_167,
     # D22, D23, D25, and D28 moved 211 unclaimed lines from this evaluator-only
     # crate.
     # D31: immutable built-in restrictions beneath accepted policy.
@@ -111,7 +112,9 @@ CRATE_BUDGETS = {
     # D83: the kernel.extraction record.
     # R1: the redactor wipes every credential form it holds.
     # KSR-043: a record torn by a crash ends the authenticated prefix.
-    "keel-audit": 1_467,
+    # KSR-058: the redactor is one shared set that refreshed credentials join,
+    # and its Debug output no longer lists them.
+    "keel-audit": 1_506,
     # D16 moved 200 lines here from keel-input for the eventstream usage decoder.
     # The trusted input path is complete, so its surplus was sized for work that
     # Phase 2 has since finished. D17 then added 700 with no donor at all: SigV4
@@ -142,7 +145,8 @@ CRATE_BUDGETS = {
     # KSR-047: origin-form targets only; KSR-058: the signer's secrets are
     # redacted; KSR-059: the credential command has a deadline; KSR-060:
     # credential copies are wiped and the injected request never reallocates.
-    "keel-secrets": 3_652,
+    # KSR-058: refreshed AWS credentials join the redactor.
+    "keel-secrets": 3_667,
     # D20 added 100 from keel-provenance for the display seam tracker: the trusted
     # terminal owner has to know where a sequence or character ends before it
     # writes a notice into the guest's stream or resumes one after a takeover.
@@ -205,8 +209,9 @@ CRATE_BUDGETS = {
     # KSR-041, KSR-043, KSR-053: recovery survives a replaced runtime, a torn
     # record, and another TMPDIR; KSR-046: the pinned policy is named at
     # admission; KSR-052: typed control bytes reach the guest and sizes are
-    # bounded; KSR-054: the backend starts only once its group is recorded.
-    "keel-input": 5_340,
+    # bounded; KSR-054: the backend starts only once its group is recorded,
+    # behind a bash gate, since dash cannot redirect a descriptor above 9.
+    "keel-input": 5_343,
 }
 SENSITIVE_TYPES = {
     "keel-secrets": [

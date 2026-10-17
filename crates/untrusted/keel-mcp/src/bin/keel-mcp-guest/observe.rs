@@ -173,6 +173,9 @@ fn watch_processes(queue: &Queue) -> io::Result<()> {
             match event {
                 ProcEvent::Exec { pid } => {
                     let process = describe(pid);
+                    if process.workspace_code {
+                        super::supervise::remember_workspace_code(pid);
+                    }
                     if seen.len() < MAX_REMEMBERED {
                         seen.insert(pid);
                     }
@@ -188,6 +191,7 @@ fn watch_processes(queue: &Queue) -> io::Result<()> {
                     });
                 }
                 ProcEvent::Exit { pid, code } if seen.remove(&pid) => {
+                    super::supervise::forget(pid);
                     queue.push(GuestEvent::Exit { pid, code });
                 }
                 ProcEvent::Exit { .. } => {}

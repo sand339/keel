@@ -99,13 +99,24 @@ ships:
 ```
 
 The `.sha256` and the bundled `SHA256SUMS` detect a damaged download; they
-are not signatures.
+are not signatures. Sign each tarball with Sigstore's keyless flow, which keeps
+no signing key anywhere:
+
+```sh
+KEEL_RELEASE_SIGN=1 ./spikes/package-release.sh   # cosign opens a browser; log in with GitHub
+```
+
+Log in as the identity the README's `cosign verify-blob` names
+(`sandeepsingh001@gmail.com`, issuer `https://github.com/login/oauth`); a
+different login produces a signature users' verification rejects. Upload the
+`.sigstore.json` bundle with the tarball and its `.sha256`, then run the
+README's verification against the uploaded files before announcing the release.
 
 Set `KEEL_RELEASE_VERSION` (for example `0.1.0`) for a tagged release; it
 defaults to the workspace version and commit. Before publishing, install the
 tarball as a user with no toolchain and run `keel doctor` and one session.
-Upload each tarball and its `.sha256` to the release on the public
-repository.
+Upload each tarball, its `.sha256`, and its `.sigstore.json` to the release on
+the public repository.
 
 The first snapshot has no parent; later ones use `-p refs/heads/public` so
 the public history is one commit per release. Spell the branch as

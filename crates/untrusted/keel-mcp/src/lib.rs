@@ -308,6 +308,11 @@ pub struct ConfinementPreflight {
     pub cgroup_bounded: bool,
     /// Landlock ABI version enforced by the guest kernel, or 0.
     pub landlock_abi: u32,
+    /// On `x86_64`, a child that issued an x32 call and one that issued an
+    /// `int 0x80` compat call were both killed by `SIGSYS`; `None` where the
+    /// architecture has neither ABI to probe (KSR-056).
+    #[serde(default)]
+    pub foreign_abi_killed: Option<bool>,
 }
 
 impl ConfinementPreflight {
@@ -331,6 +336,10 @@ impl ConfinementPreflight {
             && self.landlock_abi >= 1
             // Scoping is required wherever the guest kernel provides it.
             && (self.landlock_abi < 6 || self.signal_scoped)
+            // A probe that ran must have held; an x86_64 guest, built for
+            // the host's architecture, must have run it.
+            && !matches!(self.foreign_abi_killed, Some(false))
+            && (!cfg!(target_arch = "x86_64") || self.foreign_abi_killed.is_some())
     }
 }
 
@@ -964,8 +973,21 @@ mod confinement_tests {
             scratch_write_allowed: true,
             cgroup_bounded: true,
             landlock_abi: 3,
+            foreign_abi_killed: Some(true),
         };
         assert!(complete.holds());
+        // KSR-056: an x86_64 guest must show x32 and compat calls killed.
+        for probe in [Some(false), None] {
+            let foreign = ConfinementPreflight {
+                foreign_abi_killed: probe,
+                ..complete.clone()
+            };
+            assert_eq!(
+                foreign.holds(),
+                !cfg!(target_arch = "x86_64") && probe.is_none(),
+                "{probe:?}"
+            );
+        }
         assert!(!ConfinementPreflight::default().holds());
         let missing_vsock = ConfinementPreflight {
             vsock_denied: false,

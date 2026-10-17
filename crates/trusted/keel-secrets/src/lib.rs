@@ -404,6 +404,9 @@ impl SystemEgressConnector {
             github_repository.as_deref(),
         )?;
         let redactor = Redactor::new(redactions).map_err(|error| error.to_string())?;
+        if let Some(signer) = &vault.signer {
+            let _ = signer.redactor.set(redactor.clone());
+        }
         Self::with_vault(vault).map(|connector| (connector, git_scope, github_repository, redactor))
     }
 }
@@ -1520,6 +1523,15 @@ struct AwsCredentials {
 }
 
 impl AwsCredentials {
+    /// The secret access key and session token, for redaction.
+    fn secrets(&self, into: &mut Vec<String>) {
+        let text = |secret: &SecretBytes| {
+            secret.expose(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        };
+        into.push(text(&self.secret_access_key));
+        into.extend(self.session_token.as_ref().map(text));
+    }
+
     fn stale(&self, now: u64) -> bool {
         self.expires_at
             .is_some_and(|at| at <= now.saturating_add(CREDENTIAL_REFRESH_MARGIN))
@@ -1551,6 +1563,8 @@ struct SigV4Signer {
     region: String,
     source: AwsCredentialSource,
     credentials: Mutex<AwsCredentials>,
+    /// The audit redactor, which every refreshed secret joins (KSR-058).
+    redactor: std::sync::OnceLock<Redactor>,
 }
 
 impl SigV4Signer {
@@ -1566,6 +1580,7 @@ impl SigV4Signer {
             region,
             source,
             credentials: Mutex::new(credentials),
+            redactor: std::sync::OnceLock::new(),
         })
     }
 
@@ -1650,11 +1665,7 @@ impl SigV4Signer {
             .credentials
             .lock()
             .map_err(|_| "AWS credential custody is unavailable".to_owned())?;
-        let text = |secret: &SecretBytes| {
-            secret.expose(|bytes| String::from_utf8_lossy(bytes).into_owned())
-        };
-        redactions.push(text(&held.secret_access_key));
-        redactions.extend(held.session_token.as_ref().map(text));
+        held.secrets(redactions);
         Ok(())
     }
 
@@ -1683,6 +1694,13 @@ impl SigV4Signer {
                 ));
             };
             *held = resolve_credential_process(command, true).map_err(TlsError)?;
+            if let Some(redactor) = self.redactor.get() {
+                let mut secrets = Vec::new();
+                held.secrets(&mut secrets);
+                redactor
+                    .add(secrets)
+                    .map_err(|error| TlsError::new("redact refreshed AWS credentials", error))?;
+            }
             if held.stale(now) {
                 return Err(TlsError(
                     "KEEL_AWS_CREDENTIAL_PROCESS returned credentials that are already expiring; \

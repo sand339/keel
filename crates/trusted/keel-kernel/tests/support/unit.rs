@@ -3204,3 +3204,29 @@ fn established_bridges_do_not_lock_out_new_requests() {
     ));
     assert!(!admits_broker_client(0, MAX_BROKER_BRIDGES));
 }
+
+/// KSR-057: a client that sends a byte just inside every read timeout is cut
+/// off at the frame's overall deadline instead of holding its slot.
+#[test]
+fn a_slowly_dripped_request_frame_hits_its_deadline() {
+    use std::io::Write as _;
+    let state = Arc::new(Mutex::new(extraction_state()));
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (mut client, server) = std::os::unix::net::UnixStream::pair().expect("pair");
+    let dripper = std::thread::spawn(move || {
+        for _ in 0..20 {
+            if client.write_all(b"K").is_err() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        false
+    });
+    let started = std::time::Instant::now();
+    let _ = super::handle_broker_connection(server, &state, None, &shutdown, false);
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    assert!(
+        dripper.join().unwrap(),
+        "the connection was closed on the client"
+    );
+}

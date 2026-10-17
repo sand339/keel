@@ -74,11 +74,17 @@ validating a finding in code offline. See [scoped runs](docs/USAGE.md#10-scoped-
 
 ### Install a release
 
-A release needs no Docker or toolchain. Download the tarball for your platform
-and its `.sha256` from the
-[releases page](https://github.com/sand339/keel/releases) with `curl`, then:
+A release needs no Docker or toolchain. Download the tarball for your platform,
+its `.sha256`, and its `.sigstore.json` from the
+[releases page](https://github.com/sand339/keel/releases) with `curl`. Check
+the signature first, with [cosign](https://docs.sigstore.dev/cosign/system_config/installation/)
+installed from outside the tarball, then install:
 
 ~~~sh
+cosign verify-blob keel-VERSION-PLATFORM.tar.gz \
+    --bundle keel-VERSION-PLATFORM.tar.gz.sigstore.json \
+    --certificate-identity sandeepsingh001@gmail.com \
+    --certificate-oidc-issuer https://github.com/login/oauth
 shasum -a 256 -c keel-VERSION-PLATFORM.tar.gz.sha256   # sha256sum -c on Linux
 tar -xzf keel-VERSION-PLATFORM.tar.gz
 ./keel-VERSION-PLATFORM/install.sh                      # checks every file for damage, then installs
@@ -86,8 +92,11 @@ export PATH="$HOME/.local/bin:$PATH"
 keel doctor
 ~~~
 
-The checksums detect a damaged download. They are not signatures: they come
-from the same place as the tarball, so they do not prove who built it.
+`cosign verify-blob` proves the tarball was signed by the maintainer's GitHub
+identity and that the signature is in Sigstore's public transparency log. The
+checksums only detect a damaged download: they come from the same place as the
+tarball. A release published without a `.sigstore.json` is unsigned; treat it
+as unverified.
 
 On Ubuntu the host still needs KVM, your user in the `kvm` group, and
 `bubblewrap` (`sudo apt-get install -y bubblewrap`). Releases are built on

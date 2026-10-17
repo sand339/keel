@@ -3229,6 +3229,15 @@ const MAX_BROKER_CLIENTS: usize = 64;
 /// extraction request needs to be decided in (KSR-057).
 const MAX_BROKER_BRIDGES: usize = 512;
 const BROKER_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(500);
+/// The whole request frame, not only each read, must arrive by this deadline,
+/// so a client that sends a byte just inside every read timeout cannot hold a
+/// slot in which connections are decided (KSR-057). A pushed pack is part of
+/// the frame and crosses a local socket well inside it.
+const BROKER_REQUEST_DEADLINE: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(10)
+};
 const MINIMUM_RANK_RULE: &str = "kernel:minimum-rank";
 const REPEATED_DENIAL_RULE: &str = "repeated-denials-same-scope";
 /// Policy rule naming a host the run's egress intent does not cover.
@@ -7015,6 +7024,15 @@ fn handle_broker_connection(
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|error| error.to_string())?;
+    let (parsed, deadline) = std::sync::mpsc::channel::<()>();
+    let watchdog = stream.try_clone().map_err(|error| error.to_string())?;
+    thread::spawn(move || {
+        if deadline.recv_timeout(BROKER_REQUEST_DEADLINE)
+            == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        {
+            let _ = watchdog.shutdown(std::net::Shutdown::Both);
+        }
+    });
     // Requests are typed by channel: the helper's socket carries only its
     // jobs and its own egress, and the main socket never carries a job.
     let request = read_broker_request(&mut stream)
@@ -7030,6 +7048,7 @@ fn handle_broker_connection(
                 !helper
             }
         });
+    drop(parsed);
     let Some((origin, request)) = request else {
         stream
             .write_all(&[EGRESS_DENIED])

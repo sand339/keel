@@ -21,6 +21,10 @@ if [ -n "$(git -C "$repo_root" status --porcelain --untracked-files=no)" ]; then
     echo "the checkout has uncommitted changes; a release is built from HEAD only" >&2
     exit 1
 fi
+if [ "${KEEL_RELEASE_SIGN:-0}" = 1 ] && ! command -v cosign >/dev/null 2>&1; then
+    echo "KEEL_RELEASE_SIGN=1 needs cosign (https://docs.sigstore.dev/cosign/system_config/installation/)" >&2
+    exit 1
+fi
 build_root=$(mktemp -d "${TMPDIR:-/tmp}/keel-release.XXXXXX")
 trap 'rm -rf "$build_root"' EXIT
 install_root="$build_root/install"
@@ -78,3 +82,13 @@ tar -C "$dist" -czf "$dist/$name.tar.gz" "$name"
 rm -rf "$stage"
 echo "packaged $dist/$name.tar.gz"
 cat "$dist/$name.tar.gz.sha256"
+
+# KSR-051: with KEEL_RELEASE_SIGN=1, sign the tarball with Sigstore's keyless
+# flow. cosign opens a browser to log in, binds a short-lived certificate to
+# that identity, and records the signature in the public transparency log;
+# no signing key is kept anywhere. The bundle is published beside the
+# tarball, and a user checks it with cosign before unpacking.
+if [ "${KEEL_RELEASE_SIGN:-0}" = 1 ]; then
+    cosign sign-blob --yes --bundle "$dist/$name.tar.gz.sigstore.json" "$dist/$name.tar.gz"
+    echo "signed $dist/$name.tar.gz.sigstore.json"
+fi

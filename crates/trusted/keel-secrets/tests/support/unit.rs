@@ -1629,6 +1629,7 @@ fn a_signed_provider_discards_the_sentinel_instead_of_swapping_it() {
             session_token: Some(SecretBytes::new("session-token".as_bytes())),
             expires_at: None,
         }),
+        redactor: std::sync::OnceLock::new(),
     });
     let target = ConnectionTarget {
         server_name: host.to_owned(),
@@ -1667,6 +1668,7 @@ fn a_signed_provider_discards_the_sentinel_instead_of_swapping_it() {
             session_token: None,
             expires_at: Some(0),
         }),
+        redactor: std::sync::OnceLock::new(),
     });
     let error = vault
         .inject(&target, request.as_bytes())
@@ -1717,6 +1719,7 @@ fn a_signed_request_commits_to_the_sanitized_body_and_not_the_one_received() {
             session_token: None,
             expires_at: None,
         }),
+        redactor: std::sync::OnceLock::new(),
     });
     let target = ConnectionTarget {
         server_name: host.to_owned(),
@@ -2131,6 +2134,7 @@ fn signer_secrets_are_redacted_and_refresh_errors_carry_no_command_output() {
             session_token: Some(SecretBytes::new("session-token".as_bytes())),
             expires_at: None,
         }),
+        redactor: std::sync::OnceLock::new(),
     };
     let mut redactions = Vec::new();
     signer.redactions(&mut redactions).unwrap();
@@ -2181,4 +2185,45 @@ fn the_injected_request_buffer_is_never_reallocated() {
             .windows(credential.len())
             .any(|window| window == credential)
     );
+}
+
+/// KSR-058: a session obtained by refreshing mid-run is redacted from the
+/// audit like the one the run started with.
+#[test]
+fn refreshed_aws_credentials_join_the_redactor() {
+    let host = "bedrock-runtime.us-east-1.amazonaws.com";
+    let output = r#"{"Version":1,"AccessKeyId":"ASIAREFRESHED","SecretAccessKey":"refreshed-secret","SessionToken":"refreshed-token","Expiration":"2999-01-01T00:00:00Z"}"#;
+    let redactor = keel_audit::Redactor::new(["initial-secret"]).unwrap();
+    let signer = SigV4Signer {
+        host: host.to_owned(),
+        region: "us-east-1".to_owned(),
+        source: AwsCredentialSource::Process(format!("printf '%s' '{output}'")),
+        credentials: super::Mutex::new(AwsCredentials {
+            access_key_id: "ASIAEXAMPLE".to_owned(),
+            secret_access_key: SecretBytes::new("initial-secret".as_bytes()),
+            session_token: None,
+            expires_at: Some(0),
+        }),
+        redactor: std::sync::OnceLock::new(),
+    };
+    signer.redactor.set(redactor.clone()).unwrap();
+    let mut vault = CredentialVault::new();
+    vault.signer = Some(signer);
+    let target = ConnectionTarget {
+        server_name: host.to_owned(),
+        port: 443,
+        resolved_ip: IpAddr::from(Ipv4Addr::new(93, 184, 216, 34)),
+    };
+    let request = format!(
+        "POST /model/anthropic.claude/invoke HTTP/1.1\r\nHost: {host}\r\nAuthorization: \
+             Bearer {}\r\nContent-Length: 2\r\n\r\n{{}}",
+        SystemEgressConnector::BEDROCK_SENTINEL
+    );
+    let request_out = vault
+        .inject(&target, request.as_bytes())
+        .expect("refreshed and signed");
+    assert!(String::from_utf8_lossy(&request_out).contains("Credential=ASIAREFRESHED/"));
+    for secret in ["refreshed-secret", "refreshed-token", "initial-secret"] {
+        assert_eq!(redactor.redact(secret), "[REDACTED]", "{secret}");
+    }
 }

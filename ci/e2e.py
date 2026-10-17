@@ -701,7 +701,9 @@ def case_npm_ci_pinned(suite: Suite) -> Result:
             record["fields"] for record in suite.records(session)
             if record["event"] == "kernel.action"
             and record["fields"].get("action_class") == "egress" and record["fields"].get("outcome") == "executed"
-            and str(record["fields"].get("origin", "")).startswith("node ")
+            # npm is a build runner started in the workspace, so the origin is
+            # marked workspace code, and its process carries the `*` marker.
+            and str(record["fields"].get("origin", "")).removeprefix("workspace-code: ").lstrip("*").startswith("node ")
         ]
         result.check("npm's fetch went through Keel", bool(npm_egress), str(len(npm_egress)))
     result.seconds = time.monotonic() - started

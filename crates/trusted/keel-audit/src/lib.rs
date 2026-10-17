@@ -19,7 +19,10 @@ use std::{
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, BufWriter, Write},
     path::Path,
-    sync::mpsc::{self, Receiver, SyncSender},
+    sync::{
+        Arc, RwLock,
+        mpsc::{self, Receiver, SyncSender},
+    },
     thread::{self, JoinHandle},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -111,10 +114,33 @@ impl RunKey {
     }
 }
 
-/// Exact values that must never enter the audit stream.
-#[derive(Clone, Debug)]
+/// Exact values that must never enter the audit stream. Clones share one
+/// set, so a credential obtained later in the run, such as a refreshed AWS
+/// session, is redacted everywhere at once (KSR-058).
+#[derive(Clone)]
 pub struct Redactor {
-    secrets: Vec<String>,
+    secrets: Arc<RwLock<Secrets>>,
+}
+
+/// Every encoded form of every secret, longest first; wiped when the last
+/// redactor sharing it is dropped.
+#[derive(Default)]
+struct Secrets(Vec<String>);
+
+impl Drop for Secrets {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl fmt::Debug for Redactor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let count = self.secrets.read().map_or(0, |secrets| secrets.0.len());
+        formatter
+            .debug_struct("Redactor")
+            .field("forms", &count)
+            .finish()
+    }
 }
 
 impl Redactor {
@@ -124,54 +150,85 @@ impl Redactor {
     ///
     /// Returns an error if any configured value is empty.
     pub fn new(secrets: impl IntoIterator<Item = impl Into<String>>) -> Result<Self, AuditError> {
-        // Every copy of a secret made here is wiped when it is no longer
-        // needed: the inputs, each encoded form, and each duplicate removed.
-        let mut originals = secrets.into_iter().map(Into::into).collect::<Vec<String>>();
-        if originals.iter().any(String::is_empty) {
-            originals.zeroize();
-            return Err(AuditError::InvalidRedaction);
-        }
-        let mut secrets = Vec::with_capacity(originals.len() * 6);
-        for secret in &originals {
-            let mut standard = base64(secret.as_bytes(), b'+', b'/');
-            let mut url_safe = base64(secret.as_bytes(), b'-', b'_');
-            secrets.extend([
-                secret.clone(),
-                percent_encode(secret),
-                standard.trim_end_matches('=').to_owned(),
-                url_safe.trim_end_matches('=').to_owned(),
-                std::mem::take(&mut standard),
-                std::mem::take(&mut url_safe),
-            ]);
-        }
-        originals.zeroize();
-        secrets.retain(|secret| !secret.is_empty());
-        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
-        secrets.dedup_by(|duplicate, kept| {
-            let same = duplicate == kept;
-            if same {
-                duplicate.zeroize();
-            }
-            same
-        });
-        Ok(Self { secrets })
+        let mut forms = Secrets(encoded_forms(secrets)?);
+        normalize(&mut forms.0);
+        Ok(Self {
+            secrets: Arc::new(RwLock::new(forms)),
+        })
+    }
+
+    /// Adds values to redact from now on, for this redactor and every clone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any value is empty, or the set is unavailable.
+    pub fn add(
+        &self,
+        secrets: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<(), AuditError> {
+        let mut added = Secrets(encoded_forms(secrets)?);
+        let mut held = self
+            .secrets
+            .write()
+            .map_err(|_| AuditError::InvalidRedaction)?;
+        held.0.append(&mut added.0);
+        normalize(&mut held.0);
+        Ok(())
     }
 
     /// Returns a copy with every configured value replaced.
     #[must_use]
     pub fn redact(&self, value: &str) -> String {
-        self.secrets
-            .iter()
-            .fold(value.to_owned(), |redacted, secret| {
-                redacted.replace(secret, REDACTED)
-            })
+        let Ok(secrets) = self.secrets.read() else {
+            // A poisoned set may be incomplete; nothing passes unredacted.
+            return REDACTED.to_owned();
+        };
+        secrets.0.iter().fold(value.to_owned(), |redacted, secret| {
+            redacted.replace(secret, REDACTED)
+        })
     }
 }
 
-impl Drop for Redactor {
-    fn drop(&mut self) {
-        self.secrets.zeroize();
+/// Each value with its percent-encoded and base64 forms. Every copy of a
+/// secret made here is wiped when it is no longer needed: the inputs and each
+/// encoded form.
+fn encoded_forms(
+    secrets: impl IntoIterator<Item = impl Into<String>>,
+) -> Result<Vec<String>, AuditError> {
+    let mut originals = secrets.into_iter().map(Into::into).collect::<Vec<String>>();
+    if originals.iter().any(String::is_empty) {
+        originals.zeroize();
+        return Err(AuditError::InvalidRedaction);
     }
+    let mut forms = Vec::with_capacity(originals.len() * 6);
+    for secret in &originals {
+        let mut standard = base64(secret.as_bytes(), b'+', b'/');
+        let mut url_safe = base64(secret.as_bytes(), b'-', b'_');
+        forms.extend([
+            secret.clone(),
+            percent_encode(secret),
+            standard.trim_end_matches('=').to_owned(),
+            url_safe.trim_end_matches('=').to_owned(),
+            std::mem::take(&mut standard),
+            std::mem::take(&mut url_safe),
+        ]);
+    }
+    originals.zeroize();
+    Ok(forms)
+}
+
+/// Longest first, so a secret that contains another is replaced whole; each
+/// duplicate removed is wiped.
+fn normalize(forms: &mut Vec<String>) {
+    forms.retain(|form| !form.is_empty());
+    forms.sort_by_key(|form| std::cmp::Reverse(form.len()));
+    forms.dedup_by(|duplicate, kept| {
+        let same = duplicate == kept;
+        if same {
+            duplicate.zeroize();
+        }
+        same
+    });
 }
 
 fn percent_encode(value: &str) -> String {

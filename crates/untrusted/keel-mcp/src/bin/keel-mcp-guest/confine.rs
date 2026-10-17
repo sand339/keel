@@ -637,7 +637,53 @@ pub fn check_from_inside() -> ConfinementPreflight {
         cgroup_bounded: fs::read_to_string("/proc/self/cgroup")
             .is_ok_and(|cgroup| cgroup.contains("/keel-workload")),
         landlock_abi: landlock_abi().unwrap_or(0),
+        foreign_abi_killed: foreign_abi_killed(),
     }
+}
+
+/// Issues an x32 call and an `int 0x80` compat call, each from a forked
+/// child, and reports whether the filter killed both with `SIGSYS`. The
+/// filter's prologue is what refuses both; nothing else in the preflight
+/// would notice it letting them through (KSR-056).
+#[cfg(target_arch = "x86_64")]
+// `None` is the answer on architectures without the ABIs; here there is one.
+#[allow(clippy::unnecessary_wraps)]
+fn foreign_abi_killed() -> Option<bool> {
+    let killed = |call: fn()| {
+        // SAFETY: the child only issues one system call and exits; it touches
+        // no lock or allocator state the fork could have copied mid-use.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            call();
+            // SAFETY: _exit is async-signal-safe and ends the child at once.
+            unsafe { libc::_exit(0) };
+        }
+        if child < 0 {
+            return false;
+        }
+        let mut status = 0;
+        // SAFETY: waitpid on our own child with valid status storage.
+        let waited = unsafe { libc::waitpid(child, &raw mut status, 0) };
+        waited == child && libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS
+    };
+    let x32 = killed(|| {
+        // SAFETY: getpid takes no arguments under any ABI.
+        unsafe {
+            libc::syscall(libc::SYS_getpid | libc::c_long::from(X32_SYSCALL_BIT));
+        }
+    });
+    let compat = killed(|| {
+        // SAFETY: i386 system call 20 is getpid, which takes no arguments.
+        unsafe {
+            std::arch::asm!("int 0x80", inout("eax") 20 => _, options(nostack));
+        }
+    });
+    Some(x32 && compat)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+const fn foreign_abi_killed() -> Option<bool> {
+    None
 }
 
 #[cfg(test)]

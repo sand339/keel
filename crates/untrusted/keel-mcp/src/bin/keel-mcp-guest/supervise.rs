@@ -54,6 +54,51 @@ const BUILD_RUNNERS: &[&str] = &[
     "pnpm.cjs",
 ];
 
+/// Processes found to run workspace code when they exec'd, by process id and
+/// start time, so one cannot shed the mark by rewriting its argv afterwards,
+/// and a reused process id does not inherit it (KSR-044).
+static EXEC_TAINT: std::sync::Mutex<std::collections::BTreeMap<u32, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+const MAX_TAINTED: usize = 65_536;
+
+/// Remembers, at exec, a process that runs workspace code.
+pub fn remember_workspace_code(pid: u32) {
+    let (Some(started), Ok(mut taint)) = (start_time(pid), EXEC_TAINT.lock()) else {
+        return;
+    };
+    if taint.len() < MAX_TAINTED {
+        taint.insert(pid, started);
+    }
+}
+
+/// Forgets a process that has exited.
+pub fn forget(pid: u32) {
+    if let Ok(mut taint) = EXEC_TAINT.lock() {
+        taint.remove(&pid);
+    }
+}
+
+fn tainted_at_exec(pid: u32) -> bool {
+    EXEC_TAINT.lock().is_ok_and(|taint| {
+        taint
+            .get(&pid)
+            .is_some_and(|started| start_time(pid) == Some(*started))
+    })
+}
+
+/// The process's start time in clock ticks since boot, from `/proc`.
+fn start_time(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Fields resume after the command name's last closing parenthesis;
+    // start time is field 22, the 20th after it.
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
 /// One process in an attributed connection's ancestry, nearest first.
 #[derive(Debug, Serialize)]
 pub struct Process {
@@ -168,7 +213,8 @@ pub fn attribute(local_port: u16, peer_port: u16) -> Origin {
     let mut chain = Vec::new();
     let mut current = pid;
     while current > 1 && chain.len() < MAX_ANCESTORS {
-        let process = describe(current);
+        let mut process = describe(current);
+        process.workspace_code |= tainted_at_exec(current);
         let parent = parent_of(current);
         chain.push(process);
         match parent {
@@ -184,9 +230,39 @@ pub fn attribute(local_port: u16, peer_port: u16) -> Origin {
         && chain.last().is_some_and(|top| !is_keel_tmux(top));
     Origin {
         known: true,
-        workspace_code: orphaned || chain.iter().any(|process| process.workspace_code),
+        workspace_code: orphaned
+            || started_through_tmux(&chain)
+            || chain.iter().any(|process| process.workspace_code),
         chain,
     }
+}
+
+/// Keel's tmux server has one pane of its own, the first it starts, whose
+/// root runs `/run/keel/launch` and then execs the harness. A pane the
+/// workload opens through the server, with `tmux new-window` for example,
+/// starts later, and would otherwise hide where its commands came from
+/// (KSR-044). Exec keeps a process id and start time, so they identify the
+/// pane where argv cannot.
+fn started_through_tmux(chain: &[Process]) -> bool {
+    started_through_tmux_with(chain, first_child)
+}
+
+fn started_through_tmux_with(chain: &[Process], first: impl Fn(u32) -> Option<u32>) -> bool {
+    chain
+        .windows(2)
+        .any(|pair| is_keel_tmux(&pair[1]) && first(pair[1].pid) != Some(pair[0].pid))
+}
+
+/// The earliest-started living child of `parent`.
+fn first_child(parent: u32) -> Option<u32> {
+    fs::read_dir("/proc")
+        .ok()?
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| parent_of(*pid) == Some(parent))
+        .filter_map(|pid| Some((start_time(pid)?, pid)))
+        .min()
+        .map(|(_, pid)| pid)
 }
 
 fn is_keel_tmux(process: &Process) -> bool {
@@ -347,5 +423,54 @@ mod tests {
             Path::new("/usr/src")
         ));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn process(pid: u32, exe: &str, argv: &[&str]) -> super::Process {
+        super::Process {
+            pid,
+            exe: exe.to_owned(),
+            argv: strings(argv),
+            workspace_code: false,
+        }
+    }
+
+    /// KSR-044: a command whose pane the workload opened through Keel's tmux
+    /// server is workspace code; the harness's own pane is not.
+    #[test]
+    fn commands_started_through_keel_tmux_are_workspace_code() {
+        let server = || {
+            process(
+                10,
+                "/usr/bin/tmux",
+                &["tmux", "-f", "/etc/keel/tmux.conf", "-L", "keel"],
+            )
+        };
+        let git = || process(30, "/usr/bin/git", &["git", "push"]);
+        // The harness's pane root exec'd away from `/run/keel/launch`.
+        let harness = process(11, "/usr/bin/node", &["claude"]);
+        let laundered = process(20, "/bin/sh", &["sh", "-c", "git push"]);
+        let first = |server| (server == 10).then_some(11);
+        assert!(!super::started_through_tmux_with(
+            &[git(), harness, server()],
+            first
+        ));
+        assert!(super::started_through_tmux_with(
+            &[git(), laundered, server()],
+            first
+        ));
+    }
+
+    /// KSR-044: the mark made at exec survives an argv rewrite, and is keyed
+    /// by start time so a reused process id does not inherit it.
+    #[test]
+    fn workspace_code_found_at_exec_sticks_to_that_process() {
+        let own = std::process::id();
+        assert!(!super::tainted_at_exec(own));
+        super::remember_workspace_code(own);
+        assert!(super::tainted_at_exec(own));
+        super::EXEC_TAINT.lock().unwrap().insert(own, 0);
+        assert!(!super::tainted_at_exec(own), "another process with this id");
+        super::forget(own);
+        assert!(!super::tainted_at_exec(own));
     }
 }

@@ -209,9 +209,11 @@ workload could have written:
   other than Keel's own tmux server.
 
 Read-only system paths, such as the guest's bundled browser server, are not
-workspace code: Landlock keeps the workload from writing them. The supervisor
-reads argv, which a process can rewrite, and cannot tell a command started
-through Keel's tmux server from one the harness started.
+workspace code: Landlock keeps the workload from writing them. A process found
+to be workspace code when it execs keeps that mark, by process id and start
+time, whatever it later does to its argv. Keel's tmux server has one pane of
+its own, its first child; a command in any other pane, opened through the
+server by the workload, is workspace code.
 
 The relay sends this ahead of its traffic as an origin frame. The host
 forwards it to the kernel, which stamps it on the action as a

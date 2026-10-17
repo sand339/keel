@@ -172,9 +172,11 @@ guest-writable root, any file there named as an argument (a Git hook or a
 script with or without a suffix), a build or package runner started in a
 writable directory, or a process reparented to PID 1 other than Keel's own
 tmux server. Attribution can miss a process that exits before its connection
-is examined; such connections are reported as unknown. It also reads argv,
-which a process can rewrite, and cannot tell a command started through Keel's
-tmux server from one the harness started.
+is examined; such connections are reported as unknown. A process marked as
+workspace code when it execs keeps the mark however it rewrites its argv, and
+a command in a tmux pane other than Keel's own counts as workspace code. The
+exec-time mark comes from a lossy event stream read just after the exec, so a
+process that rewrites its argv first is judged by the rewrite.
 
 The boundary does not defend against:
 
@@ -463,8 +465,10 @@ The following are not current guarantees:
 - a receipt from a crashed supervisor; every run that opens a chain ends with a signed receipt, its supervisor's or its own, with the chain's local tamper evidence and no more;
 - authenticated crash recovery: `keel recover` acts only on resources the authenticated chain names and refuses foreign process groups and paths, but its record is unsigned, it runs only when invoked (by `keel run`, `keel attach`, `keel recover`, or the opt-in hourly reaper), and the backend does not start until its record is durable;
 - erasure of every copy of a credential: Keel wipes its own buffers, but not the process environment it inherited, nor `ring`'s derived signing keys;
-- authenticity of a release: the checksums beside a release, and the
-  `SHA256SUMS` inside it, detect a damaged download but are not signatures;
+- authenticity of a release beyond its Sigstore signature: a release is
+  signed keyless to the maintainer's GitHub identity and logged publicly, so
+  it rests on that account and on Sigstore; a release without a bundle is
+  unsigned;
 - external audit witnessing or hardware-backed attestation;
 - per-turn provenance reconstructed from the exact content in each model
   request; current direct-workspace exposure fails closed at rank zero.
