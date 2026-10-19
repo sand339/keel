@@ -10,7 +10,26 @@ Keel runs on Apple silicon macOS and on Ubuntu Linux with KVM (tested on 24.04 x
 
 ## Why Keel exists
 
-An agent can read an untrusted file or web page and then act with the authority of the person who launched it. Conventional sandboxing helps, but it does not answer questions such as:
+An agent can read an untrusted file or web page and then act with the authority
+of the person who launched it. Keel is for the moments when that matters:
+
+- **Working in code you don't trust:** a stranger's pull request, an unfamiliar
+  dependency, a bug-report repository. Repository hooks, build scripts, and Git
+  configuration can't act on your credentials unseen.
+- **Letting an agent read issues and the web while it can push:** after the agent
+  reads external content, a push or pull request reaches a trusted gate instead
+  of going through silently.
+- **Installing dependencies without exposing secrets:** install scripts never see
+  your API keys or tokens; Keel adds each credential at the boundary, for one
+  endpoint.
+- **Reproducing a finding against its target, and nowhere else:** scoped runs
+  admit only the hosts you name.
+- **Leaving a run unattended:** budgets cap spend, approvals wait for you, and
+  credentials stay on your machine.
+- **Showing afterwards what happened:** every run ends with a signed audit chain
+  and teardown receipt.
+
+Conventional sandboxing helps, but it does not answer questions such as:
 
 - May this particular process send data to this destination?
 - Did the proposed write depend on untrusted input?
@@ -18,7 +37,8 @@ An agent can read an untrusted file or web page and then act with the authority 
 - Can the workload use a credential without receiving the credential itself?
 - Can an operator later verify what the security boundary allowed?
 
-Keel makes those decisions outside the workload.
+Keel makes those decisions outside the workload. It is not meant for CI
+pipelines, multi-tenant hosting, or agents that should act without approvals.
 
 ## How it works
 
@@ -31,9 +51,9 @@ trusted input and approval UI
    v
 Keel kernel ── policy + provenance + budgets + audit
    |
-   +── VZ microVM ── Claude Code or Node/V8 workload
+   +── microVM (VZ on macOS, Cloud Hypervisor on Linux) ── Claude Code or Node/V8 workload
    |
-   +── host V8 sandbox ── pinned Deno process (lower assurance)
+   +── host V8 sandbox, macOS only ── pinned Deno process (lower assurance)
    |
    +── brokered relays ── network, Git, MCP, and credential use
 ~~~
@@ -44,9 +64,9 @@ The workload proposes actions. Keel reconstructs and validates those actions, re
 
 | Profile | Intended use | Boundary |
 | --- | --- | --- |
-| Claude Code - microVM | Interactive agent sessions | macOS Virtualization.framework VM with no ordinary guest NIC |
+| Claude Code - microVM | Interactive agent sessions | A VM with no ordinary guest NIC: Virtualization.framework on macOS, Cloud Hypervisor inside bubblewrap on Linux |
 | V8 script - microVM | JavaScript automation with the stronger boundary | Node/V8 inside the microVM |
-| V8 script - host sandbox | Fast local JavaScript experiments | Pinned Deno process with restricted capabilities; lower assurance and requires an explicit grant |
+| V8 script - host sandbox | Fast local JavaScript experiments, macOS only | Pinned Deno process with restricted capabilities; lower assurance and requires an explicit grant |
 
 The two V8 profiles use the same trusted action broker, policy, provenance, budgets, and audit pipeline. They differ in where the JavaScript engine runs and therefore in the strength of the isolation boundary.
 
