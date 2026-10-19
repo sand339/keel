@@ -397,8 +397,8 @@ per-crate ratchet.
 - Publishing: release tarballs are built and tested (`spikes/package-release.sh`,
   `keel setup --prebuilt`), so a user's install no longer fetches the guest
   kernel from Alpine's CDN, which drops superseded versions. Signing is built:
-  `KEEL_RELEASE_SIGN=1 package-release.sh` signs a tarball with Sigstore's
-  keyless flow (KSR-051). No release is published yet, and the first signed
+  `KEEL_RELEASE_SIGN=1 package-release.sh` signs a tarball with the release
+  key (KSR-051, D90). No release is published yet, and the first signed
   release is pending.
 
 ## Principal risks

@@ -6,3 +6,6 @@
 /.keel/
 __pycache__/
 /.phase1-x86_64/
+# Signing keys: only the public half, keel-release.pub, is ever committed.
+*.key
+cosign.key

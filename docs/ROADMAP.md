@@ -144,7 +144,8 @@ get their own reviewed attestation design.
 
 ## Cross-cutting
 
-- the first signed release (keyless signing is built), and notarized macOS
+- the first signed release (key-pair signing is built, D90), releases built
+  and signed in CI so the signer is a workflow rather than a key, and notarized macOS
   binaries;
 - a software bill of materials and dependency provenance;
 - ARM64 Linux on real hardware (it is tested only in a nested VM);

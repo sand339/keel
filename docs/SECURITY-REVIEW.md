@@ -48,7 +48,7 @@ full manual pass succeed; D88 records the review and its costs.
 | KSR-048 | P2 | Linux liveness check treats a live session as crashed once `keel setup` replaces keel-input-runtime, and auto-recovery then deletes its live resources and attach socket | Fixed and verified |
 | KSR-049 | P2 | `keel setup` builds and installs the trusted runtime from whatever checkout-looking directory is above the current directory | Fixed and verified |
 | KSR-050 | P2 | macOS build path omits `cargo build --locked`, so release binaries can silently resolve dependencies outside Cargo.lock | Fixed and verified |
-| KSR-051 | P2 | Release verification proves integrity, not authenticity: the verifier, the SHA256SUMS and install.sh all ship in the tarball they check, and the only outside check is a co-hosted unsigned .sha256 | Fixed: keyless signing; first signed release pending |
+| KSR-051 | P2 | Release verification proves integrity, not authenticity: the verifier, the SHA256SUMS and install.sh all ship in the tarball they check, and the only outside check is a co-hosted unsigned .sha256 | Fixed: release key signing; first signed release pending |
 | KSR-052 | P2 | Operator Ctrl-G is eaten as a control prefix; Ctrl-G q shuts the run down and Ctrl-G s + 4 keys kills the renderer | Fixed and verified |
 | KSR-053 | P3 | Recovery's temp-root assumptions differ from where the run created its resources (Linux broker dir under TMPDIR, reaper's TMPDIR) | Fixed and verified |
 | KSR-054 | P3 | The backend group is recorded only after spawn, so a crash in that window leaves an orphaned VM that recovery reports as clean | Fixed and verified |
@@ -218,11 +218,15 @@ into a fresh install directory, so nothing installed earlier ships.
 The tarball's `.sha256` and the bundled `SHA256SUMS` come from the same place as
 the release, so they detect damage, not tampering. The README, the release
 script, and `install.sh` now say so. `KEEL_RELEASE_SIGN=1 package-release.sh`
-signs the tarball with Sigstore's keyless flow: a short-lived certificate bound
+first signed the tarball with Sigstore's keyless flow: a short-lived certificate bound
 to the maintainer's GitHub login, a public transparency-log entry, and no key
-kept anywhere. The README verifies the bundle with `cosign verify-blob`,
-installed from outside the tarball, before unpacking. The first signed release
-needs the maintainer's interactive login, so it is pending.
+kept anywhere. Keyless verification has to name that login, which put the
+maintainer's email in every user's verify command, so signing moved to a
+release key pair (D90): the tarball is signed with a password-protected key
+kept outside the checkout, the public half is committed as `keel-release.pub`,
+and the transparency-log entry carries the key, not an account. The README
+verifies the bundle with `cosign verify-blob --key`, installed from outside the
+tarball, before unpacking. The first signed release is pending.
 
 ### KSR-052: the operator's Ctrl-G
 

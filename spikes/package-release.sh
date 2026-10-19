@@ -21,9 +21,25 @@ if [ -n "$(git -C "$repo_root" status --porcelain --untracked-files=no)" ]; then
     echo "the checkout has uncommitted changes; a release is built from HEAD only" >&2
     exit 1
 fi
-if [ "${KEEL_RELEASE_SIGN:-0}" = 1 ] && ! command -v cosign >/dev/null 2>&1; then
-    echo "KEEL_RELEASE_SIGN=1 needs cosign (https://docs.sigstore.dev/cosign/system_config/installation/)" >&2
-    exit 1
+if [ "${KEEL_RELEASE_SIGN:-0}" = 1 ]; then
+    if ! command -v cosign >/dev/null 2>&1; then
+        echo "KEEL_RELEASE_SIGN=1 needs cosign (https://docs.sigstore.dev/cosign/system_config/installation/)" >&2
+        exit 1
+    fi
+    if [ ! -s "$repo_root/keel-release.pub" ]; then
+        echo "KEEL_RELEASE_SIGN=1 needs the committed public key keel-release.pub" >&2
+        exit 1
+    fi
+    # The private key never lives in the checkout, so it cannot be committed
+    # or shipped by accident.
+    case "${KEEL_RELEASE_KEY:-}" in
+    "") echo "KEEL_RELEASE_SIGN=1 needs KEEL_RELEASE_KEY, the path to the private key" >&2; exit 1 ;;
+    "$repo_root"/*) echo "KEEL_RELEASE_KEY must be outside the checkout" >&2; exit 1 ;;
+    esac
+    if [ ! -r "$KEEL_RELEASE_KEY" ]; then
+        echo "cannot read KEEL_RELEASE_KEY: $KEEL_RELEASE_KEY" >&2
+        exit 1
+    fi
 fi
 build_root=$(mktemp -d "${TMPDIR:-/tmp}/keel-release.XXXXXX")
 trap 'rm -rf "$build_root"' EXIT
@@ -83,12 +99,16 @@ rm -rf "$stage"
 echo "packaged $dist/$name.tar.gz"
 cat "$dist/$name.tar.gz.sha256"
 
-# KSR-051: with KEEL_RELEASE_SIGN=1, sign the tarball with Sigstore's keyless
-# flow. cosign opens a browser to log in, binds a short-lived certificate to
-# that identity, and records the signature in the public transparency log;
-# no signing key is kept anywhere. The bundle is published beside the
-# tarball, and a user checks it with cosign before unpacking.
+# KSR-051: with KEEL_RELEASE_SIGN=1, sign the tarball with the maintainer's
+# release key (KEEL_RELEASE_KEY, kept outside the checkout; cosign asks for its
+# password). The signature is also recorded in Sigstore's public transparency
+# log under the key, not under any account or email. The bundle is published
+# beside the tarball, and a user checks it against the committed
+# keel-release.pub before unpacking. The bundle is checked here the same way,
+# so a release signed with the wrong key is caught before it is published.
 if [ "${KEEL_RELEASE_SIGN:-0}" = 1 ]; then
-    cosign sign-blob --yes --bundle "$dist/$name.tar.gz.sigstore.json" "$dist/$name.tar.gz"
-    echo "signed $dist/$name.tar.gz.sigstore.json"
+    bundle="$dist/$name.tar.gz.sigstore.json"
+    cosign sign-blob --yes --key "$KEEL_RELEASE_KEY" --bundle "$bundle" "$dist/$name.tar.gz"
+    cosign verify-blob --key "$repo_root/keel-release.pub" --bundle "$bundle" "$dist/$name.tar.gz"
+    echo "signed $bundle"
 fi

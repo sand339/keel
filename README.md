@@ -96,15 +96,17 @@ validating a finding in code offline. See [scoped runs](docs/USAGE.md#10-scoped-
 
 A release needs no Docker or toolchain. Download the tarball for your platform,
 its `.sha256`, and its `.sigstore.json` from the
-[releases page](https://github.com/sand339/keel/releases) with `curl`. Check
-the signature first, with [cosign](https://docs.sigstore.dev/cosign/system_config/installation/)
+[releases page](https://github.com/sand339/keel/releases) with `curl`, and the
+release public key, [`keel-release.pub`](keel-release.pub), from this
+repository. Check the signature first, with
+[cosign](https://docs.sigstore.dev/cosign/system_config/installation/)
 installed from outside the tarball, then install:
 
 ~~~sh
+curl -fsSLO https://raw.githubusercontent.com/sand339/keel/main/keel-release.pub
 cosign verify-blob keel-VERSION-PLATFORM.tar.gz \
     --bundle keel-VERSION-PLATFORM.tar.gz.sigstore.json \
-    --certificate-identity sandeepsingh001@gmail.com \
-    --certificate-oidc-issuer https://github.com/login/oauth
+    --key keel-release.pub
 shasum -a 256 -c keel-VERSION-PLATFORM.tar.gz.sha256   # sha256sum -c on Linux
 tar -xzf keel-VERSION-PLATFORM.tar.gz
 ./keel-VERSION-PLATFORM/install.sh                      # checks every file for damage, then installs
@@ -112,8 +114,8 @@ export PATH="$HOME/.local/bin:$PATH"
 keel doctor
 ~~~
 
-`cosign verify-blob` proves the tarball was signed by the maintainer's GitHub
-identity and that the signature is in Sigstore's public transparency log. The
+`cosign verify-blob` proves the tarball was signed with the maintainer's release
+key and that the signature is in Sigstore's public transparency log. The
 checksums only detect a damaged download: they come from the same place as the
 tarball. A release published without a `.sigstore.json` is unsigned; treat it
 as unverified.

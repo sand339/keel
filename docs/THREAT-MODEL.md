@@ -480,9 +480,10 @@ The following are not current guarantees:
 - a receipt from a crashed supervisor; every run that opens a chain ends with a signed receipt, its supervisor's or its own, with the chain's local tamper evidence and no more;
 - authenticated crash recovery: `keel recover` acts only on resources the authenticated chain names and refuses foreign process groups and paths, but its record is unsigned, it runs only when invoked (by `keel run`, `keel attach`, `keel recover`, or the opt-in hourly reaper), and the backend does not start until its record is durable;
 - erasure of every copy of a credential: Keel wipes its own buffers, but not the process environment it inherited, nor `ring`'s derived signing keys;
-- authenticity of a release beyond its Sigstore signature: a release is
-  signed keyless to the maintainer's GitHub identity and logged publicly, so
-  it rests on that account and on Sigstore; a release without a bundle is
+- authenticity of a release beyond its signature: a release is signed with
+  the maintainer's release key, published as `keel-release.pub` in the same
+  repository as the releases, and logged publicly, so it rests on that key
+  and on the repository serving the right public key; a release without a bundle is
   unsigned, and no release has been signed yet;
 - external audit witnessing or hardware-backed attestation;
 - per-turn provenance reconstructed from the exact content in each model
