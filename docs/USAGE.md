@@ -2,18 +2,45 @@
 
 This guide covers the supported local workflow: install Keel, configure one model provider, start a session, respond to trusted approval prompts, and inspect the resulting evidence.
 
-Keel is currently a research prototype for Apple silicon macOS.
+Keel is a research prototype for Apple silicon macOS and for Ubuntu 24.04 or
+later with KVM (x86_64; ARM64 is tested only in a nested VM). The host V8
+sandbox is macOS-only.
 
 ## 1. Prerequisites
 
-Install or provide:
+On macOS, install or provide:
 
 - an Apple silicon Mac;
 - Xcode Command Line Tools;
 - Docker Desktop, running during guest-image setup;
-- cpio, curl, gzip, Python 3, shasum, and tar;
-- the Rust toolchain selected by rust-toolchain.toml;
-- either an Anthropic API key or usable Amazon Bedrock credentials.
+- cpio, curl, git, gzip, Python 3, shasum, and tar;
+- the Rust toolchain selected by rust-toolchain.toml.
+
+On Ubuntu, install or provide:
+
+- an x86_64 or ARM64 host with KVM (`/dev/kvm`) and your user in the `kvm`
+  group;
+- Docker, running during guest-image setup, with your user in the `docker`
+  group;
+- bubblewrap at `/usr/bin/bwrap`, which confines Keel's host-side children;
+- the Rust toolchain selected by rust-toolchain.toml, a C toolchain,
+  `pkg-config`, and the libseccomp and libcap-ng headers, for building
+  virtiofsd;
+- curl, git, gzip, Python 3, `sha256sum`, and tar.
+
+On Ubuntu 24.04:
+
+~~~sh
+sudo apt-get install -y build-essential pkg-config bubblewrap docker.io \
+    libseccomp-dev libcap-ng-dev
+sudo usermod -aG kvm,docker "$USER"    # then log in again
+~~~
+
+Ubuntu 23.10 and later restrict the user namespaces bubblewrap needs;
+`keel doctor` detects this and prints the one-line `sudo` fix.
+
+On either platform, you also need an Anthropic API key, an OpenRouter key, or
+usable Amazon Bedrock credentials.
 
 GitHub CLI is optional and is used only when a GitHub MCP or GitHub authentication flow needs it.
 
@@ -29,7 +56,9 @@ keel doctor
 Setup builds Keel, prepares the pinned runtime artifacts—including the
 xterm-headless renderer—and installs a launcher at ~/.local/bin/keel by
 default. It also downloads the pinned Alpine `linux-virt` 6.12 guest kernel,
-checks its digest, and extracts the raw ARM64 image and modules. Doctor checks that the configured kernel, initramfs, guest root disk, V8 runtime,
+checks its digest, and unpacks the kernel and modules. On ARM64 it extracts
+the raw kernel image from Alpine's EFI wrapper; on x86_64 the bzImage is
+booted as is. Doctor checks that the configured kernel, initramfs, guest root disk, V8 runtime,
 terminal renderer, relay binaries, policy artifacts, and local platform
 requirements are usable.
 
@@ -63,7 +92,7 @@ Keel supports one model provider per run. Credentials stay on the host and are u
 export ANTHROPIC_API_KEY='...'
 ~~~
 
-Host Claude Code SSO is not currently imported into Keel. Being logged in to Claude Code on macOS therefore does not satisfy Keel's model credential check.
+Host Claude Code SSO is not currently imported into Keel. Being logged in to Claude Code on the host therefore does not satisfy Keel's model credential check.
 
 ### Amazon Bedrock with AWS SSO
 
@@ -169,9 +198,12 @@ The launcher presents three profiles:
 
 | Launcher choice | What it runs | Workspace rule |
 | --- | --- | --- |
-| Claude Code — microVM | Claude Code in the VZ guest | New or existing workspace |
-| V8 script — microVM | Node/V8 in the VZ guest | Existing workspace and entry file |
-| V8 script — host sandbox | Pinned Deno on the host | Existing workspace and entry file |
+| Claude Code — microVM | Claude Code in the guest | New or existing workspace |
+| V8 script — microVM | Node/V8 in the guest | Existing workspace and entry file |
+| V8 script — host sandbox | Pinned Deno on the host, macOS only | Existing workspace and entry file |
+
+The guest runs under Virtualization.framework on macOS and under Cloud
+Hypervisor inside bubblewrap on Linux.
 
 For an existing directory, navigate to the directory and choose **Use this directory**. For a V8 profile, enter a JavaScript path relative to that directory, such as:
 
@@ -237,7 +269,7 @@ The entry file must be a .js, .mjs, or .cjs file within the selected workspace.
 
 ### V8 in the host sandbox
 
-The host mode is deliberately lower assurance and is never silently selected. Grant it explicitly:
+The host mode is deliberately lower assurance and is never silently selected. It is macOS-only; Linux refuses it. Grant it explicitly:
 
 ~~~sh
 keel mux --allow isolation:v8-sandboxed
@@ -308,8 +340,10 @@ any decision.
 Requests from the microVM also carry an `origin` field. It names the guest
 process that opened the connection and its ancestry, for example
 `curl -s ... <- bash -c ... <- claude`. A `workspace-code:` prefix and a `*`
-mark code the workload could have written, such as a script in the workspace
-or a package's install hook. The trusted gate shows the same line as "issued
+mark code the workload could have written, such as a workspace script (with
+or without a suffix), a Git hook, a build runner (make, npm, cargo…) started
+in a writable directory, a package's install hook, a process reparented to
+PID 1, or a tmux pane the workload opened. The trusted gate shows the same line as "issued
 by (guest-reported)". A Git push or pull request from workspace code always
 reaches the gate. The origin comes from guest code, so Keel uses it only to
 add prompts, never to skip one.
@@ -463,6 +497,11 @@ KEEL APPROVAL PENDING - Ctrl-] or Ctrl-A /approve
 ~~~
 
 Press Ctrl-] to enter the trusted approval view. In mux sessions, `Ctrl-A`, `/approve`, Enter is an equivalent fallback if the terminal intercepts Ctrl-]. Review the action, destination, provenance, budget impact, and reason.
+
+Text that came from the workload, such as a pull-request body or a diff, is
+drawn behind a `│` gutter and cut off at 80 lines of 240 characters, so it
+cannot pass for the trusted screen's own lines. The line beside the prompt,
+`this decides action N (CLASS): …`, restates what your key decides.
 
 - Press A to approve only the exact displayed action once.
 - When the trusted screen offers it, press G to create the displayed grant for
@@ -673,7 +712,7 @@ agent-browser console                  # page console output
 
 The agent and the CLI share one browser, so you can log in and then hand the
 page to the agent, or the reverse. Screenshots, downloads, and HAR files land
-in `.keel-browser/` in your workspace, visible on the Mac immediately; the
+in `.keel-browser/` in your workspace, visible on the host immediately; the
 directory ignores itself, so Git never sees it. It is created only when the
 browser is first used.
 - **Traffic and scope.** Its traffic goes through Keel like everything else,
@@ -686,7 +725,7 @@ browser is first used.
 - **Disabled features.** `agent-browser chat`, its cloud providers, and WebMCP
   are not usable: the first two need credentials the guest never holds, and
   WebMCP is switched off because it would surface tools defined by the page.
-  Downloaded files land in `.keel-browser/downloads` on your Mac; treat them
+  Downloaded files land in `.keel-browser/downloads` on the host; treat them
   as hostile.
 
 ### Building software in the guest
@@ -745,6 +784,15 @@ session whose chain has not changed for 15 minutes, and print one line if
 they did; the grace keeps a fresh crash's scratch directory for inspection.
 Set `KEEL_RECOVERY_GRACE_MINUTES` to change it, or `KEEL_AUTO_RECOVER=off` to
 disable it. `keel recover --all` recovers every crashed session now.
+
+To recover sessions even when Keel is not used again, install the opt-in
+reaper. It runs `keel recover --all` hourly, through launchd on macOS and a
+systemd user timer on Linux:
+
+~~~sh
+keel setup --install-reaper
+keel setup --remove-reaper
+~~~
 
 `admitted` summarizes the run's admission manifest:
 harness, model, provider, guest kernel, policy bundle, and manifest digest.
@@ -838,7 +886,7 @@ none` to see exactly which hosts refused code tried to reach.
 ### Detonating untrusted code (ephemeral workspace)
 
 By default the workspace is shared read-write, so what the workload writes
-lands on your Mac. To run something you do not trust, add
+lands on the host. To run something you do not trust, add
 `--ephemeral-workspace`: the workspace is shared read-only and a tmpfs overlay
 is layered on top inside the VM, so the workload reads the files but every
 write stays in guest RAM and vanishes at shutdown. The host directory is never
@@ -1022,7 +1070,7 @@ seconds. Let the first run finish rather than interrupting it.
 
 ### Docker is unavailable during setup
 
-Start Docker Desktop and rerun keel setup. Docker is used to build the guest artifacts, not as the runtime isolation boundary.
+Start Docker Desktop on macOS, or the Docker service on Linux, and rerun keel setup. Docker is used to build the guest artifacts, not as the runtime isolation boundary.
 
 ### Git credential configuration is incomplete
 
@@ -1073,10 +1121,7 @@ approve at task admission, for example `--model-cost-budget 100`.
 Before publishing a change:
 
 ~~~sh
-cargo fmt --all -- --check
-cargo check --workspace
-cargo test --workspace
-./ci/check.sh
+./ci/phase0.sh    # fmt, clippy, tests, invariants, pre-push guard test, cargo-deny
 ~~~
 
 The CI script also enforces trusted-code size and dependency constraints. See [Architecture](ARCHITECTURE.md) for the crate boundary and [Threat model](THREAT-MODEL.md) for what those checks do and do not establish.

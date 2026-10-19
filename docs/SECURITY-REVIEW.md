@@ -1,12 +1,12 @@
 # Security review results
 
-Date: 2026-09-25
+Date: first review 2026-09-25; second review 2026-10-15
 
-Scope: the complete working tree, including uncommitted and untracked files.
-
-Method: two read-only passes with the built-in Codex CLI, followed by manual
-call-path validation and regression testing. This document tracks remediation
-work performed after the review.
+This document tracks two reviews and the remediation performed after each. The
+second review comes first. The first review's scope was the complete working
+tree, including uncommitted and untracked files; its method was two read-only
+passes with the built-in Codex CLI, followed by manual call-path validation and
+regression testing.
 
 ## Second review (2026-10-15)
 
@@ -21,7 +21,12 @@ provenance and admission; credentials and TLS; isolation and confinement; the
 trusted terminal; Git, audit, and recovery; supply chain and the CLI). Each
 finding had to name a concrete failure path and was then checked by a separate
 verifier told to refute it. All thirty survived. `cargo deny` also reported
-RUSTSEC-2026-0346 through 0349 against rustls 0.23.45.
+RUSTSEC-2026-0346 through 0349 against rustls 0.23.45; rustls 0.23.46
+resolves them (`3f9f0c0`).
+
+Verification: each fix landed with regression tests. On macOS
+and Ubuntu the workspace tests, E2E (15/15), the fault suite (6/6), and the
+full manual pass succeed; D88 records the review and its costs.
 
 | ID | Severity | Finding | Status |
 | --- | --- | --- | --- |
@@ -36,7 +41,7 @@ RUSTSEC-2026-0346 through 0349 against rustls 0.23.45.
 | KSR-041 | P2 | Linux: reinstalling Keel during a live session makes recovery treat the live run as crashed and delete its broker dir, scratch and images | Fixed and verified |
 | KSR-042 | P2 | gitd's protected diff for a new ref covers only the tip commit against its first parent, so the operator gate shows an incomplete or '(none)' diff | Fixed and verified |
 | KSR-043 | P2 | A torn final record aborts the whole recovery pass and the session can never be recovered | Fixed and verified |
-| KSR-044 | P2 | Guest attribution misses git hooks, Makefile/npm scripts, suffix-less interpreters and reparented processes, so the documented 'workspace-code push reaches the gate' rule is bypassable | Fixed and verified |
+| KSR-044 | P2 | Guest attribution misses git hooks, Makefile/npm scripts, suffix-less interpreters and reparented processes, so the documented 'workspace-code push reaches the gate' rule is bypassable | Fixed and verified; residual: guest-reported, lossy exec stream |
 | KSR-045 | P2 | Trusted push derivation misses deletions, copies of admitted blobs, and force/delete, leaving the protected flags to untrusted gitd | Fixed and verified |
 | KSR-046 | P2 | `keel policy accept` does not confirm, and does not bind to the draft the operator reviewed | Fixed and verified |
 | KSR-047 | P2 | Absolute-form request targets inside terminated TLS are authorized and forwarded verbatim | Fixed and verified |
@@ -279,7 +284,7 @@ The guard now lowercases the remote URL and strips trailing slashes and `.git`
 before matching, and `ci/test-pre-push-guard.sh` checks each spelling GitHub
 accepts.
 
-## Status
+## First review (2026-09-25): status
 
 Twenty-three reviewed findings are remediated with focused regression tests or
 platform-level sandbox assertions. KSR-021 remains explicitly open: affected

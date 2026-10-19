@@ -80,11 +80,11 @@ untrusted runtime, so no VM process exists before it is durable. It carries
 |---|---|---|
 | Identity | `run_id`, `keel_build` (crate version) | session id, compile time; a continued session keeps its id and starts a new chain |
 | Components and boot artifacts (SHA-256) | `trusted_runtime`, `runtime`, `kernel`, `initramfs`, `rootfs` (D61), `vz_backend` or `v8_runtime` and `v8_sdk`, `renderer`; plus `kernel_release` | paths `keel-input-runtime` already selects; the Git relay is part of the VZ backend |
-| Policy | `policy_artifact`, `policy_bundle` | accepted policy hash and `policy_bundle_hash` |
-| Workspace | `root` (canonical), `head` (commit or `unborn`), `git_control` (existing digest), `origin` (credential host and path), `dirty` | worktree at admission |
+| Policy | `policy_bundle`; `extraction_schemas` (D83) | `policy_bundle_hash`; the pinned schema bundle hash |
+| Workspace | `root` (canonical), `head` (commit or `unborn`), `git_control` (existing digest), `origin` (credential host and path), `dirty`; `declared_rank` (D80), `lockfile_pins` (D85) | worktree at admission |
 | Authority | `capabilities` (normalized), `egress_hosts`, `credential_scopes` (host, methods, path prefix, sentinel name; never the secret) | runtime intent and credential vault |
 | Model | `provider` (`anthropic`, `bedrock`, `openrouter`), `host`, `region`, `model`, `tariff` (input and output micro-USD per token, `source`: `reviewed-table` or `admitted-snapshot`), `token_ceiling`, `microusd_ceiling` | trusted provider selection and budget |
-| Run shape | `harness`, `isolation`, `cpus`, `memory_gib`, `provenance_mode`, `starting_floor`, `connection_reuse`, `mux` | runtime request and intent |
+| Run shape | `harness`, `isolation`, `cpus`, `memory_gib`, `provenance_mode`, `starting_floor`, `connection_reuse`, `mux`; `record_targets` (D69), `ephemeral_workspace` (D70), `profile` and `scope` (D58, D67) | runtime request and intent |
 | Admission | `admitted_by` (`trusted-terminal` or `not-required`), `summary_sha256` (SHA-256 of the exact summary admitted) | trusted input |
 
 Excluded: secrets of any kind, the price list behind a snapshot, environment
@@ -94,7 +94,9 @@ dumps, and any guest state.
 
 - Boot-artifact digests are evidence, not enforcement. The untrusted VZ backend
   reads the files itself, and v1 hashes at admission without a private staging
-  copy, because the threat model trusts the host OS.
+  copy, because the threat model trusts the host OS. (Closed in R1: the
+  launcher hashes and boots private copies; see the
+  [R1 slice](#r1-slice-every-run-receipted-and-bound).)
 - `head` and `dirty` describe the workspace at admission, not later changes.
 
 ### Untrusted consumers
@@ -119,7 +121,7 @@ dumps, and any guest state.
 
 ### Cost
 
-249 trusted lines (PLAN D57): input 184, secrets 34 (credential scopes and
+249 trusted lines (D57): input 184, secrets 34 (credential scopes and
 tariff source), kernel 20, and audit 11. Status and report summaries are
 untrusted.
 
@@ -167,7 +169,7 @@ escalation was needed; one `check.N.KIND` field per resource, `ok` or the
 unmet postcondition followed by a secret-free identifier; and an overall `ok`.
 The broker adds a check for its own socket and directory, which it removes once
 no client can connect. The run exits nonzero, naming the postcondition, when a
-runtime-side check fails (PLAN D71–D73).
+runtime-side check fails (D71–D73).
 
 `floor.json` is still saved after the seal: moving it would mean reading
 session facts before the broker has closed its pushes and reservations.
@@ -213,7 +215,7 @@ verification rule). Status and report changes are untrusted.
 
 ## v3 slice: supervisor receipt and two-stage stop
 
-**Status: implemented (PLAN D74).** The persistent session supervisor
+**Status: implemented (D74).** The persistent session supervisor
 (`keel-input-runtime serve`) now owns the facts established after the seal and
 records them in a signed receipt; `keel stop` returns only once that receipt is
 durable.
@@ -266,13 +268,13 @@ no longer matches the recorded digest, is `closed-unclean`. This gives
   a direct `run`; a forged key can only vouch for serve-side files.
 - A supervisor that crashes or is killed writes no receipt; `keel stop`
   reports a stale socket as a supervisor gone without one. Crash recovery
-  remains the next slice.
+  remains the next slice. (Built in the v4 slice.)
 - Deny-pending-approval at stop, secret zeroization, and connection-pool
-  checks are not yet recorded.
+  checks are not yet recorded. (Recorded since R1.)
 
 ## v4 slice: in-chain resources and crash recovery
 
-**Status: implemented (PLAN D75).**
+**Status: implemented (D75).**
 
 ### Registration
 
@@ -292,9 +294,13 @@ it reads the authenticated prefix and releases each recorded resource:
 
 - a directory only if it is in the expected temporary root and named for that
   run's pid (`keel-runtime-PID-…`, `keel-kernel-PID-…`); otherwise it is
-  reported, not removed;
+  reported, not removed. Since KSR-053 the expected root is the canonical
+  path the chain recorded, accepted when it has the run's naming and is a
+  private directory of this user, or is already gone;
 - a process group only if every member is a Keel backend component
-  (`sandbox-exec`, `keel-runtime`, `keel-vz-spike`, `deno`, `git`, `git-*`)
+  (`sandbox-exec`, `keel-runtime`, `keel-vz-spike`, `deno`, `git`, `git-*`,
+  `keel-extract`; on Linux `bwrap`, `keel-runtime`, `keel-ch`,
+  `cloud-hypervisor`, `virtiofsd`, `git`, `keel-extract`)
   and a live leader started before the run recorded it. A group whose leader
   is gone cannot have been reused while members remain. It is then ended
   `SIGTERM`, then `SIGKILL`, and checked empty. An unreadable process table
@@ -316,17 +322,18 @@ line. `keel doctor` warns of stale sessions and names the command to run.
 - The recovery record is unsigned: no key the chain names outlives the crash.
   It describes what recovery observed and when, not the state at the crash.
 - A backend spawned but killed before its record was written is not recorded;
-  the window is one `spawn` return.
+  the window is one `spawn` return. (Closed by KSR-054: the backend starts
+  behind a gate that opens only once its process group is in the chain.)
 - Virtualization.framework may keep the VM in an XPC service outside the
   recorded group (see the v2 limits).
 - Recovery runs only when invoked; `keel run` does not yet reconcile at start.
+  (Superseded by the v5 slice's recovery on use.)
 - Run request files are not removed: one may belong to a session starting
   concurrently.
 
 ## v5 slice: idle timeout and recovery on use
 
-**Status: implemented (PLAN D76), except the opt-in reaper, which is
-planned.** A session can be stale in two ways that need different answers: it
+**Status: implemented (D76); the opt-in reaper followed in R1.** A session can be stale in two ways that need different answers: it
 crashed and left resources behind, or it is alive but nobody is attending it.
 The second holds a VM and live credentials, so it is the larger risk.
 
@@ -354,14 +361,15 @@ are authenticated in full; on 217 session directories a warm pass takes about
 80 ms. `keel recover --all` runs the same pass with no grace. `keel status`
 and `keel doctor` only report.
 
-### Opt-in reaper (planned)
+### Opt-in reaper (built in R1)
 
 A host where Keel is not used for days would keep an orphaned backend until
-the next command. `keel setup --install-reaper` would install a launchd agent
-running `keel recover --all` hourly. It changes host configuration, so it is
-opt-in and not part of this slice.
+the next command. `keel setup --install-reaper` installs a launchd agent on
+macOS, or a systemd user timer on Linux, running `keel recover --all` hourly.
+It changes host configuration, so it is opt-in and was not part of this
+slice.
 
-### Fault injection (PLAN D77)
+### Fault injection (D77)
 
 `ci/faults.py` runs the trusted runtime in front of a fake backend that
 misbehaves on purpose. Its first runs found three defects, all fixed in D77:
@@ -414,6 +422,11 @@ pruning them is a retention decision for the operator.
   resource that teardown removes and recovery releases.
 - **Opt-in reaper.** `keel setup --install-reaper` runs `keel recover --all`
   hourly through launchd or a systemd user timer.
+- **A killed runtime's VM stops with it (D89).** On macOS `keel-runtime`
+  polls its parent every 250 ms and kills the backend, the VZ VM or host V8's
+  Deno, once the trusted runtime is gone. Linux already ended it through
+  bubblewrap's `--die-with-parent`. Recovery still releases whatever a crash
+  leaves behind.
 
 Limits:
 
@@ -428,8 +441,9 @@ Limits:
 ## Verified teardown
 
 The two-stage protocol and receipt below are implemented for persistent
-sessions by the v3 slice; the remaining supervisor duties (denying a pending
-approval, relays and connection pools, zeroization) are not yet recorded.
+sessions by the v3 slice; R1 recorded the remaining supervisor duties
+(denying a pending approval, relays and connection pools, zeroization) and
+gave every run a receipt. The list keeps the original requirements.
 
 `keel stop RUN` is a two-stage protocol:
 
@@ -453,7 +467,7 @@ The supervisor must:
 - retain only documented durable state: authenticated audits, audit keys,
   accepted policy metadata, provenance history, and the teardown receipt.
 
-The receipt will identify the admission digest, run ID, stop reason, timestamps,
+The receipt identifies the admission digest, run ID, stop reason, timestamps,
 termination escalation, each checked resource, retained files, and final
 success or failure. `keel stop` must exit nonzero if a required postcondition
 cannot be established. Repeating the command should return the existing valid
@@ -473,8 +487,11 @@ original crash time.
 
 ## Implementation stages
 
-Stages 2, 3, and 5 are implemented (v2 and v3 slices), stage 4 by the v1 slice
-for the audit event, and stage 6 in its operator-invoked form (v4 slice).
+Stages 1, 2, 3, and 5 are implemented by the v1–v3 slices; stage 4 by the
+v1 slice for the audit event and R1 for the private image copies; stage 6 by
+the v4 slice, and run automatically by the v5 slice. Stage 7 is implemented
+for backend hangs, ignored signals, and crashed runs (`ci/faults.py`, PLAN
+D77); the other faults it lists are not injected.
 
 1. Define canonical admission and teardown receipt schemas.
 2. Add an explicit run resource registry owned by the supervisor.

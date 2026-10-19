@@ -7,6 +7,10 @@ Keel supports two V8 execution modes in addition to its existing agent VM:
 | `vm-v8` | `keel run --isolation vm-v8 v8 SCRIPT` | Node/V8 inside the existing microVM | Strong; recommended |
 | `v8-sandboxed` | `keel run --isolation v8-sandboxed --allow isolation:v8-sandboxed v8 SCRIPT` | Deno permissions on the host | Lower; explicit opt-in |
 
+`v8-sandboxed` is macOS-only. On Linux trusted input refuses it before
+asking for confirmation, because no Linux confinement adapter exists for host
+V8 yet (D86); use `vm-v8`. The launcher still lists the profile there.
+
 Plain `vm` remains the default for Claude and other full harnesses. Keel never
 changes modes after a failure. A failed VM boot therefore cannot become a host
 V8 run.
@@ -193,7 +197,7 @@ package installation path.
 
 ## Tests
 
-The implementation is covered at four levels:
+The implementation is covered at five levels:
 
 1. CLI tests verify defaults, accepted mode/harness pairs, and the explicit
    host-mode grant.

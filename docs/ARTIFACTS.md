@@ -7,16 +7,20 @@ fetches it from the original source.
 
 ## Checksum-pinned downloads
 
-Each script downloads into `.phase0/` or `.phase1/`, refuses a file whose
-SHA-256 differs from the pinned value, and reuses a verified file on later
-runs.
+Each script downloads into `.phase0/`, `.phase1/` (aarch64 guest),
+`.phase1-x86_64/` (x86_64 guest), or, for the Linux runtime,
+`target/downloads/`; refuses a file whose SHA-256 differs from the pinned
+value; and reuses a verified file on later runs. `KEEL_GUEST_ARCH` selects the
+guest architecture; it defaults to the build host's.
 
 | Artifact | Version | Source | Pinned in |
 |---|---|---|---|
-| Guest Linux kernel (`linux-virt`) and its modules | 6.12.111-r0 | Alpine Linux v3.21 `main` (`dl-cdn.alpinelinux.org`) | `spikes/fetch-guest-kernel.sh` |
-| Claude Code (Linux arm64 musl) | 2.1.287 | `downloads.claude.ai` | `spikes/build-phase1-image.sh` |
-| `agent-browser` (musl arm64 binary from the npm package) | 0.38.2 | `registry.npmjs.org` | `spikes/build-phase1-image.sh` (package and binary checksums) |
-| Deno (host, Apple silicon) | 2.9.7 | GitHub releases, `denoland/deno` | `spikes/fetch-deno.sh` |
+| Guest Linux kernel (`linux-virt`) and its modules, aarch64 and x86_64 | 6.12.112-r0 | Alpine Linux v3.21 `main` (`dl-cdn.alpinelinux.org`) | `spikes/fetch-guest-kernel.sh` |
+| Claude Code (Linux arm64 or x64 musl) | 2.1.287 | `downloads.claude.ai` | `spikes/build-phase1-image.sh` |
+| `agent-browser` (musl arm64 or x64 binary from the npm package) | 0.38.2 | `registry.npmjs.org` | `spikes/build-phase1-image.sh` (package and binary checksums) |
+| Deno (host: macOS arm64, Linux x86_64 and aarch64) | 2.9.7 | GitHub releases, `denoland/deno` | `spikes/fetch-deno.sh` |
+| Cloud Hypervisor (Linux host, static x86_64 and aarch64 binaries) | v53.0 | GitHub releases, `cloud-hypervisor/cloud-hypervisor` | `spikes/build-linux-runtime.sh` |
+| virtiofsd (Linux host, built from source) | 1.14.0 | crates.io, `cargo install --locked` (its lockfile, checksummed by crates.io) | `spikes/build-linux-runtime.sh` |
 | `@xterm/headless` | 6.0.0 | `registry.npmjs.org` | `spikes/fetch-xterm-headless.sh` |
 | `@xterm/addon-serialize` | 0.14.0 | `registry.npmjs.org` | `spikes/fetch-xterm-headless.sh` |
 | vmette bundle (phase-0 smoke image only) | 0.11.0 | GitHub releases, `chamuka-inc/vmette` | `spikes/fetch-phase0.sh` |
@@ -41,8 +45,10 @@ Docker is a build tool here, not the runtime isolation boundary.
 ## Locked guest packages
 
 Every Alpine package the image build installs is pinned in
-[`spikes/guest-packages.lock`](../spikes/guest-packages.lock): repository,
-name, exact version, and SHA-256, dependencies included. Two sets are locked:
+[`spikes/guest-packages.lock`](../spikes/guest-packages.lock) (aarch64) and
+[`spikes/guest-packages-x86_64.lock`](../spikes/guest-packages-x86_64.lock)
+(x86_64): repository, name, exact version, and SHA-256, dependencies included.
+Each lock has two sets:
 
 - `rootfs`: the guest root filesystem, from Alpine 3.23 `main` and `community`
   (Chromium, Node, Python, git, tmux, and the gcc, make, npm, pip, Rust, and Go
@@ -51,8 +57,8 @@ name, exact version, and SHA-256, dependencies included. Two sets are locked:
   disk, the stage-1 busybox, and the zstd initramfs.
 
 `spikes/build-phase1-image.sh` downloads each locked file into
-`.phase1/apk-cache/`, refuses one whose digest differs, and installs the files
-offline, so nothing is resolved against Alpine's live index. apk still checks
+`.phase1/apk-cache/` (`.phase1-x86_64/apk-cache/` for x86_64), refuses one
+whose digest differs, and installs the files offline, so nothing is resolved against Alpine's live index. apk still checks
 each package's Alpine signature. The build then fails unless the installed set
 equals the `rootfs` set exactly.
 
@@ -74,12 +80,12 @@ Limits:
   pruned version fails to download, and the fix is to refresh the lock.
 
 Each build still records the SHA-256 of every root filesystem file in
-`.phase1/rootfs.sha256`, and each run records the image digests in its
+`.phase1/rootfs.sha256` (or `.phase1-x86_64/rootfs.sha256`), and each run records the image digests in its
 admission manifest (`kernel.run-admitted`).
 
-To refresh the lock, run `spikes/lock-guest-packages.sh`, review the diff of
-`spikes/guest-packages.lock` (Chromium's version especially), then follow the
-steps below from step 3.
+To refresh a lock, run `spikes/lock-guest-packages.sh` (with
+`KEEL_GUEST_ARCH=x86_64` for the x86_64 lock), review the diff of the lock
+file (Chromium's version especially), then follow the steps below from step 3.
 
 ## Updating a pin
 
@@ -91,7 +97,7 @@ steps below from step 3.
    the virtio-fs, vsock, block, squashfs, and overlay drivers).
 3. Run `keel setup`, then `keel doctor`, then a VM smoke run (`keel run
    --isolation vm-v8 v8 docs/examples/v8-smoke.mjs`) and a Claude session.
-4. Record the change in [PLAN](PLAN.md) when it changes a security property.
+4. Record the change in the [decision log](DECISIONS.md) when it changes a security property.
 
 Alpine removes superseded packages from its CDN, so an old kernel pin
 eventually fails to download with 404. That is the signal to update it.

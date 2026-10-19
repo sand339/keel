@@ -35,7 +35,8 @@ Repository maintainers should enable **Private vulnerability reporting** under *
 Provide enough information to reproduce and assess the issue:
 
 - affected commit, branch, or release;
-- macOS version, hardware architecture, and Keel isolation profile;
+- host OS and version (macOS or Ubuntu), hardware architecture, VMM
+  (Virtualization.framework or Cloud Hypervisor), and Keel isolation profile;
 - whether the workload used the microVM or host V8 sandbox;
 - expected security decision and observed result;
 - minimal reproduction steps or proof of concept;
@@ -51,6 +52,7 @@ Never send live API keys, AWS credentials, Git credentials, unredacted secrets, 
 Examples include:
 
 - escape from a Keel microVM into the host;
+- escape from the bubblewrap confinement of Keel's host-side children on Linux;
 - host V8 sandbox escape or undeclared host access;
 - credential disclosure to the workload;
 - arbitrary egress that bypasses the trusted authorization path;

@@ -46,11 +46,12 @@ The following components should require little or no Linux-specific redesign:
 - guest MCP, egress, Git, and terminal protocols;
 - the Linux guest init process and workload environment.
 
-The main platform-specific implementation is currently concentrated in the VZ
-launcher, setup checks, renderer confinement command, guest image architecture,
-and runtime configuration names.
+Before Linux support, the platform-specific implementation was concentrated
+in the VZ launcher, setup checks, renderer confinement command, guest image
+architecture, and runtime configuration names. Linux adds the `keel-ch`
+backend and the bubblewrap confinement adapter beside them (D86).
 
-## Proposed host architecture
+## Host architecture
 
 ```text
 keel CLI
@@ -68,9 +69,10 @@ untrusted Linux runtime supervisor
 
 Cloud Hypervisor is the recommended first backend because it supports direct
 kernel boot, virtio-vsock, virtio-fs, serial consoles, and an intentionally
-small virtual device surface. Firecracker remains an alternative for later
-noninteractive fleet workloads, but its block-device and API lifecycle model
-requires more adaptation for an interactive local workspace.
+small virtual device surface. Firecracker was the alternative, but its
+block-device and API lifecycle model needs more adaptation for an interactive
+local workspace, and the noninteractive fleet use it suits is out of scope
+(D89).
 
 Cloud Hypervisor and `virtiofsd` remain outside Keel's TCB. They provide
 isolation mechanisms; Keel's trusted kernel still decides authority, holds
@@ -279,9 +281,10 @@ must not depend on a mutable global firewall configuration.
 
 ## Lifecycle and teardown
 
-Linux support should integrate the planned
+Linux support integrates the
 [run admission and verified teardown](run-admission-and-verified-teardown.md)
-work rather than creating another temporary lifecycle:
+work, now implemented on both platforms, rather than creating another
+temporary lifecycle:
 
 - bind backend and image digests before boot;
 - record VM, Cloud Hypervisor API socket, vsock socket, `virtiofsd`, cgroup, and
@@ -393,8 +396,10 @@ per-crate ratchet.
   same lock, and passes both on macOS.
 - Publishing: release tarballs are built and tested (`spikes/package-release.sh`,
   `keel setup --prebuilt`), so a user's install no longer fetches the guest
-  kernel from Alpine's CDN, which drops superseded versions. They are not yet
-  published, and not yet signed.
+  kernel from Alpine's CDN, which drops superseded versions. Signing is built:
+  `KEEL_RELEASE_SIGN=1 package-release.sh` signs a tarball with Sigstore's
+  keyless flow (KSR-051). No release is published yet, and the first signed
+  release is pending.
 
 ## Principal risks
 

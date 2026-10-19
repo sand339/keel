@@ -23,14 +23,18 @@ Do not file public issues for suspected vulnerabilities. Follow [SECURITY.md](SE
 
 ## Development environment
 
-Keel currently targets Apple silicon macOS.
+Keel targets Apple silicon macOS and Ubuntu 24.04 or later with KVM. The
+host V8 sandbox is macOS-only.
 
-Install:
+On macOS, install:
 
 - Xcode Command Line Tools;
 - Docker Desktop for guest-image setup;
-- cpio, gzip, and shasum;
+- cpio, curl, git, gzip, Python 3, shasum, and tar;
 - the Rust toolchain pinned by rust-toolchain.toml.
+
+On Ubuntu, install the KVM, Docker, bubblewrap, and build requirements listed
+in the [README](README.md#requirements), and the same Rust toolchain.
 
 From the repository root:
 
@@ -85,7 +89,7 @@ Explain any proposed exception in the pull request and update the architecture a
 
 ## Trusted computing base budget
 
-CI holds each of the six trusted crates to a per-crate line ratchet in [`ci/check_invariants.py`](ci/check_invariants.py) (invariant I1), together with dependency-direction and allowlist checks. A change that grows a trusted crate past its ratchet fails CI until the number is raised in the same change. The trusted total, about 15,300 lines, is reported on every run but is not capped.
+CI holds each of the six trusted crates to a per-crate line ratchet in [`ci/check_invariants.py`](ci/check_invariants.py) (invariant I1), together with dependency-direction and allowlist checks. A change that grows a trusted crate past its ratchet fails CI until the number is raised in the same change. The trusted total, about 19,700 lines, is reported on every run but is not capped.
 
 When changing trusted code:
 
@@ -116,10 +120,7 @@ Use cargo fmt for formatting and address relevant Clippy warnings.
 Run the standard checks before opening a pull request:
 
 ~~~sh
-cargo fmt --all -- --check
-cargo check --workspace
-cargo test --workspace
-./ci/check.sh
+./ci/phase0.sh    # fmt, clippy, tests, invariants, pre-push guard test, cargo-deny
 ~~~
 
 Add focused tests appropriate to the change:

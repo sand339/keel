@@ -82,8 +82,7 @@ variables in every shell, and authenticated push needs three hand-built
 variables per repository. `keel init` records where each credential comes from
 (Keychain, a credential process, `gh`) without storing any secret, derives the
 push scope from the workspace's `origin` at admission, and ends with a short
-first session on the real trusted screen. See the
-[design note](design/keel-init.md).
+first session on the real trusted screen.
 
 Exit criteria:
 
@@ -145,7 +144,8 @@ get their own reviewed attestation design.
 
 ## Cross-cutting
 
-- signed release artifacts, and notarized macOS binaries;
+- the first signed release (keyless signing is built), and notarized macOS
+  binaries;
 - a software bill of materials and dependency provenance;
 - ARM64 Linux on real hardware (it is tested only in a nested VM);
 - external audit witnessing and optional hardware-backed keys;

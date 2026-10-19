@@ -38,7 +38,7 @@ The central rule is that an untrusted component may request authority but may no
      +---------+---------+      +-----+------------------+
      | untrusted runtime |      | model / Git / MCP     |
      |                   |      | brokered transport     |
-     | VZ microVM        |      +------------------------+
+     | VZ / CH microVM   |      +------------------------+
      | or host Deno      |
      +---------+---------+
                |
@@ -57,7 +57,8 @@ The diagram is a trust map, not a process map. Some trusted crates are linked in
 Keel's intended trusted computing base includes:
 
 - the local operator;
-- the host operating system and Apple Virtualization.framework;
+- the host operating system and its VM mechanism: Apple Virtualization.framework
+  on macOS, or KVM with Cloud Hypervisor and bubblewrap on Linux;
 - the six trusted Keel crates;
 - pinned dependencies of those crates;
 - runtime artifacts admitted by the local setup and configuration;
@@ -81,7 +82,7 @@ An untrusted component can still contain important correctness logic. “Untrust
 
 Keel keeps the hand-written first-party trusted Rust surface small. CI holds each
 trusted crate to a line ratchet: growing a crate past its number fails until the
-number is raised, with the reason in the commit. The trusted total, about 18,900
+number is raised, with the reason in the commit. The trusted total, about 19,700
 lines, is reported rather than capped. The `tokei` count includes inline tests and
 trusted binaries as well as production library code.
 
@@ -153,14 +154,14 @@ Typical protected actions include network connections, Git mutations, MCP calls,
 
 ### Claude Code microVM
 
-Claude Code runs in a macOS Virtualization.framework guest. The guest has no ordinary NIC or DNS path. Keel communicates over a constrained host/guest channel and performs permitted external operations through host relays.
+Claude Code runs in a Virtualization.framework guest on macOS or a Cloud Hypervisor (KVM) guest on Linux, with the host-side children confined by Seatbelt or bubblewrap. The guest has no ordinary NIC or DNS path. Keel communicates over a constrained host/guest channel and performs permitted external operations through host relays.
 
 The guest is not trusted merely because it boots from a prepared image.
 
 The Claude guest also carries a headless Chromium, driven by `agent-browser`,
 an MCP server for the agent and a CLI for the operator that share one browser
-(DECISIONS D36). It runs inside the confinement below without Chromium's own
-sandbox (DECISIONS D35), proxies every request through the guest egress relay,
+(D60). It runs inside the confinement below without Chromium's own
+sandbox (D59), proxies every request through the guest egress relay,
 and has its background calls to Google services disabled. Screenshots,
 downloads, and HAR files go to a self-ignoring `.keel-browser/` directory in
 the workspace.
@@ -190,7 +191,10 @@ as root and then drop to a separate service UID, so the workload can neither
 signal nor inspect them. The workload reaches the host only through those
 relays. At boot, a confined child tries every forbidden operation and reports
 the result in the guest report; the host refuses to start the workload unless
-every layer holds.
+every layer holds. On an `x86_64` guest the preflight also issues an x32 call
+and an `int 0x80` compat call from two children, and the host refuses the
+guest unless both were killed by `SIGSYS`. A guest relay retries a failed
+`accept` rather than exiting, and bridges at most 256 connections at once.
 
 **Process attribution.** PID 1 in the guest is a Rust supervisor. It keeps
 root, but the kernel delivers no signal to PID 1 from inside the guest unless
@@ -234,7 +238,8 @@ This is the recommended V8 profile when isolation strength matters.
 
 ### V8 host sandbox
 
-The lower-assurance profile runs a pinned Deno binary on the host with:
+The lower-assurance profile runs a pinned Deno binary on the host, on macOS
+only; Linux refuses `v8-sandboxed`. It runs with:
 
 - a cleaned environment;
 - bounded workspace access;
@@ -272,7 +277,8 @@ The workload sees a sentinel credential, not the real model or service secret.
 Current model authentication paths are:
 
 - Anthropic API key held by the host relay;
-- Amazon Bedrock credentials obtained on the host, with requests signed using SigV4.
+- Amazon Bedrock credentials obtained on the host, with requests signed using SigV4;
+- OpenRouter API key held by the host relay, charged at an operator-admitted price snapshot.
 
 Host Claude Code SSO import is not currently implemented.
 
@@ -295,9 +301,10 @@ reusable grant.
 
 For HTTPS, CONNECT and the guest-facing TLS handshake are local setup inside
 the terminating relay. They do not perform external DNS or TCP. The relay first
-decrypts, bounds, and authorizes the exact HTTP method, path, and body digest;
-only then may trusted code resolve the admitted name, reject forbidden address
-classes, open the upstream socket, and substitute a scoped credential. This
+decrypts, bounds, and authorizes the exact HTTP method, path, and body digest,
+reading only an origin-form request target (one that starts with `/`, not
+`//`, and has no fragment); only then may trusted code resolve the admitted
+name, reject forbidden address classes, open the upstream socket, and substitute a scoped credential. This
 keeps one user-visible request at one meaningful gate and prevents a generic
 CONNECT allowance from becoming a DNS or port-probing primitive.
 
@@ -314,6 +321,12 @@ shutdown while the gate is pending cancels that decision; late input cannot
 start the effect or create a grant. This
 separation prevents a legitimate human approval from being mistaken for an
 unresponsive broker and tearing down the model connection.
+
+A request frame must arrive whole within ten seconds, not only each read
+within half a second, so a client that drips bytes cannot hold a slot. At most
+64 connections are being decided at once; established bridges, such as
+keep-alive egress sessions, have their own bound of 512 and do not count
+against those slots.
 
 Model budgets use a kernel-owned reservation lifecycle rather than treating a
 connection close as evidence that no provider work occurred. Authorization
@@ -397,7 +410,9 @@ the live broker and its displayed read history. In an attached mux session use
 `Ctrl-A`, `/floor-lift [1-3]`, Enter; `keel floor lift SESSION [1-3]` submits the
 same request to that live session, and the trusted challenge is completed in
 the attached terminal. Both routes use the kernel's operator channel and the
-same audit chain as the action they affect.
+same audit chain as the action they affect. A lift vouches for the read
+history it displayed: it is denied if the floor or its read history changed
+while the challenge was pending.
 
 The default floor mode therefore prevents lower-ranked influence from being
 used for a higher-ranked effect without either exact-action approval or an
@@ -419,7 +434,7 @@ and continuity evidence, but the session directory is unsigned and untrusted;
 a new or continued run never imports that file as authorization and begins
 again with the rank-0 direct-workspace observation.
 
-Keel also enforces **payload provenance** (PLAN D81). At admission, trusted
+Keel also enforces **payload provenance** (D81). At admission, trusted
 code indexes the committed `HEAD` tree with the hardened host Git as winnowed
 fingerprints: text blobs are private and credential-shaped paths secret,
 unless the operator declares `workspace:public`. Every decrypted non-model
@@ -436,8 +451,13 @@ itself. `keel-gitd` hands over the exact receive-pack body; the kernel binds
 the push permit to that body's digest, indexes the pack with the hardened host
 Git in a fresh repository whose only other objects are a private bare copy of
 the admitted branch in the broker's own directory, and reads only objects the
-copy lacks. The body's own ref commands replace the relay's list, and the
-default-branch and protected-path flags can only be raised. On the default
+copy lacks. The body's own ref commands replace the relay's list. The kernel
+derives force itself: a deletion, or an old commit that is not an ancestor of
+the new one, is a rewrite. It derives protected-path changes against admitted
+history, comparing a new ref with the admitted `HEAD`. A body whose commands
+cannot all be read counts as force, default-branch, and manifest at once. The
+relay's flags can only raise these, and the gate shows the kernel's protected
+view rather than the relay's diff. On the default
 branch every pushed file is protected; elsewhere manifests and CI paths are. A
 line there that is neither committed at the admitted `HEAD` nor written by the
 model in a tool call is unaccounted, and adds `payload:integrity`; a pack that
@@ -474,7 +494,7 @@ Terminal-generated replies, such as cursor-position reports, return to the
 guest as a separate bounded frame type. They never reach the operator terminal
 and cannot enter the trusted approval-input path.
 
-Ctrl-] is the secure-attention key. In mux sessions, the trusted `Ctrl-A` command mode can emit the same event with `/approve` for terminals that intercept Ctrl-]. It switches input to the trusted approval path, which renders the action from trusted data. High-risk actions can require a challenge rather than a single-key approval.
+Ctrl-] is the secure-attention key. In mux sessions, the trusted `Ctrl-A` command mode can emit the same event with `/approve` for terminals that intercept Ctrl-]. It switches input to the trusted approval path, which renders the action from trusted data. Untrusted text on that screen, such as a diff or pull-request body, is shown in a gutter bounded to 80 lines of 240 characters, so it cannot pass for the screen's own lines or scroll the header away, and a summary line beside the prompt restates the action. High-risk actions can require a challenge rather than a single-key approval.
 
 During that takeover the renderer continues updating its private screen while
 trusted input discards complete display snapshots. Resume clears the trusted
@@ -528,11 +548,13 @@ Before the runtime backend starts, trusted input records `kernel.run-admitted`:
 a canonical manifest of everything the run was admitted with (component and
 boot-artifact digests, policy, workspace state, authority and credential
 scopes, model terms, and run shape) and its SHA-256. A run whose manifest
-cannot be hashed or written does not start. The digests are evidence of what
-was admitted, not proof of what the untrusted backend booted.
+cannot be hashed or written does not start. The backend boots the private
+image copies that admission hashed; a same-user process can still race that
+copy, so the digests are strong evidence, not exclusive custody.
 
 The verifier reports a sealed complete stream separately from an authenticated
-but unsealed prefix, and names the retired signature format instead of treating
+but unsealed prefix; a partial final record, as a writer killed mid-record
+leaves, ends the authenticated prefix and is reported as truncated. It names the retired signature format instead of treating
 it as generic corruption. Gate events state whether a trusted operator prompt
 was actually presented; deny-only decisions are not counted as prompt fatigue.
 An action commits to its exact target with a hash by default; a run admitted
@@ -545,13 +567,14 @@ terminal outcome (`released-unsent`, `settled-actual`, `committed-observed`,
 `committed-conservative`, or `overrun`) without recording response content.
 The audit design provides local tamper evidence relative to the key and verifier.
 It is not remote attestation, cannot prove that a compromised host recorded
-reality. Teardown receipts cover persistent sessions whose supervisor
-survives; crash recovery records are unsigned observations.
+reality. Every run that opens a chain ends with a signed teardown receipt, its
+supervisor's or its own; a crashed supervisor leaves none, and crash recovery
+records are unsigned observations.
 
 In a microVM run, the guest's PID 1 also streams its own account of the run
 over a dedicated vsock port: process execs and exits from the kernel's
 process-events connector, and file writes from fanotify on the workload's
-writable mounts. The VZ backend stamps each bounded, validated line with host
+writable mounts. The VM backend (VZ or Cloud Hypervisor) stamps each bounded, validated line with host
 time and appends it to `guest-*.ndjson`, the one session file the trusted
 launcher lets the untrusted runtime write. These events are guest claims: they
 are outside the audit chain and never reach a decision. `keel export` joins
@@ -581,7 +604,7 @@ The current lifecycle is:
 7. Close relays, write the terminal audit seal, finalize local evidence, and
    report audit locations.
 
-Before step 5, trusted `keel-input` records `kernel.run-admitted`, a canonical manifest of what the run was admitted with, and refuses the run if it cannot ([`admission_manifest.rs`](../crates/trusted/keel-input/tests/admission_manifest.rs)). The manifest's artifact digests are evidence rather than enforcement. For a persistent session, the supervisor signs a teardown receipt after the seal with a key the chain's `kernel.run-teardown` record names, binding the seal digest, its serve-side checks, and the digests of `floor.json` and `attach.exit` ([`serve_receipt.rs`](../crates/trusted/keel-input/tests/support/serve_receipt.rs)). Each run also records the host resources it creates in the chain, so `keel recover` can release exactly what a crashed run's authenticated record names and write an unsigned recovery record ([`crash_recovery.rs`](../crates/trusted/keel-input/tests/support/crash_recovery.rs)).
+Before step 5, trusted `keel-input` records `kernel.run-admitted`, a canonical manifest of what the run was admitted with, and refuses the run if it cannot ([`admission_manifest.rs`](../crates/trusted/keel-input/tests/admission_manifest.rs)). The backend boots the image copies the manifest hashed, but a same-user process can race that copy. For a persistent session, the supervisor signs a teardown receipt after the seal with a key the chain's `kernel.run-teardown` record names, binding the seal digest, its serve-side checks, and the digests of `floor.json` and `attach.exit` ([`serve_receipt.rs`](../crates/trusted/keel-input/tests/support/serve_receipt.rs)). Each run also records the host resources it creates in the chain, so `keel recover` can release exactly what a crashed run's authenticated record names and write an unsigned recovery record ([`crash_recovery.rs`](../crates/trusted/keel-input/tests/support/crash_recovery.rs)).
 
 ## 14. Source layout
 
@@ -635,7 +658,7 @@ Run:
 cargo fmt --all -- --check
 cargo check --workspace
 cargo test --workspace
-./ci/check.sh
+./ci/phase0.sh
 ~~~
 
 These checks are necessary evidence for the architecture. They are not a formal proof of memory safety, policy correctness, hypervisor isolation, or end-to-end security.
@@ -646,7 +669,7 @@ Implemented today, with the tests that exercise each item. The headless end-to-e
 
 | Capability | Evidence |
 | --- | --- |
-| VZ microVM execution for Claude and V8 workloads, with no ordinary guest networking | `hostile_curl_requests_cross_the_runtime_and_fail_closed` in [`keel-vz-spike.rs`](../crates/untrusted/keel-isolate/src/bin/keel-vz-spike.rs) |
+| VZ microVM execution for Claude and V8 workloads, with no ordinary guest networking | `hostile_curl_requests_cross_the_runtime_and_fail_closed` in [`relay.rs`](../crates/untrusted/keel-isolate/src/relay.rs) |
 | Second confinement layer inside the guest: no capabilities, Landlock, seccomp, bounded cgroup | `confinement_preflight_requires_every_layer` in [`keel-mcp`](../crates/untrusted/keel-mcp/src/lib.rs) |
 | Lower-assurance host V8 sandbox with an explicit grant | [`v8_runtime.rs`](../crates/untrusted/keel-isolate/tests/v8_runtime.rs), [`runtime_security.rs`](../crates/trusted/keel-input/tests/support/runtime_security.rs) |
 | Trusted action stamping and structural denials | I5 and I11; the [kernel unit suite](../crates/trusted/keel-kernel/tests/support/unit.rs) |
@@ -665,9 +688,9 @@ Implemented today, with the tests that exercise each item. The headless end-to-e
 
 Planned:
 
-- enforcement from the admission manifest, such as staging admitted artifacts privately;
-- an opt-in launchd reaper, teardown receipts for foreground runs, and fault-injection tests for teardown and recovery;
-- Linux KVM and Cloud Hypervisor support;
+- exclusive custody of the staged boot images (a same-user process can race the copy);
+- a receipt from a crashed supervisor;
+- host V8 on Linux, ARM64 Linux on real hardware, and Linux and VM runs in CI;
 - a distributed evaluation and reinforcement-learning substrate;
 - stronger packaging, release reproducibility, and evaluation evidence.
 

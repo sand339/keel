@@ -258,7 +258,7 @@ lower-assurance process starts.
 | Scoped runs refuse everything outside their scope | [`scoped_run.rs`](crates/trusted/keel-input/tests/scoped_run.rs) |
 | Every run records its admission manifest first | [`admission_manifest.rs`](crates/trusted/keel-input/tests/admission_manifest.rs) |
 | The audit log is authenticated, hash-chained, and sealed | [`verification_status.rs`](crates/trusted/keel-audit/tests/verification_status.rs) |
-| The trusted code is about 18,900 lines, each crate held to a line ratchet | [`check_invariants.py`](ci/check_invariants.py) I1 |
+| The trusted code is about 19,700 lines, each crate held to a line ratchet | [`check_invariants.py`](ci/check_invariants.py) I1 |
 
 Out of scope: judging whether an action is harmful, stopping an operator from
 approving an accurately shown action, exfiltration through permitted output,
@@ -274,7 +274,7 @@ and a compromised host, hypervisor, or trusted dependency. See the
 - **Chromium updates with the package lock,** and runs without its own sandbox inside the VM.
 - **No live browser view:** use the `agent-browser` CLI and its screenshots.
 - **Platforms:** Apple silicon macOS and Ubuntu 24.04+ (x86_64; ARM64 tested only nested); host V8 is macOS-only.
-- **Crash cleanup:** a killed runtime's VM stops with it on both platforms, but its scratch directories wait for `keel recover` or the opt-in hourly reaper, and recovery records are unsigned.
+- **Crash cleanup:** a killed runtime's VM stops with it on both platforms, but its scratch directories wait for `keel recover`, the next `keel run` or `keel attach` (after a 15-minute grace), or the opt-in hourly reaper, and recovery records are unsigned.
 - **Process attribution is the guest's claim:** which guest process issued a push comes from the guest's PID 1, read just after each exec; it can only add a gate, never remove one.
 - **Unsigned releases:** a release without a `.sigstore.json` bundle is unsigned; none is signed yet.
 
@@ -287,14 +287,13 @@ and a compromised host, hypervisor, or trusted dependency. See the
 | [Threat model](docs/THREAT-MODEL.md) | Assets, adversaries, intended guarantees, assumptions, and residual risks |
 | [Roadmap](docs/ROADMAP.md) | Future work only, with links to detailed design notes |
 | [Pinned artifacts](docs/ARTIFACTS.md) | Every downloaded artifact, its source and pin, and how to update it |
-| [Release checklist](docs/RELEASE.md) | What a release must pass, and the notes for each release |
 | [Documentation index](docs/README.md) | Design notes, examples, and historical project material |
 | [Security policy](SECURITY.md) | Private vulnerability reporting, scope, and response process |
 | [Contributing](CONTRIBUTING.md) | Development workflow and trust-boundary rules |
 
 ## Project status
 
-The repository contains working microVM and V8 execution paths, policy enforcement, a conservative session-wide provenance floor, trusted approvals, credential-aware relays, process attribution, an audited admission manifest, session management, checked teardown with a signed stop receipt, crash recovery from the audit chain, and authenticated audit logs. The action-centric verdicts and the per-turn context digest log run in shadow mode while their data is measured. Remaining work includes enforcement of those verdicts, reproducible packaging, evaluation, automatic crash reconciliation and fault-injection tests for teardown, and portability beyond macOS.
+The repository contains working microVM and V8 execution paths, policy enforcement, a conservative session-wide provenance floor, trusted approvals, credential-aware relays, process attribution, an audited admission manifest, session management, checked teardown with a signed stop receipt, crash recovery from the audit chain, and authenticated audit logs. The action-centric verdicts and the per-turn context digest log run in shadow mode while their data is measured. Remaining work includes enforcement of those verdicts, a published security evaluation, Linux and VM tests in CI, and host V8 on Linux (see the [roadmap](docs/ROADMAP.md)).
 
 Security-sensitive behavior should be judged from the current source, tests, and threat model—not from roadmap items or design proposals.
 

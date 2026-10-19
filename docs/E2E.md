@@ -10,7 +10,7 @@ Keel's end-to-end acceptance has two parts:
    admission screens. Those decisions are, by design, something only a person
    at the terminal can make, so they are exercised by a person.
 
-A release needs both to pass (see the [release checklist](RELEASE.md)).
+A release needs both to pass.
 
 ## 1. Headless suite
 
@@ -21,14 +21,16 @@ python3 ci/e2e.py --list               # case names
 python3 ci/e2e.py --case build-offline # one case
 ```
 
-The suite uses the installed `~/.local/bin/keel` and an isolated
-`KEEL_STATE_DIR`, so it does not mix with your own sessions. Each case's input
+The suite runs on an Apple silicon Mac or a Linux KVM host. It uses the
+installed `~/.local/bin/keel` and an isolated `KEEL_STATE_DIR`, so it does not
+mix with your own sessions. On a slow host, such as a nested VM, set
+`KEEL_E2E_TIMEOUT_SCALE` (for example `3`) to stretch every wait. Each case's input
 is `/dev/null`: a case that raised an approval or admission screen could not
 proceed, and the suite counts any such screen as a failure.
 
 | Case | What it proves |
 |---|---|
-| `doctor` | The installation is complete: root disk, guest kernel with Landlock scoping, signed VZ backend |
+| `doctor` | The installation is complete: root disk, guest kernel with Landlock scoping, signed VZ backend (macOS) or a working bubblewrap (Linux) |
 | `v8-vm` | V8 runs inside the microVM; the manifest records the isolation and root disk digest |
 | `claude-reply` | Claude Code reaches the model through the trusted proxy; usage is settled from trusted usage; the context digest log records requests |
 | `guest-confinement` | The guest runs the 6.12 kernel with Landlock ABI 6, and the workload cannot signal PID 1 |
@@ -62,8 +64,9 @@ python3 ci/faults.py                    # every case, about a minute
 python3 ci/faults.py --case supervisor-killed --keep
 ```
 
-The fault suite needs an installed runtime (for the renderer, images, and VZ
-siblings) but calls no model and boots no VM. It builds a debug
+The fault suite needs an installed runtime (for the renderer, images, and VM
+backend siblings: `keel-vz-spike` on macOS; `keel-ch`, `cloud-hypervisor`, and
+`virtiofsd` on Linux) but calls no model and boots no VM. It builds a debug
 `keel-input-runtime`, the only build that honours
 `KEEL_UNSAFE_DEVELOPMENT_OVERRIDES`, and points it at a fake `keel-runtime`
 compiled from C that misbehaves on purpose.
@@ -75,6 +78,13 @@ compiled from C that misbehaves on purpose.
 | `crash-orphan-leader` | The trusted runtime is `SIGKILL`ed; the backend keeps running | Status is `stale`; `keel recover` ends the group and records it; status is `recovered` |
 | `crash-orphan-member` | As above, but the leader exits and a member survives | Recovery ends the group without a live leader |
 | `supervisor-killed` | `serve` is `SIGKILL`ed | The run sees the hangup, ends its backend, and seals; `keel stop` reports a supervisor gone without a receipt; `keel recover` removes its files |
+| `early-error` | The renderer path is broken, so the run fails after its chain opens | The run fails; it opened one chain, sealed with stop reason `error`; its own receipt passes; status is `closed` with `receipt: verified after error` |
+
+On Linux the backend runs in bubblewrap's PID namespace with
+`--die-with-parent`, so the orphan faults cannot occur: the two `crash-orphan`
+cases check instead that nothing outlives the run, and `stop-escalates`
+expects a clean stop, since `SIGTERM` ends bubblewrap and the stubborn backend
+with it.
 
 A failed audit write at teardown is not injected live: on macOS an append to
 an already-open chain survives both the immutable flag and a full volume. It
@@ -82,8 +92,7 @@ is covered in-process by `broker_shutdown_propagates_durable_audit_failure`.
 
 ## 3. Manual runbook
 
-The cases below are the release minimum. For a full hands-on pass over every
-flow and option, use [Manual acceptance tests](MANUAL-TESTS.md).
+The cases below are the release minimum.
 
 Run each case from an interactive terminal in a throwaway Git workspace.
 - **Keys.** When an approval is pending, the terminal title reads "Keel
@@ -107,7 +116,7 @@ Run each case from an interactive terminal in a throwaway Git workspace.
 | M5b | Offline scoped run | `keel run --profile scoped --scope none claude -p 'Run curl -sI https://example.com with Bash.' --allowedTools Bash` | `APPROVE` | The admission screen shows `scope (all else refused): none`; the model still answers; example.com is refused at once as `kernel:out-of-scope` |
 | M6 | Browser on a real site | `keel run claude -p 'Open https://example.com in the browser, take a screenshot, and tell me the title.' --allowedTools mcp__browser` | `A` for example.com | Title "Example Domain"; screenshot in `.keel-browser/screenshots/`; no prompt for any Google host |
 | M7 | MCP issue read and attribution | `keel run claude -p 'Use the keel gh_issue_read tool to read issue 1 of octocat/Hello-World.' --allowedTools mcp__keel` | `A` for api.github.com | The issue is returned; the action's `origin` in the audit names `keel-mcp-guest` |
-| M8 | Host V8 sandbox | `keel run --isolation v8-sandboxed --allow isolation:v8-sandboxed v8 docs/examples/v8-smoke.mjs` (from the repository) | Type `HOST V8` | The smoke script runs; the manifest records `v8-sandboxed` |
+| M8 | Host V8 sandbox (*macOS only*; Linux refuses it) | `keel run --isolation v8-sandboxed --allow isolation:v8-sandboxed v8 docs/examples/v8-smoke.mjs` (from the repository) | Type `HOST V8` | The smoke script runs; the manifest records `v8-sandboxed` |
 | M9 | Elevated budget | `keel run --model-cost-budget 25 claude -p 'Reply OK.'` | `APPROVE` | The admission screen shows the USD 25 ceiling; the manifest records it |
 | M10 | OpenRouter | `keel run --auth openrouter --model anthropic/claude-sonnet-4.6 claude -p 'Reply OK.'` | `APPROVE` | The admission screen shows the price snapshot. Its `kernel.model-reservation` records end in `settled-actual` with an actual cost below the reserved cost, which confirms OpenRouter usage parsing; `committed-conservative` would mean usage was not parsed |
 | M11 | Persistent mux | `keel mux`, then `Ctrl-A /detach`, `keel attach SESSION`, `keel stop SESSION` | Launcher choices | The session survives detach, reattaches with its screen, and stops cleanly; `keel stop` prints its teardown receipt; `keel status` shows `closed` with `receipt: verified after stop` |

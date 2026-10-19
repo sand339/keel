@@ -1,6 +1,6 @@
 # Action-centric provenance, guest confinement, and process attribution
 
-Status: in progress on branch `provenance-axes`. Sections marked
+Status: W1–W6 as the table below states, all on `main`. Sections marked
 **Implemented** describe current behavior; everything else is proposal.
 Security claims about Keel must still be judged from the source, tests, and
 [threat model](../THREAT-MODEL.md).
@@ -795,10 +795,20 @@ Exit criteria:
   `SECCOMP_ADDFD` stay deferred: a process that exits before its connection is
   examined is reported as unknown, which never widens authority.
 - **Ancestry.** The supervisor walks parent links to PID 1, keeping up to 16
-  processes. A process is workspace code if its executable or a script
-  argument lies under a writable root, or its working directory is a
-  `node_modules` under one. Read-only system paths are not, because Landlock
-  keeps the workload from writing them.
+  processes. As first built (D51), a process was workspace code if its
+  executable or a script argument lay under a writable root, or its working
+  directory was a `node_modules` under one. Since KSR-044 (`3f9f0c0`,
+  `fae77d3`) it is also workspace code if any argument names an existing file
+  under a writable root (Git hooks, scripts without a suffix), if it is a
+  build or package runner (make, npm, cargo, and others) started in a
+  writable directory, or if its ancestry was cut off by reparenting to PID 1,
+  other than Keel's own tmux server. A process marked as workspace code when
+  it execs keeps the mark, keyed by pid and start time, however it rewrites
+  its argv, and a command in any tmux pane other than Keel's own is workspace
+  code. [`ARCHITECTURE.md`](../ARCHITECTURE.md) states the current rules.
+  Read-only system paths are not workspace code, because Landlock keeps the
+  workload from writing them. Residual: the exec-time mark is read from a
+  lossy event stream shortly after the exec.
 - **Transport.** The Git, egress, and MCP relays (`relay ... --attribute`)
   send a `KEEL-ORIGIN-V1` frame ahead of their traffic. The host VZ backend
   and gitd forward it to the kernel, which accepts the frame before any
@@ -870,6 +880,10 @@ Exit criteria:
   refused, with a rule naming the tainted ancestor.
 
 ## 11. Trusted-code budget
+
+*Superseded by D65, which retired the 16,000-line ceiling and its reserve:
+each trusted crate is now held to its own ratchet in `ci/check_invariants.py`.
+The accounting below is kept as the record up to D64.*
 
 The reserve was 2,653 lines under the 16,000 ceiling at D44. Spending so far:
 

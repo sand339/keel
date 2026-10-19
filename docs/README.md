@@ -21,13 +21,10 @@ When documents disagree, current source and tests take precedence. Architecture 
   renderer dependencies and the components setup downloads.
 - [Pinned artifacts](ARTIFACTS.md) — every downloaded artifact, its source and
   pin, and how to update it.
-- [Release checklist](RELEASE.md) — what a release must pass, and the release
-  notes.
 - [End-to-end acceptance](E2E.md) — the headless suite and the manual runbook
   for operator decisions.
-- [Manual acceptance tests](MANUAL-TESTS.md) — a hands-on checklist of every
-  user flow: install, login, launch, work, approvals, recovery, and
-  adversarial checks from inside the guest.
+- [Security review results](SECURITY-REVIEW.md) — findings from the security
+  reviews and their remediation status.
 
 ## Design notes
 
@@ -43,10 +40,7 @@ Design notes explain individual mechanisms in more detail. They are useful to co
 
 ### Planned or exploratory work
 
-- [Action-centric provenance, guest confinement, and process attribution](design/guest-confinement-attribution-and-turn-provenance.md)
-- [Triage reproduction (now the scoped profile)](design/triage-reproduction.md)
-- [Run profiles](design/run-profiles.md)
-- [Render vertex concept](design/render-vertex.md) (superseded: the guest has its own browser, D59)
+- [Action-centric provenance, guest confinement, and process attribution](design/guest-confinement-attribution-and-turn-provenance.md) (W1–W3 implemented; rest proposed)
 
 The status stated inside a design note can lag the implementation. The [roadmap](ROADMAP.md) is the public list of unfinished commitments.
 
@@ -56,16 +50,10 @@ The status stated inside a design note can lag the implementation. The [roadmap]
 
 The smoke workload is intentionally portable across Keel's Node-based microVM path and Deno-based host sandbox path.
 
-## Deeper background
-
-- [Learning guide](LEARNING_GUIDE.md) — a longer conceptual walkthrough.
-
 ## Project history and maintainer material
 
-The following files preserve design history and implementation context. They are public for transparency, but they are not current user documentation and should not be read as promises:
+The following preserve design history and implementation context. They are not current user documentation and should not be read as promises:
 
-- [Project brief](PROJECT-BRIEF.md)
-- [Implementation plan](PLAN.md)
 - [Decision log](DECISIONS.md)
 
 Historical milestone language may describe an earlier repository state. Use the primary documents above for current behavior and the roadmap for future work.

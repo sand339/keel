@@ -1,6 +1,10 @@
 # Design note — Bedrock and SigV4 model providers
 
-> **Status: both tracks built, unverified against a live endpoint.**
+> **Status: both tracks built; the signed path (Track B) is verified live on macOS.**
+> The E2E suite and manual acceptance admit Claude through Bedrock with an Identity
+> Center credential process, and pass, streaming model turns included; those runs
+> sign with `SigV4`. This note does not record a live bearer-token (Track A) run. The
+> rest of this banner and the sections below are the note as written before then.
 > §5 steps 1–4 are implemented and D16 is taken (§6). Track B is implemented under
 > D17, which raised the total cap 12,000 → 12,700 with no donor — the budget decision
 > this note insisted on, decided the other way (§6.1). Identity Center arrived with it,
@@ -353,7 +357,10 @@ and the reviewable surface gained nothing.
   is refused. If the first live run 403s, this is the first thing to instrument, and the
   cheap instrument is to log the canonical request locally and diff it against
   `aws --debug`'s.
-- **§4.1's audit-redaction requirement is not met for the signed path.** The redactor is
+- **Resolved (KSR-058, `fae77d3`):** the redactor is now one shared set; the secret
+  key, the session token, and every credential a later refresh obtains join it before
+  they are used. The original concern follows.
+  **§4.1's audit-redaction requirement is not met for the signed path.** The redactor is
   built once at connector construction from a fixed list, and a refreshed session token
   is a value that did not exist then — so rotating credentials cannot be added to it
   without making the redaction set mutable, which is TCB and a lock on the audit writer's

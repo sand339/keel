@@ -32,9 +32,15 @@ A policy can select existing capabilities and define up to 64 stateful
 rules. Each rule selects one action, one effect, and predicates combined with
 logical AND.
 
-The closed capability vocabulary is ordinary branch push, pull-request
-creation, exact-host egress, force-push denial, and
-`isolation:v8-sandboxed`. The isolation capability is an explicit acceptance
+The closed capability vocabulary is ordinary branch push (`push:branch`),
+pushes limited to matching branches (`push:ref:refs/heads/PATTERN`, the only
+way to admit a default-branch push), pull-request creation (`pr:create`),
+narrowed to one base branch by `pr:target:BRANCH`, authenticated reads of
+issues in the exact repository (`github:read-private-issues`), exact-host
+egress (`egress:HOST`), force-push denial (`deny:force-push`), a declaration
+that the repository's committed content is public (`workspace:public`), and
+`isolation:v8-sandboxed`. Repository-scoped grants require an exact GitHub
+`owner/name`. The isolation capability is an explicit acceptance
 of the lower-assurance host V8 boundary; it never causes a fallback or weakens
 the VM profiles.
 
@@ -75,13 +81,20 @@ Acceptance regenerates and reverifies every derived field. It refuses blockers,
 hash changes, Cedar warnings, Rego errors, missing rule coverage, generated
 permits, or any Cedar/Rego/Rust disagreement.
 
+`keel policy compile` prints the acceptance command with the draft's hash.
+`keel policy accept DRAFT.json --hash HASH --output POLICY.json` requires that
+hash, the one in the review the operator read, and refuses a draft whose hash
+differs (KSR-046). Acceptance records the hash in a ledger under the state root
+(`accepted-policies`), and a run refuses an artifact the ledger does not name
+(D43), because an artifact's own accepted status is self-asserted.
+
 This catches compiler and engine disagreement over the closed IR. It does not
 prove that natural-language intent was interpreted correctly; the exact
 translation remains an operator review step.
 
 ## Runtime loading
 
-`keel mux --policy ACCEPTED.json` verifies the artifact and current HTTPS GitHub
+`keel mux --policy ACCEPTED.json` (or `keel run --policy`) verifies the artifact and current HTTPS GitHub
 origin, materializes the exact bundle in the private session directory, and
 places its digest independently in the run request. Trusted `keel-input` loads
 the bundle through `keel-policy`, which recomputes the digest and performs strict

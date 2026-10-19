@@ -58,7 +58,9 @@ Keel assumes:
 
 - the local operator is not malicious and can review accurately rendered approvals;
 - the host OS, kernel, process isolation, filesystem permissions, and randomness work as intended;
-- Apple Virtualization.framework provides the expected VM boundary;
+- Apple Virtualization.framework on macOS, or KVM with Cloud Hypervisor on
+  Linux, provides the expected VM boundary, and Seatbelt or bubblewrap confines
+  Keel's host-side children;
 - the trusted Keel crates and their pinned dependencies behave correctly;
 - configured runtime artifacts are the artifacts the operator intended to admit;
 - the secure-attention key reaches the trusted input path;
@@ -101,7 +103,7 @@ The evidence column names the tests and invariants that exercise each control. I
 | --- | --- | --- | --- |
 | Prompt injection proposes data exfiltration | Provenance floors, destination policy, explicit grants, budgets, approval | Lawful output to an allowed destination may still reveal information | [`primary_scenario.rs`](../crates/trusted/keel-policy/tests/primary_scenario.rs), [`provenance_gate.rs`](../crates/trusted/keel-kernel/tests/provenance_gate.rs), [`push_provenance.rs`](../crates/trusted/keel-kernel/tests/push_provenance.rs) |
 | Workload reads a model or cloud credential | Host-owned secret store, sentinel credential, trusted substitution or SigV4 logic | A compromised host or trusted credential path can access host-held material | [`credential_scope.rs`](../crates/trusted/keel-secrets/tests/support/credential_scope.rs); `runtime_artifacts_exclude_real_and_sentinel_credentials` and `sentinel_swap_binds_to_connection_method_and_path` in the [secrets unit suite](../crates/trusted/keel-secrets/tests/support/unit.rs); I7 in [`check_invariants.py`](../ci/check_invariants.py) |
-| Guest opens an arbitrary socket | No normal guest NIC or DNS; brokered host relay | Hypervisor or host-kernel compromise is out of scope | `hostile_curl_requests_cross_the_runtime_and_fail_closed` in [`keel-vz-spike.rs`](../crates/untrusted/keel-isolate/src/bin/keel-vz-spike.rs); `structural_network_ranges_are_denied_before_policy` in the [secrets unit suite](../crates/trusted/keel-secrets/tests/support/unit.rs) |
+| Guest opens an arbitrary socket | No normal guest NIC or DNS; brokered host relay | Hypervisor or host-kernel compromise is out of scope | `hostile_curl_requests_cross_the_runtime_and_fail_closed` in [`relay.rs`](../crates/untrusted/keel-isolate/src/relay.rs); `structural_network_ranges_are_denied_before_policy` in the [secrets unit suite](../crates/trusted/keel-secrets/tests/support/unit.rs) |
 | Guest uses an approved CONNECT as a DNS or port oracle | CONNECT/front TLS remain local; exact decrypted request authorization precedes external resolution and connection | Trusted HTTP/TLS parsing remains in the TCB | `denied_tls_request_does_not_resolve_or_connect` and `system_connector_defers_dns_but_rejects_forbidden_results_before_connect` in [`transport_ordering.rs`](../crates/trusted/keel-secrets/tests/support/transport_ordering.rs) |
 | Workload lies about its requested action | Asserted/stamped split, reconstruction, structural validation | Trusted parsers and reconstruction must be correct | I5 and I11 in [`check_invariants.py`](../ci/check_invariants.py); `forged_principal_never_reaches_credentials_or_execution` and `harmless_class_cannot_disguise_a_network_target` in the [kernel unit suite](../crates/trusted/keel-kernel/tests/support/unit.rs); `malformed_broker_request_fails_before_kernel_processing` in [`runtime_broker.rs`](../crates/trusted/keel-input/tests/runtime_broker.rs) |
 | Policy translator emits a permissive rule | Closed IR, multiple generated representations, differential checks, explicit acceptance, hash binding | Agreement does not prove the original sentence was unambiguous | `draft_is_differentially_verified_and_hash_bound`, `every_condition_variant_passes_differential_verification`, and `tampering_invalidates_artifact` in [`keel-compile`](../crates/untrusted/keel-compile/src/policy.rs); `dangerous_or_broad_language_blocks_acceptance` in [`keel-compile`](../crates/untrusted/keel-compile/src/lib.rs); I6 and I10 in [`check_invariants.py`](../ci/check_invariants.py) |
@@ -152,7 +154,7 @@ Examples of structural denials include malformed targets, unsupported schemes or
 
 ### MicroVM profiles
 
-The Claude and V8 microVM profiles rely on Virtualization.framework to separate the workload from the host. The guest does not receive a normal network interface. Brokered channels expose selected operations, so their parsers and authorization bindings remain security-critical.
+The Claude and V8 microVM profiles rely on Virtualization.framework (macOS) or KVM through Cloud Hypervisor run inside bubblewrap (Linux) to separate the workload from the host. The guest does not receive a normal network interface. Brokered channels expose selected operations, so their parsers and authorization bindings remain security-critical.
 
 Inside the guest, the workload runs as UID 0 with no capabilities, under
 Landlock, seccomp, and a bounded cgroup, while guest relays run under a
@@ -187,14 +189,19 @@ The boundary does not defend against:
 
 ### Host V8 sandbox
 
-The host V8 profile relies on a pinned Deno process and OS process isolation. Keel removes most environment state, restricts workspace access, uses cached-only module behavior, denies general network permission, and exposes a loopback broker.
+The host V8 profile relies on a pinned Deno process and OS process isolation. It is available on macOS only; Linux refuses it. Keel removes most environment state, restricts workspace access, uses cached-only module behavior, denies general network permission, and exposes a loopback broker.
 
 This profile is useful for fast evaluation but is explicitly lower assurance:
 
 - the JavaScript engine and Deno permission implementation are part of the practical boundary;
 - a sandbox escape occurs on the host side of the VM boundary;
 - host-local side channels and kernel attack surface are broader;
-- accidental permission expansion can weaken the profile.
+- accidental permission expansion can weaken the profile;
+- the Seatbelt profiles deny mach-lookup of host services a confined child
+  could use to act outside its sandbox (pasteboard, LaunchServices and lsd,
+  Apple Events, the window server and dock, mDNSResponder and dnssd,
+  nsurlsessiond, sharingd, and FileProvider), but this is a denylist, so a
+  service not on it remains reachable.
 
 For those reasons, selecting it requires the explicit isolation:v8-sandboxed
 grant and a foreground-terminal `HOST V8` confirmation. A request file,
@@ -214,7 +221,9 @@ Keel must reject:
 - a sentinel sent to an unapproved destination;
 - credential use with an unbound or mismatched host and path;
 - unsupported redirection or protocol changes;
-- attempts to smuggle authority through ambiguous parsing;
+- attempts to smuggle authority through ambiguous parsing, such as an
+  absolute-form request target inside terminated TLS (only origin-form
+  targets are read);
 - traffic beyond the active policy, provenance, or budget context.
 
 Model budget values arrive in an untrusted run request. Values at or below the
@@ -298,7 +307,7 @@ Keel does not solve information-flow control for every byte or infer the meaning
 
 ### What the guest reads without the broker
 
-A declared workspace rank (`workspace:own`, PLAN D80) means something only if
+A declared workspace rank (`workspace:own`, D80) means something only if
 everything the guest can read without passing the broker is known. In a
 microVM run that set is:
 
@@ -308,11 +317,11 @@ microVM run that set is:
 | `keel-control` share, read-only | The run CA certificate, the launch script generated from the request (model, CA paths, the operator's harness arguments), and the V8 Deno cache | Operator configuration |
 | Root disk, kernel, initramfs | Pinned images, digested in the admission manifest | Keel's own |
 | Model responses | Through trusted termination | Derived from the context |
-| Pinned registry tarballs | Through trusted termination, held back until the body's SHA-512 matches the accepted `package-lock.json` (PLAN D85) | 2; any other body is 0 |
+| Pinned registry tarballs | Through trusted termination, held back until the body's SHA-512 matches the accepted `package-lock.json` (D85) | 2; any other body is 0 |
 | Every other mediated result | Through the broker, ranked as it is delivered | As delivered; it lowers the floor |
 | Operator keystrokes | Through trusted input | 3 |
 
-Under extraction (PLAN D83) the sandboxed `keel-extract` helper reads
+Under extraction (D83) the sandboxed `keel-extract` helper reads
 untrusted sources on its own channel; the guest receives only the
 schema-validated result the kernel returns, which carries no free text.
 
@@ -350,10 +359,15 @@ whoever holds the terminal the operator sees can paint over it. The
 persistent supervisor marks both ends of its pty close-on-exec, so they reach
 the run only as its stdio and never reach the backend or renderer, and the
 trusted runtime refuses to start while holding any inherited terminal-class
-descriptor (PLAN D77). Until D77 a persistent session's untrusted backend
+descriptor (D77). Until D77 a persistent session's untrusted backend
 inherited both ends and could write to them from inside its sandbox. The
 `backend-descriptors` fault case checks the backend's descriptor table in
 persistent and foreground runs.
+
+Confined host children hold no terminal either: their standard streams are
+pipes, Seatbelt denies `/dev/tty*` and `/dev/console`, and bubblewrap runs
+them with `--new-session`, so `TIOCSTI` cannot inject approval keystrokes into
+the trusted input queue.
 
 The trusted UI establishes authenticity and action binding. It does not establish that the action is wise. Review fatigue, misunderstanding, coercion, and careless approval remain human risks.
 
@@ -409,7 +423,7 @@ context, not evidence of what the workload did.
 
 The most important risks that remain even when Keel works as designed are:
 
-- **Lawful-output exfiltration.** Sensitive content can be encoded in an output the active policy permits. A request or push carrying verbatim fragments of the committed repository to a destination not cleared for them escalates, and admitted secrets are denied (PLAN D81), but paraphrased, compressed, or re-encoded content is not detected: the checks stop plain injection, not a model deliberately evading them.
+- **Lawful-output exfiltration.** Sensitive content can be encoded in an output the active policy permits. A request or push carrying verbatim fragments of the committed repository to a destination not cleared for them escalates, and admitted secrets are denied (D81), but paraphrased, compressed, or re-encoded content is not detected: the checks stop plain injection, not a model deliberately evading them.
 - **Semantic task failure.** Keel cannot decide whether a code change, command, or message actually serves the user's goal.
 - **Incorrect provenance classification.** A trusted label can be too generous, or an influence can be missed.
 - **Invisible agent structure.** Subagents inside a harness may not correspond to separately visible or separately authorized principals.
@@ -427,24 +441,25 @@ Keel does not currently claim:
 
 - protection from a malicious local operator;
 - protection from physical attacks;
-- protection from a compromised macOS host or hardware;
+- protection from a compromised host OS or hardware;
 - formal noninterference or complete data-loss prevention;
 - correctness of model output or generated code;
 - safe execution of arbitrary kernel modules or privileged guest devices;
 - production multi-tenant isolation;
-- Linux-host parity;
+- parity for host V8 on Linux (refused), ARM64 Linux beyond nested-VM testing,
+  or Linux distributions other than Ubuntu;
 - remote attestation;
 - automatic recovery of every interrupted session;
 - guaranteed service availability.
 
 ## 16. Validation
 
-Security claims should be tested at three levels:
+Security claims should be tested at four levels:
 
 1. **Repository invariants** check crate boundaries, trusted-code size, dependencies, and forbidden patterns.
 2. **Unit and integration tests** exercise action validation, policy, provenance, approvals, relays, budgets, and audit verification.
 3. **Adversarial scenarios** attempt prompt injection, credential theft, destination confusion, replay, malformed requests, terminal forgery, provenance laundering, policy disagreement, and audit tampering.
-4. **Lifecycle fault injection** (`python3 ci/faults.py`) runs the trusted runtime in front of a deliberately misbehaving backend: one that ignores `SIGTERM`, one that outlives a killed runtime, one whose leader exits and leaves a member, a killed supervisor, and a probe of the descriptors the backend inherits.
+4. **Lifecycle fault injection** (`python3 ci/faults.py`) runs the trusted runtime in front of a deliberately misbehaving backend: one that ignores `SIGTERM`, one that outlives a killed runtime, one whose leader exits and leaves a member, a killed supervisor, an early error before the workload starts, and a probe of the descriptors the backend inherits.
 
 Run the local suite:
 
@@ -452,7 +467,7 @@ Run the local suite:
 cargo fmt --all -- --check
 cargo check --workspace
 cargo test --workspace
-./ci/check.sh
+./ci/phase0.sh
 ~~~
 
 A passing suite is evidence for a particular source revision and environment. It is not a general proof of security.
@@ -468,7 +483,7 @@ The following are not current guarantees:
 - authenticity of a release beyond its Sigstore signature: a release is
   signed keyless to the maintainer's GitHub identity and logged publicly, so
   it rests on that account and on Sigstore; a release without a bundle is
-  unsigned;
+  unsigned, and no release has been signed yet;
 - external audit witnessing or hardware-backed attestation;
 - per-turn provenance reconstructed from the exact content in each model
   request; current direct-workspace exposure fails closed at rank zero.
