@@ -94,7 +94,7 @@ fn run_vm(request: &RunRequest) -> Result<(), Box<dyn std::error::Error>> {
     if request.ephemeral_workspace {
         backend.arg("--ephemeral-workspace");
     }
-    let status = backend.status();
+    let status = run_while_parent_lives(&mut backend);
     let cleanup = fs::remove_dir_all(&control);
     let status = status.map_err(|error| format!("start VM backend: {error}"))?;
     cleanup.map_err(|error| format!("remove VM control directory: {error}"))?;
@@ -102,6 +102,33 @@ fn run_vm(request: &RunRequest) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("VM backend exited with {status}").into());
     }
     Ok(())
+}
+
+/// How often the runtime checks that the trusted runtime that started it is
+/// still there.
+const PARENT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Runs `command` to completion, unless the trusted runtime that started this
+/// process exits first: then the child is killed, so a VM or host V8 process
+/// never runs on with the workspace mounted and no one supervising it. On
+/// Linux bubblewrap's `--die-with-parent` already ends the sandbox; macOS has
+/// no equivalent, so this process watches for being reparented instead.
+fn run_while_parent_lives(command: &mut Command) -> std::io::Result<std::process::ExitStatus> {
+    let parent = std::os::unix::process::parent_id();
+    let mut child = command.spawn()?;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if std::os::unix::process::parent_id() != parent {
+            let _ = child.kill();
+            child.wait()?;
+            return Err(std::io::Error::other(
+                "the trusted runtime exited; the backend was stopped with it",
+            ));
+        }
+        std::thread::sleep(PARENT_POLL);
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -207,7 +234,7 @@ fn run_host_v8(request: &RunRequest) -> Result<(), Box<dyn std::error::Error>> {
         request.session_id,
         workspace.display()
     );
-    let status = command.status();
+    let status = run_while_parent_lives(&mut command);
     let proxy_result = proxy.shutdown();
     let cleanup = fs::remove_dir_all(&control);
     let status = status.map_err(|error| format!("start pinned Deno runtime: {error}"))?;

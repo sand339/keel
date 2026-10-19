@@ -179,7 +179,7 @@ Use a disposable private repository with an HTTPS origin and the `KEEL_GIT_*` va
 
 | # | Steps | Expected |
 |---|---|---|
-| R1 | During a run, `kill -9` the `keel-input-runtime` process | `keel status` says `stale`; *macOS:* the VM may still run; *Linux:* it is gone |
+| R1 | During a run, `kill -9` the `keel-input-runtime` process | `keel status` says `stale`; within a few seconds no backend process is left (`keel-vz-spike` on macOS, `cloud-hypervisor` on Linux) |
 | R2 | `keel recover SESSION` | Status `recovered`; no `keel-runtime-*` or `keel-images-*` directory left in the temp directory |
 | R3 | Crash a run, wait 15 minutes, start any run | One line saying a crashed session was recovered |
 | R4 | `keel doctor` with a crashed session | Warns and names `keel recover` |

@@ -75,6 +75,24 @@ Exit criteria:
   a stated window;
 - a fresh setup from any release tag still succeeds after Alpine moves on.
 
+## Guided setup (`keel init`)
+
+First use stalls on credentials, not on installing: model keys are environment
+variables in every shell, and authenticated push needs three hand-built
+variables per repository. `keel init` records where each credential comes from
+(Keychain, a credential process, `gh`) without storing any secret, derives the
+push scope from the workspace's `origin` at admission, and ends with a short
+first session on the real trusted screen. See the
+[design note](design/keel-init.md).
+
+Exit criteria:
+
+- a clean macOS account and a clean Ubuntu user go from a release download to a
+  gated push in about ten minutes with no environment variables;
+- the admission screen names every credential source and derived scope a run
+  uses;
+- a sources file inside the workspace, or writable by others, is refused.
+
 ## More harnesses
 
 Only Claude Code runs in the guest. The boundary is meant to be agent-agnostic;

@@ -254,7 +254,9 @@ and a compromised host, hypervisor, or trusted dependency. See the
 - **Chromium updates with the package lock,** and runs without its own sandbox inside the VM.
 - **No live browser view:** use the `agent-browser` CLI and its screenshots.
 - **Platforms:** Apple silicon macOS and Ubuntu 24.04+ (x86_64; ARM64 tested only nested); host V8 is macOS-only.
-- **Crash cleanup:** on macOS a killed runtime's VM runs until `keel recover` or the opt-in hourly reaper (Linux ends it at once); recovery records are unsigned.
+- **Crash cleanup:** a killed runtime's VM stops with it on both platforms, but its scratch directories wait for `keel recover` or the opt-in hourly reaper, and recovery records are unsigned.
+- **Process attribution is the guest's claim:** which guest process issued a push comes from the guest's PID 1, read just after each exec; it can only add a gate, never remove one.
+- **Unsigned releases:** a release without a `.sigstore.json` bundle is unsigned; none is signed yet.
 
 ## Documentation
 
