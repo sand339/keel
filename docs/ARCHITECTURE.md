@@ -82,7 +82,7 @@ An untrusted component can still contain important correctness logic. “Untrust
 
 Keel keeps the hand-written first-party trusted Rust surface small. CI holds each
 trusted crate to a line ratchet: growing a crate past its number fails until the
-number is raised, with the reason in the commit. The trusted total, about 19,700
+number is raised, with the reason in the commit. The trusted total, about 20,200
 lines, is reported rather than capped. The `tokei` count includes inline tests and
 trusted binaries as well as production library code.
 
@@ -281,6 +281,22 @@ Current model authentication paths are:
 - OpenRouter API key held by the host relay, charged at an operator-admitted price snapshot.
 
 Host Claude Code SSO import is not currently implemented.
+
+Each credential comes from the trusted process environment or, when the
+environment names none, from a credential source the operator stored in
+`~/.keel/sources.json`: a command, such as a keyring lookup or `gh auth token`
+(D91).
+The file holds no secret. Because the trusted runtime runs the commands it
+names, `keel-input` refuses it unless the operator owns it and its directory,
+neither is a link or writable by group or others, and it lies outside the
+workspace. `keel-secrets` resolves only the selected provider's source, by a
+command on a fixed search path with no terminal on its standard streams, and
+the sources a run reads are named at admission and in the manifest.
+
+With a stored GitHub source, the Git credential scope is not spelled by the
+operator: admission reads the workspace's `origin` with trusted Git, accepts
+only `https://github.com/OWNER/REPO`, shows the scope, and binds the GitHub
+token to that repository's push endpoints for the run (D92).
 
 Before a run with extra authority starts, the trusted terminal renders its task
 manifest: declared push, PR, private-issue-read capabilities plus explicit or
@@ -680,6 +696,7 @@ Implemented today, with the tests that exercise each item. The headless end-to-e
 | Request, rate, cost, and loop constraints | [`model_budget.rs`](../crates/trusted/keel-kernel/tests/model_budget.rs), [`model_lifecycle.rs`](../crates/trusted/keel-secrets/tests/support/model_lifecycle.rs) |
 | Credential-aware Anthropic, Bedrock, and OpenRouter relays | [`credential_scope.rs`](../crates/trusted/keel-secrets/tests/support/credential_scope.rs), [`openrouter.rs`](../crates/trusted/keel-secrets/tests/openrouter.rs), [`model_auth.rs`](../crates/trusted/keel-secrets/tests/model_auth.rs) |
 | Operator-declared run scope (`--profile scoped`), including `--scope none` | [`scope.rs`](../crates/trusted/keel-provenance/tests/scope.rs), [`scoped_run.rs`](../crates/trusted/keel-input/tests/scoped_run.rs), [`scoped_provider.rs`](../crates/trusted/keel-input/tests/scoped_provider.rs) |
+| Stored credential sources and the sources-file refusals | [`sources.rs`](../crates/trusted/keel-secrets/tests/support/sources.rs), [`credential_sources.rs`](../crates/trusted/keel-input/tests/support/credential_sources.rs), and the `credential-sources` E2E case |
 | Canonical admission manifest recorded before the workload starts | [`admission_manifest.rs`](../crates/trusted/keel-input/tests/admission_manifest.rs) |
 | Authenticated hash-chained audit records with a terminal seal | [`verification_status.rs`](../crates/trusted/keel-audit/tests/verification_status.rs) and the [`keel-audit`](../crates/trusted/keel-audit/src/lib.rs) unit tests |
 | Checked teardown, signed stop receipt, and crash recovery from in-chain resource records | [`teardown.rs`](../crates/trusted/keel-input/tests/support/teardown.rs), [`run_teardown.rs`](../crates/trusted/keel-audit/tests/run_teardown.rs), [`serve_receipt.rs`](../crates/trusted/keel-input/tests/support/serve_receipt.rs), [`crash_recovery.rs`](../crates/trusted/keel-input/tests/support/crash_recovery.rs) |

@@ -19,6 +19,7 @@ Turn the test suite into a publishable evaluation of Keel's claims:
 - published source revision, platform, artifact hashes, commands, and raw
   results.
 
+
 Exit criteria:
 
 - each threat-model objective has at least one positive and one negative test;
@@ -43,11 +44,11 @@ Exit criteria:
 
 ## Linux and VM tests in CI
 
-Linux end-to-end runs are manual today, and CI boots no VM on either platform.
-Run them on every push:
+CI now boots a Linux guest under KVM on every push: `keel setup` from the
+checkout, `keel doctor`, the end-to-end cases that call no model, and the
+fault suite. Linux runs that call a model are still manual, and CI boots no
+VM on macOS. Remaining:
 
-- Linux runners with KVM: `keel setup`, `keel doctor`, a `vm-v8` run, and the
-  fault suite;
 - release tarballs built in CI, installed by a user with no toolchain, and
   smoke-tested;
 - live model cases on a schedule, behind a credential the repository holds.
@@ -61,7 +62,8 @@ Exit criteria:
 
 The guest's Chromium, Node, toolchains, and kernel are pinned, so they are
 patched only when the lock is refreshed by hand, and Alpine removes superseded
-versions from its CDN.
+versions from its CDN. In November 2026 a clean setup had been failing for
+weeks before the first CI run that performed one found it.
 
 - a scheduled lock refresh for both architectures, rebuilt and run through
   the E2E suite;
@@ -83,6 +85,12 @@ variables per repository. `keel init` records where each credential comes from
 (Keychain, a credential process, `gh`) without storing any secret, derives the
 push scope from the workspace's `origin` at admission, and ends with a short
 first session on the real trusted screen.
+
+Built: the credential sources file and its checks, the push scope derived
+from `origin`, `keel init`, and the first session (see
+[Using Keel](USAGE.md#guided-setup)). Remaining: doctor checks as structured
+results with fixes `init` can apply, verifying a provider with one model
+request, GitHub Enterprise hosts, and the timed clean-account runs below.
 
 Exit criteria:
 

@@ -17,7 +17,9 @@ use keel_provenance::{
     SchemaRegistry, Scope, SessionFacts, SourceRef, TaskAdmission, committed_paths,
     trusted_git_command,
 };
-use keel_secrets::{GitCredentialScope, GitHubAuthorities, SystemEgressConnector};
+use keel_secrets::{
+    CredentialSources, GitCredentialScope, GitHubAuthorities, SystemEgressConnector,
+};
 use ring::digest::{Context as DigestContext, SHA256};
 use serde::Deserialize;
 use std::{
@@ -158,6 +160,8 @@ pub struct RuntimeIntent {
     own_workspace: Option<own_workspace::OwnWorkspace>,
     /// Admitted extraction schemas and their bundle hash (PLAN D83).
     extraction: Option<(SchemaRegistry, String)>,
+    /// Where stored credentials come from; never the credentials.
+    sources: CredentialSources,
 }
 
 impl RuntimeIntent {
@@ -273,6 +277,7 @@ impl RuntimeIntent {
             None
         };
         Ok(Self {
+            sources: credential_sources()?,
             own_workspace,
             extraction,
             session_id: request.session_id,
@@ -361,6 +366,24 @@ impl RuntimeIntent {
                 "record-targets: request hosts and paths are written to the audit log".to_owned(),
             );
         }
+        items.extend(
+            self.credential_sources()
+                .iter()
+                .map(|source| safe_text(source.as_bytes())),
+        );
+        // A scope read from the repository is shown before any token is
+        // used, so an origin pointing somewhere unexpected is visible.
+        items.extend(match self.derived_git_scope() {
+            Some(Ok((host, path))) => Some(format!(
+                "Git credential scope, from origin: {}",
+                safe_text(format!("{host}{path}").as_bytes())
+            )),
+            Some(Err(reason)) => Some(format!(
+                "Git credential: none; {}",
+                safe_text(reason.as_bytes())
+            )),
+            None => None,
+        });
         if let Some(own) = &self.own_workspace {
             items.push(own.summary());
             items.extend(own.pins_summary());
@@ -374,6 +397,51 @@ impl RuntimeIntent {
             items.push(format!("policy bundle: {}", safe_text(hash.as_bytes())));
         }
         items.join("\r\n  ")
+    }
+
+    /// Whether this run declares a push, and whether it declares any
+    /// authority that is scoped to the workspace's repository.
+    fn repository_authority(&self) -> (bool, bool) {
+        let push = self
+            .capabilities
+            .iter()
+            .any(|capability| capability == "push:branch" || capability.starts_with("push:ref:"));
+        (
+            push,
+            push || self.capabilities.contains("github:read-private-issues"),
+        )
+    }
+
+    /// The Git credential scope read from the workspace's origin, for a run
+    /// with repository authority, a stored GitHub source, and an origin.
+    /// `Err` says why the origin cannot be a scope; the run then holds no
+    /// derived credential.
+    fn derived_git_scope(&self) -> Option<Result<(String, String), String>> {
+        if !self.repository_authority().1 || !self.sources.has_github() {
+            return None;
+        }
+        let origin = trusted_git_command()
+            .args(["config", "--get", "remote.origin.url"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())?;
+        Some(derived_push_scope(&String::from_utf8_lossy(&origin.stdout)))
+    }
+
+    /// Names of the stored credential sources this run reads.
+    fn credential_sources(&self) -> Vec<String> {
+        let provider = keel_secrets::runtime_model_provider()
+            .ok()
+            .filter(|_| !self.model_host.is_empty());
+        let provider = provider.as_ref().map(|provider| match provider.name() {
+            "anthropic" => "api-key",
+            name => name,
+        });
+        let github = ["pr:create", "github:read-private-issues"]
+            .iter()
+            .any(|capability| self.capabilities.contains(*capability))
+            || (self.repository_authority().0 && matches!(self.derived_git_scope(), Some(Ok(_))));
+        self.sources.describe(provider, github)
     }
 
     /// Marks this exact parsed task manifest as admitted by trusted input.
@@ -435,6 +503,9 @@ impl RuntimeIntent {
             Some(_) => return Err("workspace:own requires trusted task admission".to_owned()),
             None => None,
         };
+        // Read before the directory changes: an own workspace's clone keeps
+        // the source repository's origin.
+        let derived_git = self.derived_git_scope().and_then(Result::ok);
         let git_control_digest = git_control_digest(&workspace)?;
         let (push_refs, pr_targets) = (
             scoped(&self.capabilities, "push:ref:"),
@@ -449,6 +520,8 @@ impl RuntimeIntent {
                 allow_git_push,
                 GitHubAuthorities::new(allow_pr_create, allow_private_issue_reads),
                 !self.model_host.is_empty(),
+                &self.sources,
+                derived_git,
             )?;
         let connector = Box::new(connector.with_connection_reuse(self.reuse_connections));
         // Mediating a Git operation means the trusted relay itself connects to the
@@ -614,6 +687,7 @@ impl RuntimeIntent {
                 "capabilities": self.capabilities,
                 "egress_hosts": egress_hosts,
                 "credential_scopes": credential_scopes,
+                "credential_sources": self.credential_sources(),
             },
             "model": {
                 "provider": name,
@@ -1037,6 +1111,56 @@ fn load_extraction_schemas(
     Ok((registry, hash.to_ascii_lowercase()))
 }
 
+/// Reads the operator's sources file, `KEEL_SOURCES` or `~/.keel/sources.json`.
+///
+/// The runtime runs the commands this file names, so it is refused unless it
+/// is a regular file the operator owns, in a directory the operator owns,
+/// neither writable by anyone else, and outside the workspace: a repository
+/// cannot supply or shadow one.
+fn credential_sources() -> Result<CredentialSources, String> {
+    let path = std::env::var_os("KEEL_SOURCES")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".keel/sources.json"))
+        });
+    match (path, std::env::current_dir()) {
+        (Some(path), Ok(workspace)) => credential_sources_at(&path, &workspace),
+        (None, _) => Ok(CredentialSources::default()),
+        (_, Err(error)) => Err(error.to_string()),
+    }
+}
+
+fn credential_sources_at(path: &Path, workspace: &Path) -> Result<CredentialSources, String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(file) = fs::symlink_metadata(path) else {
+        return Ok(CredentialSources::default());
+    };
+    let refuse = |why: &str| format!("credential sources {} refused: {why}", path.display());
+    let directory = path
+        .parent()
+        .and_then(|directory| fs::symlink_metadata(directory).ok())
+        .ok_or_else(|| refuse("its directory is unreadable"))?;
+    let user = nix::unistd::geteuid().as_raw();
+    let private = |entry: &fs::Metadata| entry.uid() == user && entry.mode() & 0o022 == 0;
+    if !file.is_file() || !directory.is_dir() || !private(&file) || !private(&directory) {
+        return Err(refuse(
+            "it and its directory must be owned by you, not links, and not writable by group or others",
+        ));
+    }
+    let inside = match (path.canonicalize(), workspace.canonicalize()) {
+        (Ok(resolved), Ok(workspace)) => resolved.starts_with(workspace),
+        _ => true,
+    };
+    if inside {
+        return Err(refuse("it lies inside the workspace"));
+    }
+    let bytes = fs::read(path).map_err(|error| refuse(&error.to_string()))?;
+    if bytes.len() > MAX_REQUEST_FILE {
+        return Err(refuse("it exceeds 1 MiB"));
+    }
+    CredentialSources::parse(&bytes).map_err(|error| refuse(&error))
+}
+
 /// The smallest model of the run's provider family, charged to its budget.
 /// `OpenRouter`'s price snapshot prices only the admitted model, so it is used.
 fn extraction_model() -> Result<String, String> {
@@ -1048,6 +1172,38 @@ fn extraction_model() -> Result<String, String> {
             .ok_or("OpenRouter extraction needs an admitted price snapshot")?,
         _ => "claude-haiku-4-5".to_owned(),
     })
+}
+
+/// The credential scope of an origin spelled `https://github.com/OWNER/REPO`,
+/// with or without `.git`: the host, and the path exactly as written, since
+/// that is the path the Git relay sends and the credential is matched on.
+/// SSH remotes, other hosts, embedded credentials, ports, queries, and
+/// fragments are not scopes.
+fn derived_push_scope(origin_url: &str) -> Result<(String, String), String> {
+    let origin = origin_url.trim();
+    let name = |field: &str| {
+        !matches!(field, "" | "." | "..")
+            && field
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    };
+    origin
+        .strip_prefix("https://github.com/")
+        .map(|path| path.trim_end_matches('/'))
+        .filter(|path| {
+            let mut fields = path.split('/');
+            matches!(
+                (fields.next(), fields.next(), fields.next()),
+                (Some(owner), Some(repository), None) if name(owner) && name(repository)
+            )
+        })
+        .map(|path| ("github.com".to_owned(), format!("/{path}")))
+        .ok_or_else(|| {
+            format!(
+                "origin `{origin}` is not https://github.com/OWNER/REPO; to push, set \
+                 KEEL_GIT_AUTHORIZATION, KEEL_GIT_CREDENTIAL_HOST, and KEEL_GIT_CREDENTIAL_PATH"
+            )
+        })
 }
 
 /// `owner/name` of an HTTPS GitHub origin.
@@ -1679,3 +1835,7 @@ pub fn safe_text(input: &[u8]) -> String {
     }
     output
 }
+
+#[cfg(test)]
+#[path = "../tests/support/credential_sources.rs"]
+mod credential_sources_tests;

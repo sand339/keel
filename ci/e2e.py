@@ -778,6 +778,248 @@ def case_extract_url(suite: Suite) -> Result:
     return result
 
 
+# Every variable that would supply or select a credential ahead of a stored
+# source; the sources case runs without them.
+CREDENTIAL_VARIABLES = (
+    "ANTHROPIC_API_KEY",
+    "OPENROUTER_API_KEY",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "KEEL_AWS_CREDENTIAL_PROCESS",
+    "KEEL_MODEL_PROVIDER",
+    "KEEL_MODEL_AUTH",
+)
+
+
+def case_credential_sources(suite: Suite) -> Result:
+    """A run with no credential in its environment takes the model credential
+    from a stored source, names it in the manifest, and is refused when the
+    sources file could have been written by someone else or by the workspace."""
+    result = Result("credential-sources")
+    workspace = suite.workspace("credential-sources", {"hello.mjs": V8_SCRIPT})
+    directory = suite.root / "sources"
+    shutil.rmtree(directory, ignore_errors=True)
+    directory.mkdir(mode=0o700)
+    sources = directory / "sources.json"
+    # The command must not spell out what it prints: the audit redactor would
+    # then blank the credential inside the manifest's own source line.
+    command = "printf '%s-%s' e2e placeholder"
+    saved = suite.environment
+    suite.environment = {
+        name: value for name, value in saved.items() if name not in CREDENTIAL_VARIABLES
+    } | {"KEEL_SOURCES": str(sources)}
+    # The file is written by `keel init`, as an operator's would be.
+    recorded = subprocess.run(
+        [str(suite.keel), "init", "--set", f"api-key={command}"],
+        env=suite.environment, capture_output=True, text=True,
+    )
+    result.check(
+        "keel init records the source in a private file",
+        recorded.returncode == 0 and sources.exists() and sources.stat().st_mode & 0o777 == 0o600,
+        recorded.stdout + recorded.stderr,
+    )
+    content = sources.read_text() if sources.exists() else ""
+    # The model is named so the case does not depend on the host's default,
+    # which may be one the first-party provider has no tariff for.
+    arguments = ["run", "--isolation", "vm-v8", "--model", "claude-haiku-4-5", "v8", "hello.mjs"]
+    try:
+        suite.run_case(result, arguments, workspace, ["E2E-V8-OK"])
+        for session in result.sessions:
+            authority = (suite.manifest(session) or {}).get("authority", {})
+            result.check(
+                "manifest names the stored source",
+                authority.get("credential_sources") == [f"model credential: command `{command}`"],
+                str(authority.get("credential_sources")),
+            )
+            result.check(
+                "the stored credential is bound to the model host",
+                any("api.anthropic.com" in scope for scope in authority.get("credential_scopes", [])),
+                str(authority.get("credential_scopes")),
+            )
+        doctor = subprocess.run(
+            [str(suite.keel), "doctor"], env=suite.environment, capture_output=True, text=True
+        )
+        result.check(
+            "doctor lists the stored source by kind",
+            "model credential source for `--auth api-key`: process" in doctor.stdout,
+        )
+        inside = workspace / "sources.json"
+        inside.write_text(content)
+        inside.chmod(0o600)
+        # Under umask 002 the workspace is group-writable, which is refused
+        # for its own reason; this sub-case is about the file's location.
+        workspace.chmod(0o755)
+        before = suite.session_names()
+        refusals = [
+            ("group-writable file", lambda: sources.chmod(0o620), {}, "not writable by group or others"),
+            ("file inside the workspace", lambda: sources.chmod(0o600), {"KEEL_SOURCES": str(inside)}, "inside the workspace"),
+        ]
+        for label, prepare, extra, message in refusals:
+            prepare()
+            started = time.monotonic()
+            code, text = suite.run(f"credential-sources-{label.replace(' ', '-')}", arguments, workspace, 120, extra)
+            result.seconds += time.monotonic() - started
+            result.check(f"{label}: refused", code not in (0, None), f"exit {code}")
+            result.check(f"{label}: names the reason", message in text, message)
+            result.check(f"{label}: nothing ran", "E2E-V8-OK" not in text)
+        admitted = [
+            session
+            for session in suite.sessions_since(before)
+            if any(record["event"] == "kernel.run-admitted" for record in suite.records(session))
+        ]
+        result.check("no refused run reached admission", not admitted, ", ".join(admitted))
+        sources.chmod(0o600)
+        recorded = subprocess.run(
+            [str(suite.keel), "init", "--github", "printf '%s-%s' e2e token"],
+            env=suite.environment, capture_output=True, text=True,
+        )
+        kept = json.loads(sources.read_text())
+        result.check(
+            "a second keel init adds the GitHub source and keeps the first",
+            recorded.returncode == 0
+            and kept.get("providers", {}).get("api-key", {}).get("source", {}).get("command") == command
+            and "github" in kept,
+            recorded.stdout + recorded.stderr,
+        )
+        suite.environment = {
+            name: value for name, value in suite.environment.items() if name not in GIT_VARIABLES
+        }
+        derived_scope(suite, result, workspace, "https://github.com/keel-e2e/Example.git", [
+            "Git credential scope, from origin: github.com/keel-e2e/Example.git",
+        ], ["GET,POST github.com/keel-e2e/Example.git"])
+        derived_scope(suite, result, workspace, "git@github.com:keel-e2e/example.git", [
+            "Git credential: none; origin `git@github.com:keel-e2e/example.git` is not",
+        ], [])
+    finally:
+        suite.environment = saved
+    return result
+
+
+def approved_run(
+    suite: Suite, name: str, arguments: list[str], cwd: Path, timeout: int = 180
+) -> tuple[int | None, str, float]:
+    """Runs `keel ARGUMENTS`, typing APPROVE once the admission screen is up.
+    Returns the exit code, the cleaned transcript, and the seconds it took."""
+    transcript = suite.transcripts / f"{name}.typescript"
+    started = time.monotonic()
+    process = subprocess.Popen(
+        under_script(transcript, [str(suite.keel), *arguments]),
+        cwd=cwd,
+        env=suite.environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    # Input typed before the trusted screen appears is discarded.
+    deadline = time.monotonic() + scaled(60)
+    while time.monotonic() < deadline and not (
+        transcript.exists() and b"Type APPROVE" in transcript.read_bytes()
+    ):
+        time.sleep(0.2)
+    assert process.stdin is not None
+    try:
+        process.stdin.write(b"APPROVE\r")
+        process.stdin.flush()
+    except BrokenPipeError:
+        pass  # the run ended before admission; its exit code says so
+    try:
+        code: int | None = process.wait(timeout=scaled(timeout))
+    except subprocess.TimeoutExpired:
+        process.kill()
+        code = None
+    text = clean(transcript.read_bytes()) if transcript.exists() else ""
+    return code, text, time.monotonic() - started
+
+
+FETCH_SCRIPT = """\
+for (const url of ["https://example.com/", "http://example.com/"]) {
+  try {
+    const response = await Keel.fetch(url);
+    const body = await response.text();
+    console.log(`E2E-FETCH ${url} ${response.status} ${body.includes("Example Domain")}`);
+  } catch (error) {
+    console.log(`E2E-FETCH ${url} failed ${error?.message}`);
+  }
+}
+"""
+
+
+def case_v8_fetch(suite: Suite) -> Result:
+    """`Keel.fetch` in the V8 microVM reaches an admitted host over HTTPS and
+    over plain HTTP through the trusted proxy."""
+    result = Result("v8-fetch")
+    workspace = suite.workspace("v8-fetch", {"fetch.mjs": FETCH_SCRIPT})
+    before = suite.session_names()
+    code, text, result.seconds = approved_run(
+        suite,
+        "v8-fetch",
+        ["run", "--allow", "egress:example.com", "--record-targets", "--isolation", "vm-v8", "v8", "fetch.mjs"],
+        workspace,
+    )
+    result.sessions += suite.sessions_since(before)
+    result.check("the run completed", code == 0, f"exit {code}")
+    result.check("no approval was raised for the admitted host", PENDING not in text)
+    for url in ("https://example.com/", "http://example.com/"):
+        result.check(f"{url} answered through the proxy", f"E2E-FETCH {url} 200 true" in text, text[-500:])
+    for session in result.sessions:
+        targets = [
+            record["fields"].get("target", "")
+            for record in suite.records(session)
+            if record["event"] == "kernel.action" and record["fields"].get("outcome") == "executed"
+        ]
+        result.check(
+            "both requests were authorized by method and path",
+            "GET example.com:443/" in targets and "GET example.com:80/" in targets,
+            str(targets),
+        )
+    return result
+
+
+GIT_VARIABLES = (
+    "KEEL_GIT_AUTHORIZATION",
+    "KEEL_GIT_CREDENTIAL_HOST",
+    "KEEL_GIT_CREDENTIAL_PATH",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+)
+
+
+def derived_scope(
+    suite: Suite, result: Result, workspace: Path, origin: str, screen: list[str], scopes: list[str]
+) -> None:
+    """Runs a push-capable V8 session in a workspace whose origin is ORIGIN,
+    approving at the admission screen, and checks what the screen showed and
+    which Git credential scope the run was admitted with. Nothing is pushed."""
+    subprocess.run(["git", "remote", "remove", "origin"], cwd=workspace, capture_output=True)
+    subprocess.run(["git", "remote", "add", "origin", origin], cwd=workspace, check=True)
+    label = "https origin" if origin.startswith("https://") else "ssh origin"
+    before = suite.session_names()
+    code, text, seconds = approved_run(
+        suite,
+        f"credential-sources-{label.replace(' ', '-')}",
+        ["run", "--allow", "push:branch", "--isolation", "vm-v8", "--model", "claude-haiku-4-5", "v8", "hello.mjs"],
+        workspace,
+    )
+    result.seconds += seconds
+    result.check(f"{label}: the run completed", code == 0 and "E2E-V8-OK" in text, text[-300:])
+    for line in screen:
+        result.check(f"{label}: admission shows {line!r}", line in text, text[:600])
+    sessions = suite.sessions_since(before)
+    result.sessions.extend(sessions)
+    for session in sessions:
+        authority = (suite.manifest(session) or {}).get("authority", {})
+        git = [scope for scope in authority.get("credential_scopes", []) if "github.com/" in scope]
+        result.check(f"{label}: the manifest binds {scopes or 'no Git credential'}", git == scopes, str(git))
+        result.check(
+            f"{label}: the GitHub source is named only when it is used",
+            any(source.startswith("GitHub credential") for source in authority.get("credential_sources", []))
+            == bool(scopes),
+            str(authority.get("credential_sources")),
+        )
+
+
 def first_line_after_session(completed: subprocess.CompletedProcess) -> str:
     lines = completed.stdout.splitlines()
     return lines[1] if len(lines) > 1 else completed.stderr.strip()
@@ -829,6 +1071,8 @@ CASES: dict[str, tuple[Callable[[Suite], Result], list[str]]] = {
     "workspace-own": (case_workspace_own, []),
     "npm-ci-pinned": (case_npm_ci_pinned, []),
     "extract-url": (case_extract_url, []),
+    "credential-sources": (case_credential_sources, []),
+    "v8-fetch": (case_v8_fetch, []),
     "provider-anthropic": (case_provider_anthropic, ["ANTHROPIC_API_KEY"]),
 }
 

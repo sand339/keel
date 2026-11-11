@@ -728,6 +728,112 @@ fn credentials_are_injected_only_on_the_tls_port() {
     assert!(git_vault().refuse_sentinels(request.into_bytes()).is_err());
 }
 
+/// A proxy client names its target in absolute form. It is forwarded as the
+/// path alone, and only when it names the host the connection was authorized
+/// for (KSR-047 refused every absolute target, which broke plain HTTP).
+#[test]
+fn a_plain_http_proxy_request_is_forwarded_in_origin_form() {
+    let destination = EgressDestination {
+        server_name: "packages.example".to_owned(),
+        port: 80,
+    };
+    let rewrite = |request: &str| {
+        super::origin_form_request(request.as_bytes().to_vec(), &destination)
+            .map(|bytes| String::from_utf8(bytes).unwrap())
+    };
+    for (target, path) in [
+        ("http://packages.example/crate?x=1", "/crate?x=1"),
+        ("http://Packages.Example:80/crate", "/crate"),
+        ("http://packages.example", "/"),
+        ("http://packages.example?x=1", "/?x=1"),
+        ("/already/origin", "/already/origin"),
+    ] {
+        assert_eq!(
+            rewrite(&format!("GET {target} HTTP/1.1\r\nHost: h\r\n\r\nbody")).unwrap(),
+            format!("GET {path} HTTP/1.1\r\nHost: h\r\n\r\nbody"),
+            "{target}"
+        );
+    }
+    for target in [
+        "http://other.example/crate",
+        "http://packages.example:8080/crate",
+        "http://user@packages.example/crate",
+        "http://packages.example.evil.example/crate",
+        "http://packages.example@other.example/crate",
+    ] {
+        let error = rewrite(&format!("GET {target} HTTP/1.1\r\n\r\n")).unwrap_err();
+        assert!(
+            error.to_string().contains("not the host"),
+            "{target}: {error}"
+        );
+    }
+    // What is not an `http://` target is left for the origin-form check.
+    for target in [
+        "https://packages.example/crate",
+        "//packages.example/x",
+        "*",
+    ] {
+        let request = format!("GET {target} HTTP/1.1\r\n\r\n");
+        assert_eq!(rewrite(&request).unwrap(), request);
+        assert!(super::request_line(request.as_bytes()).is_err(), "{target}");
+    }
+    // A rewritten target still has to pass it.
+    let doubled = rewrite("GET http://packages.example//x HTTP/1.1\r\n\r\n").unwrap();
+    assert!(super::request_line(doubled.as_bytes()).is_err());
+
+    // End to end: the upstream receives the path and the authorized host.
+    let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let upstream_address = upstream_listener.local_addr().unwrap();
+    let upstream = thread::spawn(move || {
+        let (mut stream, _) = upstream_listener.accept().unwrap();
+        let request = super::read_http_request(&mut stream).unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nkeel-pass",
+            )
+            .unwrap();
+        String::from_utf8(request).unwrap()
+    });
+    let (mut client, guest) = UnixStream::pair().unwrap();
+    let target = ConnectionTarget {
+        server_name: "packages.example".to_owned(),
+        resolved_ip: Ipv4Addr::new(93, 184, 216, 34).into(),
+        port: upstream_address.port(),
+    };
+    let destination = EgressDestination {
+        server_name: target.server_name.clone(),
+        port: target.port,
+    };
+    let absolute = format!("http://packages.example:{}/crate", target.port);
+    let proxy = thread::spawn(move || {
+        let mut authorizer = ExpectedAuthorizer {
+            method: "GET",
+            path: "/crate",
+        };
+        proxy_plain_http_once(
+            guest,
+            &destination,
+            &CredentialVault::new(),
+            &mut authorizer,
+            || Ok((TcpStream::connect(upstream_address).unwrap(), target)),
+        )
+        .unwrap();
+    });
+    client
+        .write_all(format!("GET {absolute} HTTP/1.1\r\nHost: packages.example\r\n\r\n").as_bytes())
+        .unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    proxy.join().unwrap();
+    assert!(response.ends_with("keel-pass"));
+    assert!(
+        upstream
+            .join()
+            .unwrap()
+            .starts_with("GET /crate HTTP/1.1\r\n")
+    );
+}
+
 #[test]
 fn plain_http_never_writes_a_credential_upstream() {
     let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();

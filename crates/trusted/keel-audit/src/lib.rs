@@ -245,6 +245,12 @@ fn percent_encode(value: &str) -> String {
     encoded
 }
 
+/// Standard padded base64, for a credential header built in trusted memory.
+#[must_use]
+pub fn standard_base64(value: &[u8]) -> String {
+    base64(value, b'+', b'/')
+}
+
 fn base64(value: &[u8], char62: u8, char63: u8) -> String {
     let mut alphabet = *b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     alphabet[62] = char62;

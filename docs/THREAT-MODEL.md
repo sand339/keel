@@ -216,6 +216,10 @@ For Bedrock, the host obtains AWS credentials and signs an allowed request with 
 
 The model endpoint receives the full context and is not scanned, so the provider must never act for the workload. Trusted termination forwards only tools the harness itself executes and strips every typed tool, which covers server-side search, fetch, code execution, and MCP connectors, including types not yet defined. It refuses any request whose content the provider would fetch: a `url` or `file` image or document source, or a container upload, at any depth (D78).
 
+A credential may come from a stored source instead of the environment: `~/.keel/sources.json` names a command per provider, and the trusted runtime reads it at launch (D91). The file is as sensitive as a shell profile, since the runtime runs what it names. It is refused unless the operator owns it and its directory, neither is a link or writable by group or others, and it lies outside the workspace, so a repository cannot supply or shadow one. Its commands search a fixed path rather than one the workspace's tooling may have extended, and get no terminal on their standard streams, so a source that would prompt fails instead. Someone who can already write the operator's `~/.keel` can redirect a source; that is the power to edit their shell profile, and the admission manifest names the source used.
+
+The Git credential scope may be read from the workspace's `origin` instead of spelled by the operator (D92). The origin is repository-controlled, so it is only ever a narrowing: the token is the operator's GitHub token, which can already push wherever they can, and Keel binds it to the one `https://github.com/OWNER/REPO` the origin names, for one run. An origin pointed at an attacker's repository is shown on the admission screen before any token is used, and a push there still meets the push gate. Other URL shapes bind nothing.
+
 Keel must reject:
 
 - a sentinel sent to an unapproved destination;
@@ -433,6 +437,7 @@ The most important risks that remain even when Keel works as designed are:
 - **Host V8 escape.** The lower-assurance profile has a materially weaker containment boundary.
 - **Host or hypervisor compromise.** Keel has no defense once its trusted platform is controlled.
 - **Availability attacks.** A workload can consume time and permitted resources up to configured limits.
+- **Stored credential commands and the terminal.** A stored source's command is not moved to its own session, so one that opens `/dev/tty` itself can still prompt on the operator's terminal, outside the trusted screen.
 - **Expected workspace mutation.** Keel is designed to let authorized agents edit the selected workspace; it is not a backup system.
 
 ## 15. Out of scope

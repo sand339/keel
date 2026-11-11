@@ -31,6 +31,9 @@ use std::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
+mod sources;
+pub use sources::CredentialSources;
+
 /// Identifies this crate as part of the trusted computing base.
 pub const TRUSTED_CRATE: &str = "keel-secrets";
 
@@ -100,6 +103,109 @@ struct RuntimeCredentialValues {
     bedrock: Option<(String, String)>,
     signer: Option<SigV4Signer>,
     openrouter: Option<String>,
+}
+
+/// The Git push credential with its host and repository path, and the GitHub
+/// token, that this run's declared authority lets it hold.
+fn repository_credentials(
+    allow_git_push: bool,
+    github_authorities: GitHubAuthorities,
+    sources: &CredentialSources,
+    derived_git: Option<(String, String)>,
+) -> Result<RepositoryCredentials, String> {
+    let repository_scope = allow_git_push || github_authorities.read_private_issues;
+    let derived_git = derived_git.filter(|_| {
+        repository_scope
+            && [
+                "KEEL_GIT_AUTHORIZATION",
+                "KEEL_GIT_CREDENTIAL_HOST",
+                "KEEL_GIT_CREDENTIAL_PATH",
+            ]
+            .iter()
+            .all(|variable| std::env::var_os(variable).is_none())
+    });
+    let (mut credential, mut host, mut path) = if repository_scope {
+        (
+            allow_git_push
+                .then(|| std::env::var("KEEL_GIT_AUTHORIZATION").ok())
+                .flatten(),
+            std::env::var("KEEL_GIT_CREDENTIAL_HOST").ok(),
+            std::env::var("KEEL_GIT_CREDENTIAL_PATH").ok(),
+        )
+    } else {
+        (None, None, None)
+    };
+    // Reading the operator's GitHub credential is itself authority-bearing.
+    // Do it only for a run whose accepted capability declares a GitHub
+    // effect; ordinary model and V8 runs must not silently harvest it.
+    let push_token = allow_git_push && derived_git.is_some();
+    let mut github = if github_authorities.any() || push_token {
+        match (
+            std::env::var("GH_TOKEN").ok(),
+            std::env::var("GITHUB_TOKEN").ok(),
+        ) {
+            (Some(mut left), Some(mut right)) if left != right => {
+                left.zeroize();
+                right.zeroize();
+                return Err("GH_TOKEN and GITHUB_TOKEN contain different credentials".to_owned());
+            }
+            (Some(token), other) | (other, Some(token)) => {
+                if let Some(mut other) = other {
+                    other.zeroize();
+                }
+                Some(token)
+            }
+            (None, None) => sources.github(gh_keyring_token),
+        }
+    } else {
+        None
+    };
+    // A derived scope is applied whole or not at all: without a token a
+    // push run still starts and simply holds no push credential.
+    if let Some((derived_host, derived_path)) = derived_git
+        && (!allow_git_push || github.is_some())
+    {
+        credential = github
+            .as_deref()
+            .filter(|_| allow_git_push)
+            .map(basic_authorization);
+        (host, path) = (Some(derived_host), Some(derived_path));
+    }
+    if !github_authorities.any()
+        && let Some(mut token) = github.take()
+    {
+        token.zeroize();
+    }
+    Ok((credential, host, path, github))
+}
+
+type RepositoryCredentials = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// `Basic` authorization carrying a GitHub token, as Git's smart HTTP takes it.
+fn basic_authorization(token: &str) -> String {
+    let pair = Zeroizing::new(format!("x-access-token:{token}"));
+    format!("Basic {}", keel_audit::standard_base64(pair.as_bytes()))
+}
+
+/// The token of the active GitHub CLI login, when there is one.
+fn gh_keyring_token() -> Option<String> {
+    std::process::Command::new("gh")
+        .args(["auth", "token", "--hostname", "github.com"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            let stdout = Zeroizing::new(output.stdout);
+            std::str::from_utf8(&stdout)
+                .ok()
+                .map(|token| token.trim().to_owned())
+        })
+        .filter(|token| !token.is_empty())
 }
 
 /// System resolver and TCP connector guarded by structural address checks.
@@ -192,10 +298,14 @@ impl SystemEgressConnector {
     }
 
     /// Builds the run connector and scoped credentials from the trusted
-    /// process environment and the active GitHub CLI keyring entry.
+    /// process environment, then the operator's stored credential sources,
+    /// and the active GitHub CLI keyring entry.
     ///
     /// Only push authority reads `KEEL_GIT_AUTHORIZATION`; private issue reads
     /// use the host/path as repository identity without activating that secret.
+    /// With none of the three Git variables set, `derived_git` is the host
+    /// and repository path admission read from the workspace's origin: the
+    /// GitHub token is then bound to that one repository for this run.
     ///
     /// # Errors
     ///
@@ -204,75 +314,49 @@ impl SystemEgressConnector {
         allow_git_push: bool,
         github_authorities: GitHubAuthorities,
         include_model_provider: bool,
+        sources: &CredentialSources,
+        derived_git: Option<(String, String)>,
     ) -> Result<(Self, Option<GitCredentialScope>, Option<String>, Redactor), String> {
-        let repository_scope = allow_git_push || github_authorities.read_private_issues;
-        let (credential, host, path) = if repository_scope {
-            (
-                allow_git_push
-                    .then(|| std::env::var("KEEL_GIT_AUTHORIZATION").ok())
-                    .flatten(),
-                std::env::var("KEEL_GIT_CREDENTIAL_HOST").ok(),
-                std::env::var("KEEL_GIT_CREDENTIAL_PATH").ok(),
-            )
-        } else {
-            (None, None, None)
-        };
-        // Reading the operator's GitHub credential is itself authority-bearing.
-        // Do it only for a run whose accepted capability declares a GitHub
-        // effect; ordinary model and V8 runs must not silently harvest it.
-        let github = if github_authorities.any() {
-            match (
-                std::env::var("GH_TOKEN").ok(),
-                std::env::var("GITHUB_TOKEN").ok(),
-            ) {
-                (Some(mut left), Some(mut right)) if left != right => {
-                    left.zeroize();
-                    right.zeroize();
-                    return Err(
-                        "GH_TOKEN and GITHUB_TOKEN contain different credentials".to_owned()
-                    );
-                }
-                (Some(token), other) | (other, Some(token)) => {
-                    if let Some(mut other) = other {
-                        other.zeroize();
-                    }
-                    Some(token)
-                }
-                (None, None) => std::process::Command::new("gh")
-                    .args(["auth", "token", "--hostname", "github.com"])
-                    .output()
-                    .ok()
-                    .filter(|output| output.status.success())
-                    .and_then(|output| {
-                        let stdout = Zeroizing::new(output.stdout);
-                        std::str::from_utf8(&stdout)
-                            .ok()
-                            .map(|token| token.trim().to_owned())
-                    })
-                    .filter(|token| !token.is_empty()),
-            }
-        } else {
-            None
-        };
+        let (credential, host, path, github) =
+            repository_credentials(allow_git_push, github_authorities, sources, derived_git)?;
         // One provider per run. The credential for the provider this run did not
         // select is left unbound rather than bound and unreachable: a run that
         // holds a live key for a host outside its own egress intent is one
         // allowlist mistake away from having two budgets and one log.
         let (model, bedrock, signer, openrouter) = if include_model_provider {
             let provider = runtime_model_provider()?;
+            // The environment first, then the stored source of the selected
+            // provider only: a Bedrock run never reads the Anthropic item.
+            let (stored_bearer, stored_process) = if provider.region.is_some() {
+                sources.bedrock()?
+            } else {
+                (None, None)
+            };
             let bedrock = provider
                 .region
                 .is_some()
-                .then_some(std::env::var("AWS_BEARER_TOKEN_BEDROCK").ok())
+                .then(|| {
+                    std::env::var("AWS_BEARER_TOKEN_BEDROCK")
+                        .ok()
+                        .or(stored_bearer)
+                })
                 .flatten()
                 .map(|token| (provider.host.clone(), token));
-            let openrouter = (provider.host == OPENROUTER_HOST)
-                .then(|| std::env::var("OPENROUTER_API_KEY").ok())
-                .flatten();
+            let openrouter = if provider.host == OPENROUTER_HOST {
+                match std::env::var("OPENROUTER_API_KEY") {
+                    Ok(key) => Some(key),
+                    Err(_) => sources.secret("openrouter")?,
+                }
+            } else {
+                None
+            };
             let model = if provider.region.is_some() || provider.host == OPENROUTER_HOST {
                 None
             } else {
-                std::env::var("ANTHROPIC_API_KEY").ok()
+                match std::env::var("ANTHROPIC_API_KEY") {
+                    Ok(key) => Some(key),
+                    Err(_) => sources.secret("api-key")?,
+                }
             };
             // A regional provider without a bearer token authenticates by signing.
             // Resolving the credentials here rather than at first request means a
@@ -282,6 +366,7 @@ impl SystemEgressConnector {
                 Some(region) if bedrock.is_none() => Some(SigV4Signer::from_runtime_environment(
                     provider.host.clone(),
                     region.clone(),
+                    stored_process,
                 )?),
                 _ => None,
             };
@@ -651,7 +736,7 @@ where
     S: std::io::Read + std::io::Write,
     C: FnOnce() -> Result<(TcpStream, ConnectionTarget), TlsError>,
 {
-    let request = read_http_request(&mut guest)?;
+    let request = origin_form_request(read_http_request(&mut guest)?, destination)?;
     let request_plan = authorize_http_request(destination, &request, authorizer)?;
     commit_external_send(authorizer, request_plan.model)?;
     let (mut upstream, target) = connect()
@@ -1096,10 +1181,9 @@ fn github_repository_from_git_scope(host: &str, path: &str) -> Option<String> {
     if host != "github.com" {
         return None;
     }
-    let repository = path
-        .strip_prefix('/')?
-        .strip_suffix(".git")?
-        .trim_end_matches('/');
+    // An origin may be spelled with or without the `.git` suffix.
+    let repository = path.strip_prefix('/')?;
+    let repository = repository.strip_suffix(".git").unwrap_or(repository);
     let mut fields = repository.split('/');
     let owner = fields.next()?;
     let name = fields.next()?;
@@ -1205,6 +1289,48 @@ fn replace_credential_header(
     output.extend_from_slice(b"\r\n");
     output.extend_from_slice(&request[header_end + 4..]);
     Ok(output)
+}
+
+/// Rewrites a plain-HTTP proxy request to origin form.
+///
+/// A client speaking to a proxy names its target in absolute form,
+/// `GET http://host/path`. That form is taken only when it names the host and
+/// port this connection was authorized for, and it is replaced by the path
+/// before anything reads it, so authorization and the upstream see the same
+/// origin-form target as on every other path (KSR-047).
+fn origin_form_request(
+    request: Vec<u8>,
+    destination: &EgressDestination,
+) -> Result<Vec<u8>, TlsError> {
+    let line_end = request.windows(2).position(|bytes| bytes == b"\r\n");
+    let Some((line, rest)) = line_end.and_then(|end| {
+        let (line, rest) = request.split_at(end);
+        Some((std::str::from_utf8(line).ok()?, rest))
+    }) else {
+        return Ok(request);
+    };
+    let mut fields = line.splitn(3, ' ');
+    let (Some(method), Some(target), Some(version)) = (fields.next(), fields.next(), fields.next())
+    else {
+        return Ok(request);
+    };
+    let Some(absolute) = target.strip_prefix("http://") else {
+        return Ok(request);
+    };
+    let split = absolute.find(['/', '?', '#']).unwrap_or(absolute.len());
+    let (authority, path) = absolute.split_at(split);
+    let named = format!("{}:{}", destination.server_name, destination.port);
+    if !(authority.eq_ignore_ascii_case(&named)
+        || (destination.port == 80 && authority.eq_ignore_ascii_case(&destination.server_name)))
+    {
+        return Err(TlsError(format!(
+            "HTTP request target names `{authority}`, not the host this connection was authorized for"
+        )));
+    }
+    let slash = if path.starts_with('/') { "" } else { "/" };
+    let mut rewritten = format!("{method} {slash}{path} {version}").into_bytes();
+    rewritten.extend_from_slice(rest);
+    Ok(rewritten)
 }
 
 fn request_line(request: &[u8]) -> Result<(&str, &str), TlsError> {
@@ -1551,6 +1677,8 @@ enum AwsCredentialSource {
     /// call, and the rotation, and Keel only re-runs it. Keel therefore holds no
     /// SSO state and cannot be wrong about the cache format.
     Process(String),
+    /// The command of a stored `process` source, already hardened.
+    Stored(Mutex<std::process::Command>),
 }
 
 /// Signs model requests for a regional endpoint that authenticates with `SigV4`.
@@ -1569,12 +1697,17 @@ struct SigV4Signer {
 
 impl SigV4Signer {
     /// Resolves credentials for a signed regional provider.
-    fn from_runtime_environment(host: String, region: String) -> Result<Self, String> {
-        let source = match std::env::var("KEEL_AWS_CREDENTIAL_PROCESS") {
-            Ok(command) if !command.trim().is_empty() => AwsCredentialSource::Process(command),
+    fn from_runtime_environment(
+        host: String,
+        region: String,
+        stored: Option<std::process::Command>,
+    ) -> Result<Self, String> {
+        let source = match (std::env::var("KEEL_AWS_CREDENTIAL_PROCESS"), stored) {
+            (Ok(command), _) if !command.trim().is_empty() => AwsCredentialSource::Process(command),
+            (_, Some(command)) => AwsCredentialSource::Stored(Mutex::new(command)),
             _ => AwsCredentialSource::Environment,
         };
-        let credentials = resolve_aws_credentials(&source)?;
+        let credentials = resolve_aws_credentials(&source, false)?;
         Ok(Self {
             host,
             region,
@@ -1686,14 +1819,14 @@ impl SigV4Signer {
             .map_err(|_| TlsError("AWS credential custody is unavailable".to_owned()))?;
         let now = unix_now()?;
         if held.stale(now) {
-            let AwsCredentialSource::Process(command) = &self.source else {
+            if matches!(self.source, AwsCredentialSource::Environment) {
                 return Err(TlsError(
                     "AWS session credentials have expired and no KEEL_AWS_CREDENTIAL_PROCESS is \
                      configured to renew them"
                         .to_owned(),
                 ));
-            };
-            *held = resolve_credential_process(command, true).map_err(TlsError)?;
+            }
+            *held = resolve_aws_credentials(&self.source, true).map_err(TlsError)?;
             if let Some(redactor) = self.redactor.get() {
                 let mut secrets = Vec::new();
                 held.secrets(&mut secrets);
@@ -1942,7 +2075,10 @@ fn parse_utc_timestamp(value: &str) -> Option<u64> {
     local.checked_add_signed(-offset)
 }
 
-fn resolve_aws_credentials(source: &AwsCredentialSource) -> Result<AwsCredentials, String> {
+fn resolve_aws_credentials(
+    source: &AwsCredentialSource,
+    refresh: bool,
+) -> Result<AwsCredentials, String> {
     match source {
         AwsCredentialSource::Environment => {
             let access_key_id = std::env::var("AWS_ACCESS_KEY_ID")
@@ -1973,7 +2109,21 @@ fn resolve_aws_credentials(source: &AwsCredentialSource) -> Result<AwsCredential
                 expires_at: None,
             })
         }
-        AwsCredentialSource::Process(command) => resolve_credential_process(command, false),
+        AwsCredentialSource::Process(command) => {
+            resolve_credential_process_within(command, refresh, CREDENTIAL_PROCESS_TIMEOUT)
+        }
+        AwsCredentialSource::Stored(command) => {
+            let mut command = command
+                .lock()
+                .map_err(|_| "the stored credential command is unavailable".to_owned())?;
+            let output = run_credential_command(
+                &mut command,
+                "the stored bedrock credential command",
+                refresh,
+                CREDENTIAL_PROCESS_TIMEOUT,
+            )?;
+            parse_credential_process_output(&output)
+        }
     }
 }
 
@@ -1986,24 +2136,34 @@ const CREDENTIAL_PROCESS_TIMEOUT: Duration = Duration::from_mins(1);
 /// its stderr goes to the operator, since that is where "run aws sso login"
 /// appears; on a refresh mid-run the error can reach the audit log, so the
 /// command's own words are left out (KSR-058).
-fn resolve_credential_process(command: &str, refresh: bool) -> Result<AwsCredentials, String> {
-    resolve_credential_process_within(command, refresh, CREDENTIAL_PROCESS_TIMEOUT)
-}
-
 fn resolve_credential_process_within(
     command: &str,
     refresh: bool,
     timeout: Duration,
 ) -> Result<AwsCredentials, String> {
+    let mut shell = std::process::Command::new("sh");
+    shell.arg("-c").arg(command);
+    let label = "KEEL_AWS_CREDENTIAL_PROCESS";
+    parse_credential_process_output(&run_credential_command(
+        &mut shell, label, refresh, timeout,
+    )?)
+}
+
+/// Runs a credential command with no terminal on its standard streams and
+/// returns what it printed, in a buffer that is wiped when dropped.
+fn run_credential_command(
+    command: &mut std::process::Command,
+    label: &str,
+    refresh: bool,
+    timeout: Duration,
+) -> Result<Zeroizing<Vec<u8>>, String> {
     use std::io::Read as _;
-    let mut child = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
+    let mut child = command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|error| format!("KEEL_AWS_CREDENTIAL_PROCESS could not be run: {error}"))?;
+        .map_err(|error| format!("{label} could not be run: {error}"))?;
     // Each reader's buffer is wiped when it is dropped, even when the
     // command is abandoned below and the reader outlives this call.
     let read = |mut pipe: Box<dyn std::io::Read + Send>| {
@@ -2029,7 +2189,7 @@ fn resolve_credential_process_within(
     let status = loop {
         if let Some(status) = child
             .try_wait()
-            .map_err(|error| format!("KEEL_AWS_CREDENTIAL_PROCESS could not be awaited: {error}"))?
+            .map_err(|error| format!("{label} could not be awaited: {error}"))?
         {
             break status;
         }
@@ -2037,7 +2197,7 @@ fn resolve_credential_process_within(
             let _ = child.kill();
             let _ = child.wait();
             return Err(format!(
-                "KEEL_AWS_CREDENTIAL_PROCESS did not finish within {} seconds",
+                "{label} did not finish within {} seconds",
                 timeout.as_secs()
             ));
         }
@@ -2052,17 +2212,17 @@ fn resolve_credential_process_within(
     if !status.success() {
         return Err(if refresh {
             format!(
-                "KEEL_AWS_CREDENTIAL_PROCESS exited with {status} while renewing credentials; \
+                "{label} exited with {status} while renewing credentials; \
                  run it yourself to see why"
             )
         } else {
             format!(
-                "KEEL_AWS_CREDENTIAL_PROCESS exited with {status}: {}",
+                "{label} exited with {status}: {}",
                 String::from_utf8_lossy(&stderr).trim()
             )
         });
     }
-    parse_credential_process_output(&stdout)
+    Ok(stdout)
 }
 
 fn parse_credential_process_output(output: &[u8]) -> Result<AwsCredentials, String> {

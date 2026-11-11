@@ -3,7 +3,9 @@
 mod setup;
 
 pub mod export;
+pub mod init;
 mod openrouter;
+pub mod sources;
 use keel_audit::{AuditRecord, RunKey, TeardownReceipt, read_verified_file, read_verified_prefix};
 use keel_compile::{PolicyArtifact, SessionPolicyArtifact};
 use serde::{Deserialize, Serialize};
@@ -80,6 +82,8 @@ pub enum Command {
     },
     /// Check the local Keel runtime and current workspace.
     Doctor,
+    /// Guided setup: record where each credential comes from.
+    Init(init::InitOptions),
     /// Launch a harness through the configured runtime.
     Run(RunRequest),
     /// Compile a natural-language policy into a verified draft.
@@ -517,6 +521,7 @@ pub fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Comma
             prebuilt: Some(PathBuf::from(&arguments[2])),
         }),
         "doctor" if arguments.len() == 1 => Ok(Command::Doctor),
+        "init" => init::parse(&arguments[1..]).map(Command::Init),
         "run" | "mux" if requests_help(&arguments[1..]) => Ok(Command::Help),
         "run" => parse_run(&arguments[1..]).map(Command::Run),
         "mux" => parse_mux(&arguments[1..]).map(Command::Run),
@@ -1603,6 +1608,11 @@ fn apply_model_auth(command: &mut ProcessCommand, request: &RunRequest) -> Resul
     if let Some(auth) = &request.auth {
         command.env("KEEL_MODEL_AUTH", auth);
     }
+    // A stored Bedrock region is configuration like the exported one, which
+    // keeps priority; the trusted side validates it and shows the host.
+    if let Some(region) = sources::load().region(request.auth.as_deref()) {
+        command.env("AWS_REGION", region);
+    }
     if request.auth.as_deref() == Some("openrouter") {
         if request.harness != "claude" {
             return Err(CliError::new(
@@ -1660,9 +1670,10 @@ fn validate_model(value: &str) -> Result<(), CliError> {
 /// choice is read here, where it is only configuration, and passed down as the
 /// one value the guest is pinned to.
 #[must_use]
-pub fn host_default_model() -> Option<String> {
+pub fn host_default_model(auth: Option<&str>) -> Option<String> {
     if let Some(model) = env::var("ANTHROPIC_MODEL")
         .ok()
+        .or_else(|| sources::load().model(auth))
         .filter(|model| validate_model(model).is_ok())
     {
         return Some(model);
@@ -3531,7 +3542,7 @@ pub fn write_runtime_request_in(
 /// Returns concise command help.
 #[must_use]
 pub const fn help() -> &'static str {
-    "usage:\n  keel setup [--prebuilt RELEASE_DIR]\n  keel setup --install-reaper | --remove-reaper\n  keel doctor\n  keel mux [--workspace PATH] [RUN_OPTIONS] [-- CLAUDE_ARGS...]\n  keel run [--isolation vm|vm-v8|v8-sandboxed] [--provenance floor|gate-context] [--cpus N] [--memory GIB] [--reuse-connections] [--record-targets] [--ephemeral-workspace] [--schemas BUNDLE.json] [--keep-alive] [--idle-timeout HOURS] [--allow CAPABILITY] [--policy POLICY.json] [--continue SESSION] [--model MODEL] [--auth api-key|bedrock|openrouter] [--profile scoped --scope RULE|none|--scope-file FILE|--report REPORT [--exclude RULE]] [--model-token-budget N] [--model-cost-budget USD] HARNESS [ARGS...]\n  keel policy compile POLICY.md --output DRAFT.json [--translation RESULT.json]\n  keel policy compile --text TEXT --output DRAFT.json [--translation RESULT.json]\n  keel policy accept DRAFT.json --hash HASH --output POLICY.json\n  keel policy show POLICY.json\n  keel policy diff OLD.json NEW.json\n  keel attach SESSION\n  keel stop SESSION\n  keel recover SESSION | --all\n  keel status SESSION [--audit AUDIT.ndjson]\n  keel audit verify AUDIT.ndjson RUN_KEY_FILE\n  keel report AUDIT.ndjson RUN_KEY_FILE [AUDIT.ndjson RUN_KEY_FILE ...]\n  keel report --axes [SESSION ...]\n  keel report --context [SESSION ...]\n  keel export SESSION [SESSION ...] [--out FILE] [--otlp URL]\n  keel floor show SESSION [--state FLOOR.json]\n  keel floor lift SESSION [RANK]\n\ncapabilities:\n  egress:HOST\n  push:branch\n  push:ref:refs/heads/PATTERN\n  pr:create\n  pr:target:BRANCH\n  github:read-private-issues\n  deny:force-push\n  isolation:v8-sandboxed\n  workspace:public\n  workspace:own\n"
+    "usage:\n  keel setup [--prebuilt RELEASE_DIR]\n  keel setup --install-reaper | --remove-reaper\n  keel init [--set PROVIDER=COMMAND]... [--model PROVIDER=MODEL]... [--region REGION] [--github COMMAND] [--default PROVIDER]\n  keel doctor\n  keel mux [--workspace PATH] [RUN_OPTIONS] [-- CLAUDE_ARGS...]\n  keel run [--isolation vm|vm-v8|v8-sandboxed] [--provenance floor|gate-context] [--cpus N] [--memory GIB] [--reuse-connections] [--record-targets] [--ephemeral-workspace] [--schemas BUNDLE.json] [--keep-alive] [--idle-timeout HOURS] [--allow CAPABILITY] [--policy POLICY.json] [--continue SESSION] [--model MODEL] [--auth api-key|bedrock|openrouter] [--profile scoped --scope RULE|none|--scope-file FILE|--report REPORT [--exclude RULE]] [--model-token-budget N] [--model-cost-budget USD] HARNESS [ARGS...]\n  keel policy compile POLICY.md --output DRAFT.json [--translation RESULT.json]\n  keel policy compile --text TEXT --output DRAFT.json [--translation RESULT.json]\n  keel policy accept DRAFT.json --hash HASH --output POLICY.json\n  keel policy show POLICY.json\n  keel policy diff OLD.json NEW.json\n  keel attach SESSION\n  keel stop SESSION\n  keel recover SESSION | --all\n  keel status SESSION [--audit AUDIT.ndjson]\n  keel audit verify AUDIT.ndjson RUN_KEY_FILE\n  keel report AUDIT.ndjson RUN_KEY_FILE [AUDIT.ndjson RUN_KEY_FILE ...]\n  keel report --axes [SESSION ...]\n  keel report --context [SESSION ...]\n  keel export SESSION [SESSION ...] [--out FILE] [--otlp URL]\n  keel floor show SESSION [--state FLOOR.json]\n  keel floor lift SESSION [RANK]\n\ncapabilities:\n  egress:HOST\n  push:branch\n  push:ref:refs/heads/PATTERN\n  pr:create\n  pr:target:BRANCH\n  github:read-private-issues\n  deny:force-push\n  isolation:v8-sandboxed\n  workspace:public\n  workspace:own\n"
 }
 
 #[cfg(test)]

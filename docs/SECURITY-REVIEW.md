@@ -205,6 +205,14 @@ authorized as a path and forwarded verbatim, and some upstreams route by it.
 Only an origin-form target is now read: it must start with `/`, not `//`, and
 carry no fragment.
 
+Correction, 2026-11-10: that rule was applied to plain HTTP too, where a
+proxy client can only send an absolute target (`GET http://host/path`), so
+every plain-HTTP request was refused from the fix until this date. An
+`http://` target is now taken on the plain-HTTP path only when it names the
+host and port the connection was authorized for, and is rewritten to origin
+form before authorization and forwarding. The rule inside terminated TLS is
+unchanged. The `v8-fetch` E2E case covers both paths.
+
 ### KSR-049, KSR-050, KSR-061: what setup builds and a release ships
 
 `keel setup` built from any checkout-looking directory above the working

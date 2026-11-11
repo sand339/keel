@@ -19,17 +19,17 @@ repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 sha256() {
     if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi
 }
-version="6.12.112-r0"
-release="6.12.112-0-virt"
+version="6.12.115-r0"
+release="6.12.115-0-virt"
 case "${KEEL_GUEST_ARCH:-$(uname -m)}" in
 arm64 | aarch64)
     guest_arch=aarch64
-    expected="45f06ab578a351afbb07cb6aca31d8a258f1514e42ae377a9ec13f76078f3fa8"
+    expected="c634e13290ca7cf4b106430c8bdc40ab7dcd940fe9b453c813b9ea3f8063103e"
     kernel_root="$repo_root/.phase1/kernel"
     ;;
 x86_64 | amd64)
     guest_arch=x86_64
-    expected="6ef528f560ab6eca01c39729edc636ad47478cb583323b31a376832d7fa70c11"
+    expected="cb0a27d5a02d01767bcb9886db447131b440417f6de91f0b9c6cd057c40101b7"
     kernel_root="$repo_root/.phase1-x86_64/kernel"
     ;;
 *)

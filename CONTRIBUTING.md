@@ -89,7 +89,7 @@ Explain any proposed exception in the pull request and update the architecture a
 
 ## Trusted computing base budget
 
-CI holds each of the six trusted crates to a per-crate line ratchet in [`ci/check_invariants.py`](ci/check_invariants.py) (invariant I1), together with dependency-direction and allowlist checks. A change that grows a trusted crate past its ratchet fails CI until the number is raised in the same change. The trusted total, about 19,700 lines, is reported on every run but is not capped.
+CI holds each of the six trusted crates to a per-crate line ratchet in [`ci/check_invariants.py`](ci/check_invariants.py) (invariant I1), together with dependency-direction and allowlist checks. A change that grows a trusted crate past its ratchet fails CI until the number is raised in the same change. The trusted total, about 20,200 lines, is reported on every run but is not capped.
 
 When changing trusted code:
 

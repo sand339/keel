@@ -8,8 +8,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-keel-kernel = { version = "=0.0.1", path = "../../trusted/keel-kernel" }
-keel-secrets = { version = "=0.0.1", path = "../../trusted/keel-secrets" }
+keel-kernel = { version = "=0.1.0", path = "../../trusted/keel-kernel" }
+keel-secrets = { version = "=0.1.0", path = "../../trusted/keel-secrets" }
 
 [dev-dependencies]
 rustls.workspace = true

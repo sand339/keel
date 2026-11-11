@@ -6,7 +6,6 @@
 
 import fs from "node:fs";
 import http from "node:http";
-import https from "node:https";
 import net from "node:net";
 import tls from "node:tls";
 
@@ -80,10 +79,17 @@ function requestThroughTunnel(url, options, resolve, reject) {
     });
     secure.once("error", reject);
     secure.once("secureConnect", () => {
-      const request = https.request(url, {
-        ...options,
-        agent: false,
-        createConnection: () => secure,
+      // The request is written to the tunnel's own TLS stream. Handing Node
+      // the URL would have it resolve and dial the host itself, and the
+      // guest has no DNS: only the proxy reaches the network.
+      const agent = new http.Agent({ keepAlive: false });
+      agent.createConnection = () => secure;
+      const request = http.request({
+        agent,
+        host: url.hostname,
+        path: `${url.pathname}${url.search}`,
+        method: options.method,
+        headers: { ...options.headers, host: url.host },
       });
       request.once("error", reject);
       request.once("response", (value) => collect(value, resolve, reject));

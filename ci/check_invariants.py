@@ -114,7 +114,8 @@ CRATE_BUDGETS = {
     # KSR-043: a record torn by a crash ends the authenticated prefix.
     # KSR-058: the redactor is one shared set that refreshed credentials join,
     # and its Debug output no longer lists them.
-    "keel-audit": 1_506,
+    # keel init, step 2: standard base64 exposed for the push credential.
+    "keel-audit": 1_510,
     # D16 moved 200 lines here from keel-input for the eventstream usage decoder.
     # The trusted input path is complete, so its surplus was sized for work that
     # Phase 2 has since finished. D17 then added 700 with no donor at all: SigV4
@@ -146,7 +147,14 @@ CRATE_BUDGETS = {
     # redacted; KSR-059: the credential command has a deadline; KSR-060:
     # credential copies are wiped and the injected request never reallocates.
     # KSR-058: refreshed AWS credentials join the redactor.
-    "keel-secrets": 3_667,
+    # keel init, step 1: stored credential sources (a command or an
+    # environment variable), parsed, named for admission, and resolved on a
+    # fixed path with no terminal hint; the environment keeps priority.
+    # keel init, step 2: the GitHub token bound as the push credential to a
+    # repository scope derived at admission, or nothing when there is no token.
+    # A plain-HTTP proxy request's absolute target is taken only for the
+    # authorized host and rewritten to origin form (KSR-047 had refused it).
+    "keel-secrets": 3_997,
     # D20 added 100 from keel-provenance for the display seam tracker: the trusted
     # terminal owner has to know where a sequence or character ends before it
     # writes a notice into the guest's stream or resumes one after a takeover.
@@ -211,7 +219,12 @@ CRATE_BUDGETS = {
     # admission; KSR-052: typed control bytes reach the guest and sizes are
     # bounded; KSR-054: the backend starts only once its group is recorded,
     # behind a bash gate, since dash cannot redirect a descriptor above 9.
-    "keel-input": 5_343,
+    # keel init, step 1: the sources file is refused unless the operator owns
+    # it, nobody else can write it, and it lies outside the workspace; the
+    # sources a run reads are named at admission and in the manifest.
+    # keel init, step 2: the push scope read from the workspace's origin,
+    # shown at admission, and passed to credential custody.
+    "keel-input": 5_473,
 }
 SENSITIVE_TYPES = {
     "keel-secrets": [

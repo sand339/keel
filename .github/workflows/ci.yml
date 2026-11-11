@@ -45,3 +45,65 @@ jobs:
           cargo install --locked --version 0.20.2 cargo-deny
       - name: Check trust-boundary invariants
         run: ./ci/phase0.sh
+
+  # Boots the guest under KVM on every push: setup from the checkout, doctor,
+  # the end-to-end cases that call no model, and the lifecycle fault suite.
+  # A change that breaks Linux setup, boot, confinement, or teardown fails here.
+  linux-vm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      # A V8 run names a provider at admission but calls no model, so a
+      # placeholder key is enough and no secret is held for this job.
+      ANTHROPIC_API_KEY: ci-placeholder
+      ANTHROPIC_MODEL: claude-haiku-4-5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Require KVM
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::this runner has no /dev/kvm; the VM job needs a KVM-capable runner"
+            exit 1
+          fi
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+      - name: Install setup prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bubblewrap libseccomp-dev libcap-ng-dev pkg-config
+      - name: Allow bubblewrap to create user namespaces
+        # Ubuntu 23.10 and later restrict them; this is the profile
+        # `keel doctor` prints.
+        run: |
+          printf 'abi <abi/4.0>,\ninclude <tunables/global>\n\nprofile bwrap /usr/bin/bwrap flags=(unconfined) {\n  userns,\n  include if exists <local/bwrap>\n}\n' \
+            | sudo tee /etc/apparmor.d/bwrap >/dev/null
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap
+      - name: Build the launcher
+        run: cargo build --release --locked -p keel-cli --bin keel
+      - name: Set up the runtime and guest image
+        run: |
+          ./target/release/keel setup
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Check the installation
+        run: keel doctor
+      - name: Run the end-to-end cases that call no model
+        run: >
+          python3 ci/e2e.py
+          --case doctor --case v8-vm --case refusals
+          --case credential-sources --case v8-fetch
+      - name: Run the lifecycle fault suite
+        run: python3 ci/faults.py
+      - name: Show the results of a failed run
+        if: failure()
+        run: |
+          for summary in "$HOME"/.keel/e2e-results/*/summary.md; do
+            [ -f "$summary" ] && cat "$summary"
+          done
+          keel doctor || true

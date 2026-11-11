@@ -15,7 +15,7 @@ guest architecture; it defaults to the build host's.
 
 | Artifact | Version | Source | Pinned in |
 |---|---|---|---|
-| Guest Linux kernel (`linux-virt`) and its modules, aarch64 and x86_64 | 6.12.112-r0 | Alpine Linux v3.21 `main` (`dl-cdn.alpinelinux.org`) | `spikes/fetch-guest-kernel.sh` |
+| Guest Linux kernel (`linux-virt`) and its modules, aarch64 and x86_64 | 6.12.115-r0 | Alpine Linux v3.21 `main` (`dl-cdn.alpinelinux.org`) | `spikes/fetch-guest-kernel.sh` |
 | Claude Code (Linux arm64 or x64 musl) | 2.1.287 | `downloads.claude.ai` | `spikes/build-phase1-image.sh` |
 | `agent-browser` (musl arm64 or x64 binary from the npm package) | 0.38.2 | `registry.npmjs.org` | `spikes/build-phase1-image.sh` (package and binary checksums) |
 | Deno (host: macOS arm64, Linux x86_64 and aarch64) | 2.9.7 | GitHub releases, `denoland/deno` | `spikes/fetch-deno.sh` |

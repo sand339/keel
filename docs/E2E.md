@@ -28,6 +28,10 @@ mix with your own sessions. On a slow host, such as a nested VM, set
 is `/dev/null`: a case that raised an approval or admission screen could not
 proceed, and the suite counts any such screen as a failure.
 
+CI runs `doctor`, `v8-vm`, `refusals`, `credential-sources`, and `v8-fetch`
+on a Linux runner with KVM on every push, with a placeholder key; they call no
+model. The other cases need a model credential and are run by hand.
+
 | Case | What it proves |
 |---|---|
 | `doctor` | The installation is complete: root disk, guest kernel with Landlock scoping, signed VZ backend (macOS) or a working bubblewrap (Linux) |
@@ -44,6 +48,8 @@ proceed, and the suite counts any such screen as a failure.
 | `workspace-own` | `--allow workspace:own`, approved once the trusted screen is up, runs in a clean clone of `HEAD` (untracked files absent), starts and stays at floor 2 while the agent reads the repository, and a second run reports the `HEAD` unchanged since acceptance |
 | `npm-ci-pinned` | An own workspace with a committed `package-lock.json` pinning `is-number`: admission names one pinned package, `npm ci` fetches the tarball through Keel, the agent reads the installed package, the manifest records `lockfile_pins: 1`, and the floor stays at 2 |
 | `extract-url` | With `--schemas` and an own workspace, the agent calls `keel_extract` on `example.com`: it receives only the schema's fields, no page text, the page never enters the guest's provenance, the audit records `kernel.extraction` as `ok`, and the floor stays at 2 |
+| `credential-sources` | `keel init --set` writes a private sources file, and a second `keel init --github` adds to it; with no credential variable in the environment, a V8 run takes the model credential from that `process` source; the manifest names the source and binds it to the model host; `keel doctor` lists it by kind; a group-writable sources file and one inside the workspace are refused before admission; with a stored GitHub source and `push:branch`, the admission screen shows the credential scope read from an HTTPS GitHub origin and the manifest binds the token to that repository, while an SSH origin shows no credential and binds none (nothing is pushed) |
+| `v8-fetch` | `Keel.fetch` in the V8 microVM reaches an admitted host over HTTPS and over plain HTTP; both requests are authorized by method and path, and no approval is raised |
 | `provider-anthropic` | The Anthropic API key path works (needs `ANTHROPIC_API_KEY`) |
 
 Every session must also record an admission manifest, present no operator

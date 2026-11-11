@@ -187,7 +187,20 @@ checkout. See [pinned artifacts](docs/ARTIFACTS.md).
 
 ### Configure model access
 
-For Anthropic API access:
+Run guided setup once. It records where each credential comes from, such as a
+Keychain item, a password-manager command, or your `gh` login, in
+`~/.keel/sources.json`. It stores no key, and ends with a two-minute first
+session on the trusted approval screen:
+
+~~~sh
+keel init
+~~~
+
+After that no environment variable is needed, and a push is bound to the
+workspace's own GitHub repository at admission. See
+[credential sources](docs/USAGE.md#credential-sources-instead-of-environment-variables).
+
+Environment variables still work and take priority. For Anthropic API access:
 
 ~~~sh
 export ANTHROPIC_API_KEY='...'
@@ -260,7 +273,7 @@ lower-assurance process starts.
 | Scoped runs refuse everything outside their scope | [`scoped_run.rs`](crates/trusted/keel-input/tests/scoped_run.rs) |
 | Every run records its admission manifest first | [`admission_manifest.rs`](crates/trusted/keel-input/tests/admission_manifest.rs) |
 | The audit log is authenticated, hash-chained, and sealed | [`verification_status.rs`](crates/trusted/keel-audit/tests/verification_status.rs) |
-| The trusted code is about 19,700 lines, each crate held to a line ratchet | [`check_invariants.py`](ci/check_invariants.py) I1 |
+| The trusted code is about 20,200 lines, each crate held to a line ratchet | [`check_invariants.py`](ci/check_invariants.py) I1 |
 
 Out of scope: judging whether an action is harmful, stopping an operator from
 approving an accurately shown action, exfiltration through permitted output,
@@ -278,7 +291,8 @@ and a compromised host, hypervisor, or trusted dependency. See the
 - **Platforms:** Apple silicon macOS and Ubuntu 24.04+ (x86_64; ARM64 tested only nested); host V8 is macOS-only.
 - **Crash cleanup:** a killed runtime's VM stops with it on both platforms, but its scratch directories wait for `keel recover`, the next `keel run` or `keel attach` (after a 15-minute grace), or the opt-in hourly reaper, and recovery records are unsigned.
 - **Process attribution is the guest's claim:** which guest process issued a push comes from the guest's PID 1, read just after each exec; it can only add a gate, never remove one.
-- **Unsigned releases:** a release without a `.sigstore.json` bundle is unsigned; none is signed yet.
+- **Unsigned releases:** a release without a `.sigstore.json` bundle is unsigned; treat it as unverified.
+- **Push scope derivation is GitHub only:** `https://github.com/OWNER/REPO` origins; other hosts and SSH remotes use the `KEEL_GIT_*` variables.
 
 ## Documentation
 

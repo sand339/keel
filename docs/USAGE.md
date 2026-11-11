@@ -145,6 +145,122 @@ keel run --auth api-key --provenance floor claude
 
 Run keel doctor after configuring credentials. A warning that no model credential is set means live Claude requests will fail even if the runtime itself can start.
 
+### Guided setup
+
+~~~sh
+keel init
+~~~
+
+`keel init` checks the host as `keel doctor` does, then asks, for each model
+provider you want, where its credential should come from. It offers what the
+host has: the macOS Keychain; on Linux a desktop keyring (`secret-tool`),
+`pass`, 1Password, or Bitwarden; an environment variable; or any command that
+prints the key. It then offers your `gh` login for pushes and the GitHub
+tools, shows the file it would write, and writes it only when you confirm.
+
+- Keel never reads or stores a key. To store one, `init` runs the keyring's
+  own tool (`security add-generic-password`, `secret-tool store`,
+  `pass insert`), which asks for the key itself.
+- Each chosen command is run once, the way a run will run it, and its output
+  is discarded, so a source that is locked or misspelled is reported now
+  with its unlock step.
+- It is rerunnable: it shows what is configured and changes only what you
+  choose.
+- When the sources directory lets group or others write to it, as a default
+  Ubuntu account creates `~/.keel`, writing the file also removes that
+  access, and `init` says so before you confirm.
+- It offers the hourly crash-recovery job, and then a first session: a
+  script in the V8 microVM, in Keel's own throwaway workspace
+  (`~/.keel/init-demo`), that makes two requests. You approve one with
+  `Ctrl-]` then `A` and deny the other with `Ctrl-]` then Escape. It calls
+  no model, reads no stored credential, and touches no repository.
+
+For scripts, record sources without prompts:
+
+~~~sh
+keel init --set api-key='pass show keel/anthropic' \
+          --set bedrock='aws configure export-credentials --profile work --format process' \
+          --region us-west-2 --default api-key \
+          --github 'gh auth token --hostname github.com'
+~~~
+
+`--model PROVIDER=MODEL` records a provider's default model. Flags record
+exactly what they are given: nothing is tested and no session runs.
+
+### Credential sources instead of environment variables
+
+`keel init` writes the file described here; you can also edit it by hand.
+Exporting a key in every shell is optional. `~/.keel/sources.json` tells the
+trusted runtime where to fetch each credential when a run starts. It names
+commands and never holds a secret:
+
+~~~json
+{
+  "version": 1,
+  "providers": {
+    "api-key": {"source": {"kind": "process", "command": "/usr/bin/security find-generic-password -w -s keel-anthropic"}},
+    "bedrock": {
+      "source": {"kind": "process", "command": "aws configure export-credentials --profile work --format process"},
+      "region": "us-west-2"
+    },
+    "openrouter": {
+      "source": {"kind": "process", "command": "pass show keel/openrouter"},
+      "hint": "unlock with `pass show keel/openrouter` first",
+      "model": "anthropic/claude-sonnet-4.6"
+    }
+  },
+  "default": "api-key",
+  "github": {"source": {"kind": "process", "command": "gh auth token --hostname github.com"}}
+}
+~~~
+
+There are two kinds of source:
+
+| Kind | Field | What the runtime does |
+|---|---|---|
+| `process` | `command` | Runs the command through `/bin/sh -c`; what it prints is the credential |
+| `env` | `variable` | Reads the variable, as without a sources file |
+
+A keyring or password manager is a `process` source, so the command you admit
+is the command that runs:
+
+| Store | Command |
+|---|---|
+| macOS Keychain | `/usr/bin/security find-generic-password -w -s keel-anthropic` |
+| Linux desktop keyring | `secret-tool lookup keel anthropic` |
+| `pass` | `pass show keel/anthropic` |
+| `systemd-creds` | `systemd-creds decrypt ~/.keel/anthropic.cred -` |
+| 1Password | `op read op://Private/keel-anthropic/credential` |
+| GitHub CLI | `gh auth token --hostname github.com` |
+
+Store a macOS Keychain item once with
+`security add-generic-password -s keel-anthropic -a "$USER" -w`. For Bedrock, a
+`process` source prints the AWS credential-process JSON and is run again when
+the session it printed lapses; an `env` source names a Bedrock bearer token.
+
+Rules:
+
+- Providers are keyed by the names `--auth` takes. A run resolves only the
+  source of the provider it selected. Without `--auth`, a run uses the only
+  configured provider, then `default`, and otherwise asks.
+- The environment keeps priority. `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`,
+  the Bedrock variables, `GH_TOKEN`, and `AWS_REGION` override the stored
+  entry for their provider, so an existing setup behaves as before.
+- The runtime runs the commands this file names, so it refuses the file, and
+  the run, unless the file and its directory are owned by you, are not
+  symbolic links, are not writable by group or others, and lie outside the
+  workspace. `KEEL_SOURCES=PATH` names another file under the same rules.
+- Commands find their program on `/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin`,
+  not your `PATH`; give an absolute path for a tool installed elsewhere. They
+  run with no terminal on their standard streams and without `GPG_TTY` or
+  `SSH_ASKPASS`, with a one-minute deadline. A source that needs unlocking
+  therefore fails, and the run is refused with the entry's `hint`. A command
+  that opens `/dev/tty` itself can still prompt; avoid such commands.
+- A GitHub source that fails does not stop a run: the run has no GitHub token.
+- The admission screen and the admission manifest (`authority.credential_sources`)
+  name each stored source a run reads. `keel doctor` lists the stored sources
+  by kind without running them.
+
 ### GitHub MCP
 
 Authenticate the GitHub CLI on the host:
@@ -157,7 +273,30 @@ Alternatively provide GH_TOKEN in the host environment. The trusted relay owns t
 
 ### Authenticated Git push
 
-Provide all three variables or none of them:
+With a GitHub source in `~/.keel/sources.json` (see above), nothing else is
+needed. For a run that declares a push, the trusted runtime reads the
+workspace's `origin` at admission and binds your GitHub token to that one
+repository for that run:
+
+- the origin must be spelled `https://github.com/OWNER/REPO`, with or without
+  `.git`. SSH remotes, other hosts, a URL with embedded credentials, a port, a
+  query, or a fragment are not scopes;
+- the admission screen shows the scope before any token is used
+  (`Git credential scope, from origin: github.com/OWNER/REPO.git`), so an
+  origin that points somewhere unexpected is visible;
+- when the origin is not such a URL, the run still starts and holds no push
+  credential. The admission screen says so (`Git credential: none; …`);
+- when the GitHub source yields no token (`gh` missing or signed out), the
+  run also starts with no push credential. The token is read after
+  admission, so the screen still shows the scope; the admission manifest's
+  `authority.credential_scopes` then lists no `github.com` entry, and a push
+  fails at the remote as unauthenticated;
+- GitHub Enterprise hosts are not derived; use the variables below;
+- the same scope identifies the repository for `github:read-private-issues`.
+
+To set the scope by hand instead, for another host or without a sources file,
+provide all three variables or none of them. They take priority over a derived
+scope:
 
 ~~~sh
 export KEEL_GIT_AUTHORIZATION='Basic ...'
@@ -974,7 +1113,14 @@ authorizations; the stored history remains evidence for inspection only.
 
 ### No model credential is set
 
-Configure ANTHROPIC_API_KEY or the Bedrock variables in section 3. Host Claude Code SSO is not currently consumed by Keel.
+Configure ANTHROPIC_API_KEY, the Bedrock variables, or a credential source in section 3. Host Claude Code SSO is not currently consumed by Keel.
+
+### Credential sources refused
+
+A run that prints `credential sources PATH refused` names the reason: the file
+or its directory is a link, is owned by another user, is writable by group or
+others (`chmod go-w` both), lies inside the workspace, or does not parse.
+`keel doctor` reports the same before a run does.
 
 ### V8 workloads require an existing workspace with an entry file
 
@@ -1074,7 +1220,9 @@ Start Docker Desktop on macOS, or the Docker service on Linux, and rerun keel se
 
 ### Git credential configuration is incomplete
 
-Set all three KEEL_GIT_* variables or unset all three.
+Set all three KEEL_GIT_* variables or unset all three. With a GitHub source in
+`~/.keel/sources.json` and none of the three set, the scope is derived from
+the workspace's origin.
 
 ### Terminal output contains literal escape sequences or diagonal spacing
 

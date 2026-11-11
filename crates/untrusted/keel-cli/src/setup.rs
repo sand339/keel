@@ -265,6 +265,16 @@ fn sha256_file(path: &Path) -> Result<String, CliError> {
 const REAPER_LABEL: &str = "dev.keel.reaper";
 
 /// Where the reaper's job definition lives on this platform.
+/// Whether a runtime configuration exists, for `keel init`.
+pub(crate) fn runtime_installed() -> bool {
+    matches!(runtime_config(), Ok(Some(_)))
+}
+
+/// Whether the crash-recovery job is installed, for `keel init`.
+pub(crate) fn reaper_installed() -> bool {
+    home_directory().is_ok_and(|home| reaper_files(&home).iter().all(|file| file.is_file()))
+}
+
 fn reaper_files(home: &Path) -> Vec<PathBuf> {
     if cfg!(target_os = "macos") {
         vec![home.join(format!("Library/LaunchAgents/{REAPER_LABEL}.plist"))]
@@ -967,6 +977,7 @@ fn github_authenticated() -> bool {
 /// ambiguous or incomplete: the trusted process takes the regional provider
 /// whenever its bearer token is set, and leaves a direct key unbound.
 fn check_model_credentials(report: &mut CheckReport) {
+    let stored = check_credential_sources(report);
     let anthropic = env::var_os("ANTHROPIC_API_KEY").is_some();
     let bearer = env::var_os("AWS_BEARER_TOKEN_BEDROCK").is_some();
     // A bearer token selects the regional provider on its own because the
@@ -995,11 +1006,13 @@ fn check_model_credentials(report: &mut CheckReport) {
         return;
     }
     if !bearer && !selected && chosen.as_deref() != Some("bedrock") {
-        report.optional(
-            anthropic,
-            "Anthropic credential is available",
-            "no model credential is set; live Claude requests will fail",
-        );
+        if anthropic || !stored {
+            report.optional(
+                anthropic,
+                "Anthropic credential is available",
+                "no model credential is set; live Claude requests will fail",
+            );
+        }
         return;
     }
     if env::var_os("AWS_REGION").is_none() {
@@ -1020,6 +1033,61 @@ otherwise takes the regional provider, leaving ANTHROPIC_API_KEY unbound; `--aut
 api-key|bedrock` settles it",
         );
     }
+}
+
+/// Reports the stored credential sources, by kind and never by running one:
+/// a source may prompt or reach the network, as a credential process may.
+/// Returns whether a stored source supplies a model credential.
+fn check_credential_sources(report: &mut CheckReport) -> bool {
+    let sources = match super::sources::inspect() {
+        Ok(sources) => sources,
+        Err(problem) => {
+            let path = super::sources::path().unwrap_or_default();
+            report.fail(&format!(
+                "credential sources {} will be refused by every run: {problem}",
+                path.display()
+            ));
+            return false;
+        }
+    };
+    let overridden = |variables: &[&str]| {
+        if variables.iter().any(|name| env::var_os(name).is_some()) {
+            "; the environment overrides it"
+        } else {
+            ""
+        }
+    };
+    for (name, provider) in &sources.providers {
+        let variables: &[&str] = match name.as_str() {
+            "api-key" => &["ANTHROPIC_API_KEY"],
+            "openrouter" => &["OPENROUTER_API_KEY"],
+            _ => &[
+                "AWS_BEARER_TOKEN_BEDROCK",
+                "KEEL_AWS_CREDENTIAL_PROCESS",
+                "AWS_ACCESS_KEY_ID",
+            ],
+        };
+        let default = if sources.default.as_deref() == Some(name) {
+            ", the default"
+        } else {
+            ""
+        };
+        report.ok(&format!(
+            "model credential source for `--auth {name}`{default}: {}{}",
+            provider.kind,
+            overridden(variables)
+        ));
+        if name == "bedrock" && provider.region.is_none() && env::var_os("AWS_REGION").is_none() {
+            report.warn("the stored bedrock source names no region and AWS_REGION is unset");
+        }
+    }
+    if let Some(kind) = &sources.github {
+        report.ok(&format!(
+            "GitHub credential source: {kind}{}",
+            overridden(&["GH_TOKEN", "GITHUB_TOKEN"])
+        ));
+    }
+    !sources.providers.is_empty()
 }
 
 /// Reports whether `SigV4` signing could resolve a credential for this run.
@@ -1060,7 +1128,13 @@ fn check_git_credentials(report: &mut CheckReport) {
     if configured.iter().all(|value| *value) {
         report.ok("Git push credential scope is complete");
     } else if configured.iter().all(|value| !*value) {
-        report.warn("Git push credential scope is unset; authenticated pushes are unavailable");
+        // With a stored GitHub source the trusted runtime derives the scope
+        // from each workspace's origin at admission.
+        report.optional(
+            super::sources::load().github.is_some(),
+            "Git push credential scope is derived from each workspace's origin (GitHub credential source)",
+            "Git push credential scope is unset; authenticated pushes are unavailable",
+        );
     } else {
         report.warn("set all three KEEL_GIT_* credential variables or unset all three");
     }

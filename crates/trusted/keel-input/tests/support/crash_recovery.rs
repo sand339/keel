@@ -16,13 +16,17 @@ use std::{
 
 const DEAD_PID: u32 = 999_999;
 
+/// Unique per call: the clock alone repeats when parallel tests ask within
+/// one tick, and two tests then create the same directory.
 fn nonce() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     format!(
-        "{:x}",
+        "{:x}-{}",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     )
 }
 

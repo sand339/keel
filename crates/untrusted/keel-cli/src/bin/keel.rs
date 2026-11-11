@@ -7,7 +7,7 @@ use keel_cli::{
     explicit_mux_workspace, fatigue_report, format_enforcement_report, format_floor_status, help,
     host_default_model, install, install_reaper, launch_runtime, load_floor_status, new_session_id,
     parse_args, persistent_runtime_operation, reconcile_crashed_sessions, record_accepted_policy,
-    remove_reaper, select_mux_launch, session_directory, session_enforcement_state,
+    remove_reaper, select_mux_launch, session_directory, session_enforcement_state, sources,
     start_persistent_runtime, validate_run_isolation, validate_v8_request_entry,
 };
 use keel_compile::{PolicyArtifact, load_policy_translation, translate_policy_with_claude};
@@ -56,6 +56,16 @@ fn run_export(
     Ok(ExitCode::SUCCESS)
 }
 
+fn print_doctor() -> ExitCode {
+    let report = doctor();
+    print!("{}", report.output);
+    if report.healthy {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     match parse_args(env::args_os().skip(1))? {
         Command::Setup { prebuilt } => {
@@ -73,14 +83,11 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             );
             Ok(ExitCode::SUCCESS)
         }
-        Command::Doctor => {
-            let report = doctor();
-            print!("{}", report.output);
-            Ok(if report.healthy {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            })
+        Command::Doctor => Ok(print_doctor()),
+        Command::Init(options) => {
+            let terminal = io::stdin().is_terminal() && io::stdout().is_terminal();
+            keel_cli::init::run(&options, terminal)?;
+            Ok(ExitCode::SUCCESS)
         }
         Command::Help => {
             print!("{}", help());
@@ -263,7 +270,7 @@ fn run_harness(mut request: keel_cli::RunRequest) -> Result<ExitCode, Box<dyn st
         }
         require_model_credential(request.auth.as_deref())?;
         if request.model.is_none() {
-            request.model = host_default_model();
+            request.model = host_default_model(request.auth.as_deref());
         }
     }
     if request.keep_alive {
@@ -343,7 +350,7 @@ fn run_mux_manager(
     selected.auth.clone_from(&template.auth);
     require_model_credential(template.auth.as_deref())?;
     if template.model.is_none() {
-        template.model = host_default_model();
+        template.model = host_default_model(template.auth.as_deref());
     }
     selected.model.clone_from(&template.model);
     let first = start_mux_tab(runtime, &selected, &workspace, Some(&template.session_id))?;
@@ -779,7 +786,8 @@ fn require_model_credential(auth: Option<&str>) -> Result<(), Box<dyn std::error
                 || env::var("KEEL_MODEL_PROVIDER").as_deref() == Ok("bedrock")
         }
     };
-    if configured {
+    let stored = sources::checked()?;
+    if configured || auth.is_some_and(|auth| stored.providers.contains_key(auth)) {
         return Ok(());
     }
     Err(format!(
@@ -804,6 +812,10 @@ fn choose_model_auth() -> Result<Option<String>, Box<dyn std::error::Error>> {
     let bedrock = env::var_os("AWS_BEARER_TOKEN_BEDROCK").is_some()
         || env::var("KEEL_MODEL_PROVIDER").as_deref() == Ok("bedrock")
         || env::var_os("KEEL_AWS_CREDENTIAL_PROCESS").is_some();
+    if !(api_key || bedrock) {
+        // The environment names no provider, so the stored sources do.
+        return Ok(sources::checked()?.choose(io::stdin().is_terminal())?);
+    }
     if !(api_key && bedrock && io::stdin().is_terminal()) {
         return Ok(None);
     }
