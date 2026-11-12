@@ -632,7 +632,7 @@ pub fn record_guest_events(fd: OwnedFd) -> Result<(), RelayError> {
 ///
 /// Returns an error when the terminal stream fails.
 pub fn relay_terminal(fd: OwnedFd) -> io::Result<()> {
-    let mut output = UnixStream::from(fd);
+    let output = UnixStream::from(fd);
     output.set_nonblocking(false)?;
     let mut input = output.try_clone()?;
     thread::Builder::new()
@@ -644,13 +644,27 @@ pub fn relay_terminal(fd: OwnedFd) -> io::Result<()> {
                 eprintln!("keel-vm: terminal input ended: {error}");
             }
         })?;
-    // Guest terminal frames carry few newlines, so `io::copy` into the
-    // line-buffered standard output would strand a partial frame until the
-    // guest exits. Each read is flushed onward as soon as it arrives.
-    let mut display = io::stdout().lock();
+    display_until_closed(output, io::stdout().lock())
+}
+
+/// Copies guest terminal frames to the display until the guest closes the
+/// stream.
+///
+/// Guest terminal frames carry few newlines, so `io::copy` into the
+/// line-buffered standard output would strand a partial frame until the
+/// guest exits. Each read is flushed onward as soon as it arrives.
+fn display_until_closed(mut guest: impl io::Read, mut display: impl io::Write) -> io::Result<()> {
     let mut frame = [0_u8; 16 * 1024];
     loop {
-        let count = output.read(&mut frame)?;
+        let count = match guest.read(&mut frame) {
+            Ok(count) => count,
+            // A guest that powers off with its terminal still open resets
+            // the stream rather than closing it. The session is over either
+            // way, and the backend's own exit status says how it ended; a
+            // reset here must not turn a clean run into a failed one.
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => 0,
+            Err(error) => return Err(error),
+        };
         if count == 0 {
             return display.flush();
         }
@@ -795,8 +809,8 @@ pub fn initialize_git_service(workspace: Option<&Path>) -> Result<GitServiceRunt
 #[cfg(test)]
 mod tests {
     use super::{
-        LaunchArguments, github_request_uses_credential, parse_github_issue, parse_github_response,
-        parse_launch_arguments, run_egress, run_egress_with_kernel, run_git,
+        LaunchArguments, display_until_closed, github_request_uses_credential, parse_github_issue,
+        parse_github_response, parse_launch_arguments, run_egress, run_egress_with_kernel, run_git,
         validate_github_repository,
     };
     use keel_kernel::KernelBroker;
@@ -809,6 +823,49 @@ mod tests {
         thread,
         time::Duration,
     };
+
+    /// A guest that powers off with its terminal open resets the stream. That
+    /// ends the session like a close does; any other failure is still one.
+    #[test]
+    fn a_reset_terminal_stream_ends_the_session_cleanly() {
+        struct Frames(Vec<std::io::Result<Vec<u8>>>);
+        impl std::io::Read for Frames {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                match self.0.remove(0) {
+                    Ok(frame) => {
+                        buffer[..frame.len()].copy_from_slice(&frame);
+                        Ok(frame.len())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        }
+        let reset = || Err(std::io::ErrorKind::ConnectionReset.into());
+        let mut shown = Vec::new();
+        display_until_closed(
+            Frames(vec![Ok(b"last frame".to_vec()), reset()]),
+            &mut shown,
+        )
+        .unwrap();
+        assert_eq!(shown, b"last frame");
+
+        let mut shown = Vec::new();
+        display_until_closed(
+            Frames(vec![Ok(b"closed".to_vec()), Ok(Vec::new())]),
+            &mut shown,
+        )
+        .unwrap();
+        assert_eq!(shown, b"closed");
+
+        let failed = display_until_closed(
+            Frames(vec![Err(std::io::ErrorKind::PermissionDenied.into())]),
+            Vec::new(),
+        );
+        assert_eq!(
+            failed.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
 
     #[test]
     fn launch_arguments_default_to_two_cpus_and_accept_an_override() {

@@ -11,6 +11,9 @@ use super::{
     sigv4_signature, sigv4_timestamps, terminate_http_once,
 };
 use keel_audit::{AuditPayload, AuditWriter, RunKey};
+
+#[path = "fuzz.rs"]
+mod fuzz;
 use keel_kernel::EgressRequestAuthorizer;
 use rustls::{
     ClientConfig, ClientConnection, RootCertStore, ServerConnection, StreamOwned,
@@ -874,6 +877,89 @@ fn plain_http_never_writes_a_credential_upstream() {
     .unwrap_err();
     assert!(error.to_string().contains("sentinel"), "{error}");
     assert!(upstream.join().unwrap().is_empty());
+}
+
+/// A request the credential layer refuses after authorization is reported to
+/// the kernel as unsent; one that goes out is not.
+#[test]
+fn a_request_refused_after_authorization_is_reported_unsent() {
+    struct Recorder {
+        unsent: usize,
+    }
+    impl EgressRequestAuthorizer for Recorder {
+        fn authorize(
+            &mut self,
+            _method: &str,
+            _path: &str,
+            _body_digest: [u8; 32],
+            _model_budget: Option<ModelBudgetRequest>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn record_unsent(&mut self) {
+            self.unsent += 1;
+        }
+        fn record_response(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    let run = |request: String| {
+        let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream = thread::spawn(move || {
+            let (mut stream, _) = upstream_listener.accept().unwrap();
+            let mut received = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            if let Ok(count) = stream.read(&mut buffer) {
+                received.extend_from_slice(&buffer[..count]);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            }
+            received
+        });
+        let (mut client, guest) = UnixStream::pair().unwrap();
+        let target = ConnectionTarget {
+            server_name: "example.com".to_owned(),
+            resolved_ip: Ipv4Addr::new(93, 184, 216, 34).into(),
+            port: 80,
+        };
+        let destination = EgressDestination {
+            server_name: target.server_name.clone(),
+            port: target.port,
+        };
+        client.write_all(request.as_bytes()).unwrap();
+        let mut recorder = Recorder { unsent: 0 };
+        let outcome =
+            proxy_plain_http_once(guest, &destination, &git_vault(), &mut recorder, || {
+                Ok((TcpStream::connect(upstream_address).unwrap(), target))
+            });
+        (outcome.is_ok(), recorder.unsent, upstream.join().unwrap())
+    };
+
+    let (sent, unsent, received) = run("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".to_owned());
+    assert!(sent);
+    assert_eq!(unsent, 0);
+    assert!(received.starts_with(b"GET / HTTP/1.1"));
+
+    for request in [
+        format!(
+            "GET / HTTP/1.1\r\nx-api-key: {}\r\n\r\n",
+            SystemEgressConnector::MODEL_SENTINEL
+        ),
+        format!(
+            "POST / HTTP/1.1\r\nContent-Length: 41\r\n\r\nkey={}",
+            SystemEgressConnector::MODEL_SENTINEL
+        ),
+    ] {
+        let (sent, unsent, received) = run(request);
+        assert!(!sent);
+        assert_eq!(unsent, 1, "the refusal was not reported");
+        assert!(
+            received.is_empty(),
+            "a refused request reached the upstream"
+        );
+    }
 }
 
 #[test]
@@ -2332,4 +2418,40 @@ fn refreshed_aws_credentials_join_the_redactor() {
     for secret in ["refreshed-secret", "refreshed-token", "initial-secret"] {
         assert_eq!(redactor.redact(secret), "[REDACTED]", "{secret}");
     }
+}
+
+/// Found by the randomized tests (D103): a bare LF made an empty line, so the
+/// upstream saw the authorized request end there and a second request, with a
+/// method and path the kernel never saw, begin.
+#[test]
+fn a_bare_line_feed_cannot_smuggle_a_second_request() {
+    let target = ConnectionTarget {
+        server_name: "packages.example".to_owned(),
+        resolved_ip: std::net::Ipv4Addr::new(93, 184, 216, 34).into(),
+        port: 443,
+    };
+    for request in [
+        "GET /allowed HTTP/1.1\r\n\nPOST /forbidden HTTP/1.1\r\nX: y\r\n\r\n",
+        "GET /allowed HTTP/1.1\r\nX: y\nHost: other.example\r\n\r\n",
+        "GET /allowed HTTP/1.1\r\nX: y\rTransfer-Encoding: chunked\r\n\r\n",
+        "GET /allowed HTTP/1.1\r\nContent-Length : 7\r\n\r\n",
+        "GET /allowed HTTP/1.1\r\nTransfer-Encoding\t: chunked\r\n\r\n",
+        "GET /allowed HTTP/1.1\r\n Host: other.example\r\n\r\n",
+        "GET /allowed HTTP/1.1\r\nno-colon\r\n\r\n",
+    ] {
+        assert!(
+            crate::rebuild_http_request(request.as_bytes(), b"", &target, false).is_err(),
+            "{request:?} was rebuilt"
+        );
+    }
+    let rebuilt = crate::rebuild_http_request(
+        b"GET /allowed HTTP/1.1\r\nAccept: */*\r\nX-Tab: a\tb\r\n\r\n",
+        b"",
+        &target,
+        false,
+    )
+    .unwrap();
+    assert!(rebuilt.starts_with(
+        b"GET /allowed HTTP/1.1\r\nAccept: */*\r\nX-Tab: a\tb\r\nHost: packages.example\r\n"
+    ));
 }

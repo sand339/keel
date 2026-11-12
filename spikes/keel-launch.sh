@@ -5,6 +5,18 @@ if [ "${1:-}" = "keel-harness" ]; then
     shift
 fi
 
+# Build tools reach registries through Keel's proxy, so they must trust the
+# run CA. npm (Node), pip, and cargo do not all read the system bundle that
+# SSL_CERT_FILE names.
+trust_run_ca() {
+    if [ -r "${SSL_CERT_FILE:-}" ]; then
+        export NODE_EXTRA_CA_CERTS="$SSL_CERT_FILE"
+        export PIP_CERT="$SSL_CERT_FILE"
+        export REQUESTS_CA_BUNDLE="$SSL_CERT_FILE"
+        export CARGO_HTTP_CAINFO="$SSL_CERT_FILE"
+    fi
+}
+
 case "${KEEL_REQUESTED_HARNESS:-}" in
     claude)
         # The launch script the host writes exports the regional provider's
@@ -27,15 +39,7 @@ case "${KEEL_REQUESTED_HARNESS:-}" in
             certutil -N --empty-password -d "sql:$HOME/.pki/nssdb"
             certutil -A -d "sql:$HOME/.pki/nssdb" -n keel-run-ca -t "C,," -i "$SSL_CERT_FILE"
         fi
-        # Build tools reach registries through Keel's proxy, so they must
-        # trust the run CA. npm (Node), pip, and cargo do not all read the
-        # system bundle that SSL_CERT_FILE names.
-        if [ -r "${SSL_CERT_FILE:-}" ]; then
-            export NODE_EXTRA_CA_CERTS="$SSL_CERT_FILE"
-            export PIP_CERT="$SSL_CERT_FILE"
-            export REQUESTS_CA_BUNDLE="$SSL_CERT_FILE"
-            export CARGO_HTTP_CAINFO="$SSL_CERT_FILE"
-        fi
+        trust_run_ca
         # agent-browser, for the agent's MCP tools and the analyst's CLI,
         # shares one browser through its daemon. WebMCP stays off: it would
         # surface tools defined by the untrusted page.
@@ -65,6 +69,14 @@ case "${KEEL_REQUESTED_HARNESS:-}" in
             --allow-fs-write=/workspace \
             --import=/usr/local/lib/keel/v8-sdk.mjs \
             "$@"
+        ;;
+    shell)
+        # A shell script, or with no argument an interactive shell, as the
+        # workload. It has the confinement and the brokered channels of any
+        # harness and calls no model. It is also the attacker the security
+        # evaluation runs: a script with everything a compromised agent has.
+        trust_run_ca
+        exec /bin/bash "$@"
         ;;
     *)
         echo "unsupported guest harness: ${KEEL_REQUESTED_HARNESS:-unset}" >&2

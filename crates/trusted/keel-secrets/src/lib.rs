@@ -4279,6 +4279,8 @@ fn release_authorized_unsent(
     model: bool,
     error: TlsError,
 ) -> TlsError {
+    // The kernel recorded this request as executed when it authorized it.
+    authorizer.record_unsent();
     if model {
         release_definitely_unsent(authorizer, error)
     } else {
@@ -4298,15 +4300,27 @@ fn rebuild_http_request(
         .ok_or_else(|| TlsError("HTTP headers are incomplete".to_owned()))?;
     let headers = std::str::from_utf8(&request[..header_end])
         .map_err(|error| TlsError::new("HTTP headers", error))?;
-    let mut lines = headers.lines();
+    // Only CRLF ends a line here. A bare CR or LF, an empty line, or a name
+    // that is not a token would let the upstream see a different set of
+    // headers, or a second request, than the one the kernel authorized.
+    let mut lines = headers.split("\r\n");
     let request_line = lines
         .next()
-        .ok_or_else(|| TlsError("HTTP request line is missing".to_owned()))?;
+        .filter(|line| !line.chars().any(|character| character.is_ascii_control()))
+        .ok_or_else(|| TlsError("HTTP request line is malformed".to_owned()))?;
     let mut output = Vec::with_capacity(request.len() + 19);
     output.extend_from_slice(request_line.as_bytes());
     output.extend_from_slice(b"\r\n");
     for line in lines {
-        let name = line.split_once(':').map_or(line, |(name, _)| name);
+        let name = line
+            .split_once(':')
+            .filter(|(name, value)| {
+                !name.is_empty()
+                    && name.bytes().all(is_header_token)
+                    && !value.chars().any(|c| c.is_ascii_control() && c != '\t')
+            })
+            .map(|(name, _)| name)
+            .ok_or_else(|| TlsError("HTTP header line is malformed".to_owned()))?;
         if name.eq_ignore_ascii_case("host")
             || name.eq_ignore_ascii_case("content-length")
             || name.eq_ignore_ascii_case("connection")
@@ -4340,6 +4354,10 @@ fn rebuild_http_request(
     .map_err(|error| TlsError::new("HTTP request rebuild", error))?;
     output.extend_from_slice(body);
     Ok(output)
+}
+
+fn is_header_token(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
 fn read_http_request(stream: &mut impl std::io::Read) -> Result<Vec<u8>, TlsError> {

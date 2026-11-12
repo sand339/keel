@@ -8,15 +8,15 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-keel-audit = { version = "=0.1.0", path = "../../trusted/keel-audit" }
-keel-compile = { version = "=0.1.0", path = "../keel-compile" }
-keel-provenance = { version = "=0.1.0", path = "../../trusted/keel-provenance" }
+keel-audit = { version = "=0.1.1", path = "../../trusted/keel-audit" }
+keel-compile = { version = "=0.1.1", path = "../keel-compile" }
+keel-provenance = { version = "=0.1.1", path = "../../trusted/keel-provenance" }
 ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-keel-input = { version = "=0.1.0", path = "../../trusted/keel-input" }
+keel-input = { version = "=0.1.1", path = "../../trusted/keel-input" }
 
 [lints]
 workspace = true

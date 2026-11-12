@@ -93,7 +93,7 @@ Keel is designed so that:
 
 These are design and implementation objectives under the assumptions above. They are not claims against a compromised host or trusted computing base.
 
-The [control map](#6-control-map) links each control to its tests. Objective 9 is checked mechanically by invariants I1 to I4 in [`ci/check_invariants.py`](../ci/check_invariants.py): per-crate trusted line ratchets, `forbid(unsafe_code)`, the trusted-to-untrusted dependency direction, and the per-crate dependency allowlist in [`trusted-dependencies.toml`](../ci/trusted-dependencies.toml).
+The [control map](#6-control-map) links each control to its tests. Objective 9 is checked mechanically by invariants I1 to I4 in [`ci/check_invariants.py`](../ci/check_invariants.py): per-crate trusted line ratchets under a hard 30,000-line ceiling, `forbid(unsafe_code)`, the trusted-to-untrusted dependency direction, and the per-crate dependency allowlist in [`trusted-dependencies.toml`](../ci/trusted-dependencies.toml).
 
 ## 6. Control map
 

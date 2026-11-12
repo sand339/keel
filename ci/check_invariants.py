@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check the Phase 1 trust-boundary invariants I1-I12."""
+"""Check the Phase 1 trust-boundary invariants I1-I13."""
 
 from __future__ import annotations
 
@@ -15,12 +15,18 @@ import tomllib
 ROOT = Path(__file__).resolve().parent.parent
 TRUSTED_ROOT = ROOT / "crates" / "trusted"
 UNTRUSTED_ROOT = ROOT / "crates" / "untrusted"
+# The hard ceiling on first-party trusted LOC across all trusted crates (D98).
+# CI fails when the trusted crates total more than this, and when the
+# per-crate ratchets below sum to more than this, so no ratchet can be raised
+# past it. It is a backstop, not an allocation: there is no reserve to
+# account for, and the ratchets are what a change meets first. D65 had
+# retired an earlier 16,000-line ceiling; this one is set where it does not
+# move with each feature.
+TRUSTED_TOTAL_BUDGET = 30_000
 # Per-crate ratchets on first-party trusted LOC. A change that grows a trusted
 # crate past its number fails CI until the number is raised here, with a
-# one-line reason in the commit. The total is reported, not capped: D65 retired
-# the 16,000-line aggregate ceiling and its reserve accounting, because lines
-# are a review-cost signal rather than a security property. The comments below
-# are the allocation history up to D64.
+# one-line reason in the commit. The comments below are the allocation
+# history up to D64.
 CRATE_BUDGETS = {
     # D15 moved 200 lines here from keel-provenance for the enforcement-state
     # record. Provenance's budget was sized for the vertex-fork comparison that
@@ -67,7 +73,13 @@ CRATE_BUDGETS = {
     # KSR-042: the gate's protected view is derived from the pushed objects;
     # KSR-057: established bridges are bounded apart from connections being
     # decided, and a request frame has an overall deadline.
-    "keel-kernel": 6_167,
+    # D97: a request the trusted proxy refuses after authorization is
+    # reported unsent on its own action.
+    # D100: structural rejections are forwarded through the broker's audit
+    # wrapper, and a refusal past the loop limit is recorded.
+    # D102: every line of an action on the trusted screen is bounded, and the
+    # line beside the prompt leads with what Keel derived.
+    "keel-kernel": 6_216,
     # D22, D23, D25, and D28 moved 211 unclaimed lines from this evaluator-only
     # crate.
     # D31: immutable built-in restrictions beneath accepted policy.
@@ -154,7 +166,8 @@ CRATE_BUDGETS = {
     # repository scope derived at admission, or nothing when there is no token.
     # A plain-HTTP proxy request's absolute target is taken only for the
     # authorized host and rewritten to origin form (KSR-047 had refused it).
-    "keel-secrets": 3_997,
+    # D97: the refusal of an authorized request is reported to the kernel.
+    "keel-secrets": 4_015,
     # D20 added 100 from keel-provenance for the display seam tracker: the trusted
     # terminal owner has to know where a sequence or character ends before it
     # writes a notice into the guest's stream or resumes one after a takeover.
@@ -332,6 +345,31 @@ def tokei_line_count(crate: Path) -> int:
     return int(report["Total"]["code"])
 
 
+def loc_violations(counts: dict[str, int], budgets: dict[str, int], ceiling: int) -> list[str]:
+    """Every way the measured trusted line counts break the budget: a crate
+    over its ratchet, the total over the ceiling, or ratchets that together
+    would permit a total over the ceiling."""
+    violations = [
+        f"I1: {name} has {actual} first-party LOC; its ratchet is {budgets[name]}. "
+        "Raise it in ci/check_invariants.py and give the reason in the commit."
+        for name, actual in counts.items()
+        if actual > budgets[name]
+    ]
+    total = sum(counts.values())
+    if total > ceiling:
+        violations.append(
+            f"I1: the trusted crates total {total} first-party LOC; the ceiling is {ceiling}. "
+            "Move code out of the trusted crates; the ceiling moves only by a recorded decision."
+        )
+    allowed = sum(budgets.values())
+    if allowed > ceiling:
+        violations.append(
+            f"I1: the per-crate ratchets sum to {allowed}, above the ceiling of {ceiling}; "
+            "a ratchet cannot be raised past it."
+        )
+    return violations
+
+
 def check_loc() -> None:
     # One counter everywhere. An approximate local fallback is worse than no local
     # check: it disagrees with CI at the margin, so it fails on crates that are
@@ -341,26 +379,21 @@ def check_loc() -> None:
             "I1: tokei is required to count first-party LOC. "
             "Install the pinned version with: cargo install tokei --version 15.0.0"
         )
-    violations = []
-    total = 0
-    for name, budget in CRATE_BUDGETS.items():
-        actual = tokei_line_count(TRUSTED_ROOT / name)
-        total += actual
+    counts = {name: tokei_line_count(TRUSTED_ROOT / name) for name in CRATE_BUDGETS}
+    for name, actual in counts.items():
+        budget = CRATE_BUDGETS[name]
         over = "" if actual <= budget else f"  OVER by {actual - budget}"
-        if actual > budget:
-            violations.append(
-                f"I1: {name} has {actual} first-party LOC; its ratchet is {budget}. "
-                "Raise it in ci/check_invariants.py and give the reason in the commit."
-            )
         print(f"I1: {name}: {actual}/{budget} LOC{over}")
     # Report every violation. Exiting on the first one hides the rest, which is how
     # a second crate stayed over budget unnoticed for fourteen commits.
+    violations = loc_violations(counts, CRATE_BUDGETS, TRUSTED_TOTAL_BUDGET)
     if violations:
         for violation in violations:
             print(f"error: {violation}", file=sys.stderr)
         raise SystemExit(1)
+    total = sum(counts.values())
     print(
-        f"I1: trusted total: {total} first-party LOC "
+        f"I1: trusted total: {total}/{TRUSTED_TOTAL_BUDGET} first-party LOC "
         f"(ratchets sum to {sum(CRATE_BUDGETS.values())}; tokei)"
     )
 
@@ -650,6 +683,25 @@ def check_git_invocations() -> None:
     print("I12: production Git invocations use hardened, non-interactive configuration")
 
 
+def check_audit_forwarding() -> None:
+    """The broker wraps its audit sink to count events. A record the wrapper
+    does not forward falls to the trait's default, which discards it: the
+    structural rejections were lost that way until D100."""
+    source = (TRUSTED_ROOT / "keel-kernel" / "src" / "lib.rs").read_text(encoding="utf-8")
+
+    def methods(header: str) -> set[str]:
+        start = source.index(header)
+        return set(re.findall(r"\n    fn (\w+)\(", source[start : source.index("\n}\n", start)]))
+
+    declared = methods("pub trait AuditSink")
+    forwarded = methods("impl AuditSink for CountingAudit")
+    # `is_durable` describes the sink rather than recording anything.
+    dropped = sorted(declared - forwarded - {"is_durable"})
+    if not declared or dropped:
+        fail(f"I13: the broker's audit wrapper does not forward {dropped}")
+    print("I13: the broker's audit wrapper forwards every audit record")
+
+
 def main() -> None:
     check_loc()
     check_forbid_unsafe()
@@ -663,7 +715,8 @@ def main() -> None:
     check_policy_artifact()
     check_structural_invariants()
     check_git_invocations()
-    print("Phase 1 invariants I1-I12: PASS")
+    check_audit_forwarding()
+    print("Phase 1 invariants I1-I13: PASS")
 
 
 if __name__ == "__main__":

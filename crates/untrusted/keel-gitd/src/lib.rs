@@ -29,11 +29,27 @@ const MAX_HTTP_HEADERS: usize = 64 * 1024;
 const MAX_HTTP_BODY: usize = 900 * 1024;
 const REMOTE_TEXT_LIMIT: usize = 240;
 
+/// The search path Git's own children are given. Git runs its helpers by
+/// name: `http-backend` runs `git receive-pack`. On macOS `/usr/bin/git` is
+/// an `xcrun` shim that the runtime sandbox refuses to execute, so the
+/// directory of the Git this relay was handed comes first and a helper
+/// resolves to that same binary.
+fn git_search_path(git: &std::ffi::OsStr) -> std::ffi::OsString {
+    let mut path = std::ffi::OsString::new();
+    if let Some(directory) = Path::new(git).parent().filter(|path| path.is_absolute()) {
+        path.push(directory);
+        path.push(":");
+    }
+    path.push("/usr/bin:/bin");
+    path
+}
+
 fn git_command() -> Command {
-    let mut command = Command::new(env::var_os("KEEL_GIT").unwrap_or_else(|| "git".into()));
+    let git = env::var_os("KEEL_GIT").unwrap_or_else(|| "git".into());
+    let mut command = Command::new(&git);
     command
         .env_clear()
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", git_search_path(&git))
         .env("LC_ALL", "C")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -725,6 +741,10 @@ impl GitHttpService {
             Ok(response) => response,
             Err(GitdError::Denied) => http_error("403 Forbidden", b"Keel denied this Git push.\n"),
             Err(error) => {
+                // Git shows the guest only the status, so the reason is said
+                // here, on the backend's own output, where the operator can
+                // read it. Debug formatting keeps control bytes out.
+                eprintln!("keel-vm: Git relay failed: {:?}", error.to_string());
                 let body = format!("Keel Git relay failed: {error}\n");
                 http_error("502 Bad Gateway", body.as_bytes())
             }
@@ -840,8 +860,16 @@ impl PushForwarder for GitPushForwarder<'_> {
             .collect::<Vec<_>>();
         let response = upstream.forward_receive_pack(self.request, body)?;
         let rejection = assess_remote_receive_pack(&response, &expected_refs).err();
-        if rejection.is_none() {
-            self.service.run_backend(self.request, body)?;
+        // The remote has taken the push; the mirror is a local convenience.
+        // Failing here would tell the guest, and the audit, that an accepted
+        // push failed, so a mirror that cannot follow is only reported.
+        if rejection.is_none()
+            && let Err(error) = self.service.run_backend(self.request, body)
+        {
+            eprintln!(
+                "keel-vm: the remote accepted the push, but the local mirror was not updated: {:?}",
+                error.to_string()
+            );
         }
         Ok(Forwarded {
             response,
@@ -1704,6 +1732,30 @@ mod tests {
         let mut packet = format!("{:04x}", payload.len() + 4).into_bytes();
         packet.extend_from_slice(payload);
         packet
+    }
+
+    /// Git's helpers resolve to the Git this relay was handed, not to
+    /// whatever `git` is first on a system path: on macOS that is an `xcrun`
+    /// shim the runtime sandbox refuses, which made `http-backend` unable to
+    /// run `receive-pack` after the remote had accepted a push.
+    #[test]
+    fn git_helpers_resolve_to_the_git_the_relay_was_given() {
+        use std::ffi::OsStr;
+        assert_eq!(
+            super::git_search_path(OsStr::new(
+                "/Library/Developer/CommandLineTools/usr/bin/git"
+            )),
+            OsStr::new("/Library/Developer/CommandLineTools/usr/bin:/usr/bin:/bin")
+        );
+        assert_eq!(
+            super::git_search_path(OsStr::new("/usr/bin/git")),
+            OsStr::new("/usr/bin:/usr/bin:/bin")
+        );
+        // A bare name names no directory to prefer.
+        assert_eq!(
+            super::git_search_path(OsStr::new("git")),
+            OsStr::new("/usr/bin:/bin")
+        );
     }
 
     #[test]

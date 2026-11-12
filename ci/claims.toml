@@ -1,0 +1,293 @@
+# The claims ledger: what Keel claims, and the tests that are its evidence.
+#
+# One or more claims per security objective in docs/THREAT-MODEL.md §5. Each
+# names tests of both kinds:
+#
+#   positive  the permitted thing works;
+#   negative  the forbidden thing fails, and fails closed.
+#
+# A claim with only negative tests is satisfied by a system that does
+# nothing. A side with no test carries `waiver_positive` or `waiver_negative`
+# saying why: that is a known gap, printed on every run of
+# ci/check_claims.py, and the goal is none.
+#
+# References: test:NAME (a Rust #[test]), file:PATH (a Rust test file),
+# e2e:CASE, faults:CASE, eval:CASE, invariant:In, script:PATH (a check
+# script ci/phase0.sh runs).
+#
+# `environment` says where the evidence was produced. `limit` is what the
+# claim does not cover; it is part of the claim. `gaps` lists where the
+# evidence is weaker than the statement: a known defect, or a claim only
+# partly tested. Each is printed with the waivers.
+
+# --- Objective 1: credentials ---------------------------------------------
+
+[[claim]]
+id = "O1-credential-custody"
+objective = 1
+statement = "A workload cannot obtain a real service credential through the normal execution path: it holds a sentinel, and the trusted proxy applies the credential only on its exact host, method, and path."
+limit = "A compromised host or trusted credential path holds the credential. A credential the operator's own command prints to the terminal is not covered."
+environment = ["macos-aarch64", "linux-x86_64"]
+positive = [
+    "e2e:claude-reply",
+    "e2e:credential-sources",
+    "test:sentinel_swap_binds_to_connection_method_and_path",
+]
+negative = [
+    "eval:credential-scan",
+    "eval:sentinel-misuse",
+    "eval:confinement",
+    "test:runtime_artifacts_exclude_real_and_sentinel_credentials",
+    "test:plain_http_never_writes_a_credential_upstream",
+    "file:crates/trusted/keel-secrets/tests/support/credential_scope.rs",
+    "invariant:I7",
+]
+
+[[claim]]
+id = "O1-credential-sources"
+objective = 1
+statement = "A stored credential source is read only from a file the operator owns, outside the workspace, and only for the provider a run selected."
+limit = "Someone who can write the operator's ~/.keel can redirect a source. A stored command that opens /dev/tty itself can still prompt."
+environment = ["macos-aarch64", "linux-x86_64"]
+positive = [
+    "e2e:credential-sources",
+    "test:a_private_sources_file_outside_the_workspace_is_read",
+    "test:a_process_source_prints_the_credential",
+]
+negative = [
+    "test:a_sources_file_others_can_write_is_refused",
+    "test:a_sources_file_inside_the_workspace_is_refused",
+    "test:a_linked_sources_file_is_refused",
+    "test:a_stored_command_sees_a_fixed_path_and_no_terminal_hint",
+    "test:every_other_origin_is_refused_with_the_manual_path",
+]
+
+# --- Objective 2: no ordinary network path --------------------------------
+
+[[claim]]
+id = "O2-brokered-egress"
+objective = 2
+statement = "A microVM workload has no ordinary guest NIC or DNS path: every byte leaves through a brokered relay, and link-local, loopback, and private destinations are refused before policy."
+limit = "A hypervisor or host-kernel compromise is out of scope. The host V8 profile is a host process, not a VM."
+environment = ["macos-aarch64", "linux-x86_64"]
+positive = ["e2e:v8-fetch", "e2e:npm-ci-pinned"]
+negative = [
+    "eval:network-escape",
+    "test:hostile_curl_requests_cross_the_runtime_and_fail_closed",
+    "test:structural_network_ranges_are_denied_before_policy",
+    "test:a_forbidden_ipv4_address_is_forbidden_in_every_ipv6_form",
+    "test:a_parsed_destination_is_always_a_plain_dns_name",
+]
+
+# --- Objective 3: typed decisions -----------------------------------------
+
+[[claim]]
+id = "O3-typed-action"
+objective = 3
+statement = "A protected action is decided from a typed action the trusted side reconstructs, not from a boolean or string the workload asserts."
+limit = "Trusted parsers and reconstruction must be correct; their bugs are trusted-code defects."
+environment = ["macos-aarch64", "linux-x86_64"]
+positive = [
+    "test:terminal_gate_renders_the_kernel_action_and_returns_operator_approval",
+    "e2e:workspace-own",
+]
+negative = [
+    "test:forged_principal_never_reaches_credentials_or_execution",
+    "test:harmless_class_cannot_disguise_a_network_target",
+    "test:malformed_broker_request_fails_before_kernel_processing",
+    "test:a_bare_line_feed_cannot_smuggle_a_second_request",
+    "test:a_rebuilt_request_names_only_the_connected_host",
+    "test:a_request_target_is_always_reduced_to_a_path_on_the_authorized_host",
+    "test:receive_pack_commands_survive_malformed_requests",
+    "invariant:I5",
+    "invariant:I11",
+]
+
+[[claim]]
+id = "O3-policy-artifact"
+objective = 3
+statement = "A natural-language policy becomes authority only as a hash-bound artifact that passed differential verification and explicit acceptance."
+limit = "Agreement between representations does not prove the original sentence was unambiguous."
+environment = ["macos-aarch64", "linux-x86_64"]
+positive = [
+    "test:draft_is_differentially_verified_and_hash_bound",
+    "test:every_condition_variant_passes_differential_verification",
+]
+negative = [
+    "test:tampering_invalidates_artifact",
+    "test:dangerous_or_broad_language_blocks_acceptance",
+    "invariant:I6",
+    "invariant:I10",
+]
+
+# --- Objective 4: structural refusals -------------------------------------
+
+[[claim]]
+id = "O4-structural-refusal"
+objective = 4
+statement = "A structurally forbidden action is refused before policy or approval is consulted, and a refused request causes no DNS lookup or connection."
+limit = "Trusted HTTP and TLS parsing remains in the trusted computing base."
+environment = ["macos-aarch64", "linux-x86_64"]
+positive = ["e2e:v8-fetch", "test:a_plain_http_proxy_request_is_forwarded_in_origin_form"]
+negative = [
+    "eval:network-escape",
+    "eval:destination-confusion",
+    "test:structural_network_ranges_are_denied_before_policy",
+    "test:denied_tls_request_does_not_resolve_or_connect",
+    "test:system_connector_defers_dns_but_rejects_forbidden_results_before_connect",
+    "e2e:refusals",
+]
+
+# --- Objective 5: policy, provenance, budgets, approval --------------------
+
+[[claim]]
+id = "O5-provenance"
+objective = 5
+statement = "Provenance constrains authority: an action that depends on untrusted input meets the floor, writes inherit the labels of what they read, and a push from workspace code reaches the gate."
+limit = "Provenance is coarse and depends on correct labeling. Lawful output to an allowed destination can still reveal information. The process origin is the guest's claim and can only add a gate."
+environment = ["macos-aarch64", "linux-x86_64"]
+positive = [
+    "e2e:workspace-own",
+    "e2e:extract-url",
+    "file:crates/trusted/keel-policy/tests/primary_scenario.rs",
+]
+negative = [
+    "eval:provenance-floor",
+    "file:crates/trusted/keel-kernel/tests/provenance_gate.rs",
+    "file:crates/trusted/keel-kernel/tests/push_provenance.rs",
+    "file:crates/trusted/keel-provenance/tests/write_inheritance.rs",
+    "file:crates/trusted/keel-provenance/tests/persistence.rs",
+    "test:a_pull_request_carries_the_guest_origin_of_its_mcp_connection",
+    "test:a_push_reported_from_workspace_code_reaches_the_gate",
+]
+
+[[claim]]
+id = "O5-budgets"
+objective = 5
+statement = "Request, cost, rate, and loop limits bound a run, exhaustion cannot be approved away, and an ambiguous model send is charged conservatively."
+limit = "Availability is not a full security guarantee; a conservative charge can exhaust a budget without a usable response."
+environment = ["macos-aarch64", "linux-x86_64"]
+positive = [
+    "e2e:claude-reply",
+    "file:crates/trusted/keel-secrets/tests/support/model_lifecycle.rs",
+]
+negative = [
+    "eval:loop-and-exhaustion",
+    "test:repeated_action_loop_is_stopped_before_injection",
+    "test:budget_exhaustion_is_not_gate_overridable",
+    "test:uncertain_send_keeps_the_conservative_charge",
+    "file:crates/trusted/keel-kernel/tests/model_budget.rs",
+]
+
+[[claim]]
+id = "O5-scoped-run"
+objective = 5
+statement = "A scoped run reaches only the hosts its operator-declared scope names and refuses everything else without a prompt."
+limit = "The scope is operator-declared and trusted; Keel does not check it against the task."
+environment = ["macos-aarch64", "linux-x86_64"]
+positive = ["file:crates/trusted/keel-provenance/tests/scope.rs"]
+negative = [
+    "file:crates/trusted/keel-input/tests/scoped_run.rs",
+    "file:crates/trusted/keel-input/tests/scoped_provider.rs",
+    "e2e:refusals",
+]
+
+# --- Objective 6: the approval prompt -------------------------------------
+
+[[claim]]
+id = "O6-trusted-prompt"
+objective = 6
+statement = "A prompt drawn by the workload cannot capture a trusted approval: approval input is taken only after secure attention, on a screen the trusted side renders, with the renderer suspended."
+limit = "The operator can still approve a dangerous action that is shown accurately. Ordinary terminal content remains untrusted."
+environment = ["macos-aarch64", "linux-x86_64"]
+positive = [
+    "test:terminal_gate_renders_the_kernel_action_and_returns_operator_approval",
+    "file:crates/trusted/keel-input/tests/secure_attention.rs",
+]
+negative = [
+    "eval:terminal-forgery",
+    "eval:gate-flood",
+    "test:a_long_request_path_cannot_fill_the_trusted_screen",
+    "test:untrusted_gate_text_is_quoted_and_bounded",
+    "test:escape_denies_and_renderer_frames_are_suspended_in_trusted_mode",
+    "test:renderer_sandbox_can_execute_only_its_renderer",
+    "file:crates/trusted/keel-input/tests/terminal_control.rs",
+    "invariant:I9",
+]
+
+[[claim]]
+id = "O6-host-v8"
+objective = 6
+statement = "The lower-assurance host V8 profile starts only on an exact trusted confirmation and reaches only its one assigned proxy port."
+limit = "A runtime escape reaches a sandboxed host process, not a VM. The profile is macOS only."
+environment = ["macos-aarch64"]
+positive = ["file:crates/untrusted/keel-isolate/tests/v8_runtime.rs"]
+negative = [
+    "test:host_v8_requires_the_exact_trusted_confirmation",
+    "test:runtime_sandbox_connects_only_to_the_assigned_v8_proxy_port",
+]
+
+# --- Objective 7: approvals and grants ------------------------------------
+
+[[claim]]
+id = "O7-exact-approval"
+objective = 7
+statement = "`A` approves one exact action once and cannot be replayed; a `G` grant covers only the displayed host, port, and method; an approval does not outlive the request that asked for it."
+limit = "Bugs in action rendering or binding are trusted-code defects. Host suspension can still interrupt a pending decision."
+environment = ["macos-aarch64", "linux-x86_64"]
+positive = [
+    "eval:approval-binding",
+    "test:git_effect_permit_matches_exact_body_and_is_consumed_once",
+    "file:crates/trusted/keel-kernel/tests/egress_grant_scope.rs",
+]
+negative = [
+    "eval:approval-binding",
+    "test:expired_terminal_approval_fails_closed_and_rejects_late_input",
+    "test:disconnect_after_approval_cancels_before_upstream_connect",
+    "test:broker_shutdown_cancels_a_pending_terminal_gate",
+]
+
+# --- Objective 8: the audit chain -----------------------------------------
+
+[[claim]]
+id = "O8-audit-chain"
+objective = 8
+statement = "Security-relevant decisions are recorded in an authenticated, ordered chain with a signed terminal seal; a request refused after it was authorized is reported as unsent; a refusal past the loop limit is recorded; and an edited, truncated, or wrongly keyed chain is rejected."
+limit = "A crash leaves an intentionally unsealed stream. A host compromised during the run is out of scope."
+environment = ["macos-aarch64", "linux-x86_64"]
+positive = [
+    "e2e:v8-vm",
+    "faults:early-error",
+    "test:a_request_that_is_sent_carries_no_unsent_report",
+    "file:crates/trusted/keel-audit/tests/verification_status.rs",
+]
+negative = [
+    "eval:audit-tamper",
+    "test:an_edited_chain_never_verifies_as_different_records",
+    "eval:sentinel-misuse",
+    "eval:loop-and-exhaustion",
+    "test:a_request_refused_after_authorization_is_reported_unsent",
+    "test:every_refusal_of_a_repeated_request_is_recorded",
+    "invariant:I13",
+    "test:verifier_rejects_tampered_payload_and_wrong_key",
+    "test:verifier_rejects_a_valid_prefix_without_its_terminal_seal",
+    "e2e:interrupted",
+]
+gaps = [
+    "A request the trusted proxy refuses as malformed before the kernel is asked, such as an absolute target inside a TLS connection, leaves no record beyond its connection (pinned by eval:destination-confusion).",
+    "A destination the untrusted relay rejects as malformed, such as an IPv6-mapped address, is refused with no audit record (pinned by eval:network-escape).",
+]
+
+# --- Objective 9: a reviewable trusted surface ----------------------------
+
+[[claim]]
+id = "O9-trusted-surface"
+objective = 9
+statement = "The trusted first-party Rust surface stays mechanically constrained: per-crate line ratchets under a hard 30,000-line ceiling, no unsafe code, no trusted-to-untrusted dependency, an allowlisted dependency set, and no runtime loading."
+limit = "A line count is a review-cost signal, not a security property. Memory safety does not exclude logic, parsing, or state-machine bugs."
+environment = ["macos-aarch64", "linux-x86_64"]
+positive = ["invariant:I1", "invariant:I2", "invariant:I3", "invariant:I4"]
+negative = ["script:ci/test_check_invariants.py"]
+gaps = [
+    "Only I1, the line budgets, has a test that the checker fails on a violation; nothing runs it against a tree that violates I2 to I4.",
+]

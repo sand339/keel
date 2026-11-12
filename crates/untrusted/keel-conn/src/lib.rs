@@ -602,7 +602,10 @@ fn parse_http(prefix: &[u8]) -> Result<Destination, ParseError> {
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
             .ok_or(ParseError::Incomplete)?;
-        let headers = str::from_utf8(&prefix[line_end + 2..headers_end])
+        // A request with no header at all ends its line with the blank line,
+        // so the header block is empty rather than a reversed range.
+        let headers = prefix.get(line_end + 2..headers_end).unwrap_or_default();
+        let headers = str::from_utf8(headers)
             .map_err(|_| ParseError::Malformed("HTTP headers are not ASCII"))?;
         let mut hosts = headers.lines().filter_map(|line| {
             let (name, value) = line.split_once(':')?;
@@ -1185,5 +1188,115 @@ mod tests {
         client.read_to_string(&mut response).expect("response");
         server.join().expect("server thread");
         assert!(response.ends_with("ok"));
+    }
+
+    /// Randomized (D103): whatever the guest's first bytes are, a destination
+    /// that parses is a lowercase DNS name and a real port, never an address
+    /// literal, a userinfo form, or a name with bytes a later layer could
+    /// read differently.
+    #[test]
+    fn a_parsed_destination_is_always_a_plain_dns_name() {
+        let hello = client_hello("packages.example");
+        let seeds: [&[u8]; 4] = [
+            &hello,
+            b"CONNECT packages.example:443 HTTP/1.1\r\nHost: packages.example:443\r\n\r\n",
+            b"GET /crate HTTP/1.1\r\nHost: packages.example\r\n\r\n",
+            b"GET http://packages.example:8080/crate HTTP/1.1\r\nHost: other.example\r\n\r\n",
+        ];
+        let tokens: [&[u8]; 14] = [
+            b"\r\n",
+            b"\n",
+            b"\r",
+            b" ",
+            b"\0",
+            b"@",
+            b":",
+            b"//",
+            b"[::1]",
+            b"127.0.0.1",
+            b"Host: ",
+            b"http://",
+            b"\xff",
+            b".",
+        ];
+        let mut rng = Rng(0x4b45_454c_0101);
+        for iteration in 0..iterations() {
+            let seed = seeds[rng.below(seeds.len())];
+            let bytes = mutate(&mut rng, seed, &tokens);
+            let Ok(destination) = super::parse_destination(&bytes) else {
+                continue;
+            };
+            let (super::Destination::Tls { host, port }
+            | super::Destination::Connect { host, port }
+            | super::Destination::Http { host, port }) = destination;
+            assert!(
+                port != 0
+                    && !host.is_empty()
+                    && host.len() <= 253
+                    && host.bytes().all(|b| b.is_ascii_lowercase()
+                        || b.is_ascii_digit()
+                        || b == b'-'
+                        || b == b'.'),
+                "iteration {iteration}: destination {host:?}:{port}"
+            );
+        }
+    }
+
+    /// xorshift64*, seeded, so a failure names an iteration that reproduces.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            usize::try_from(self.next() % u64::try_from(bound.max(1)).unwrap()).unwrap()
+        }
+    }
+
+    fn iterations() -> usize {
+        std::env::var("KEEL_FUZZ_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(20_000)
+    }
+
+    /// One or more random edits: a flipped bit, a cut, a copied run, a
+    /// truncation, an inserted byte, or an inserted token.
+    fn mutate(rng: &mut Rng, seed: &[u8], tokens: &[&[u8]]) -> Vec<u8> {
+        let mut bytes = seed.to_vec();
+        for _ in 0..=rng.below(4) {
+            let at = rng.below(bytes.len() + 1);
+            match rng.below(6) {
+                0 if !bytes.is_empty() => {
+                    let index = rng.below(bytes.len());
+                    bytes[index] ^= 1 << rng.below(8);
+                }
+                1 if !bytes.is_empty() => {
+                    let end = (at + rng.below(8)).min(bytes.len());
+                    bytes.drain(at.min(end)..end);
+                }
+                2 if !tokens.is_empty() => {
+                    let token = tokens[rng.below(tokens.len())];
+                    bytes.splice(at..at, token.iter().copied());
+                }
+                3 if !bytes.is_empty() => {
+                    let start = rng.below(bytes.len());
+                    let end = (start + rng.below(16)).min(bytes.len());
+                    let copy = bytes[start..end].to_vec();
+                    bytes.splice(at..at, copy);
+                }
+                4 => bytes.truncate(at),
+                _ => {
+                    let byte = u8::try_from(rng.below(256)).unwrap();
+                    bytes.insert(at, byte);
+                }
+            }
+        }
+        bytes
     }
 }

@@ -377,3 +377,104 @@ fn a_new_branch_is_compared_with_the_admitted_head() {
     assert!(!content.rewrites);
     fs::remove_dir_all(root).unwrap();
 }
+
+/// Randomized (D103): a receive-pack request that parses names only whole
+/// object names, and its pack offset lies inside the request.
+#[test]
+fn receive_pack_commands_survive_malformed_requests() {
+    let old = "a".repeat(40);
+    let new = "b".repeat(40);
+    let mut seed = pkt(&format!("{old} {new} refs/heads/main\0report-status\n"));
+    seed.extend_from_slice(&pkt(&format!("{new} {old} refs/tags/v1\n")));
+    seed.extend_from_slice(b"0000PACK\0\0\0\x02");
+    let tokens: [&[u8]; 9] = [
+        b"0000",
+        b"0004",
+        b"0005",
+        b"ffff",
+        b"\0",
+        b"\n",
+        b" ",
+        b"shallow ",
+        b"\xff",
+    ];
+    let mut rng = Rng(0x4b45_454c_0201);
+    for iteration in 0..iterations() {
+        let body = mutate(&mut rng, &seed, &tokens);
+        let Ok((updates, offset)) = receive_pack_commands(&body) else {
+            continue;
+        };
+        assert!(
+            offset <= body.len() && !updates.is_empty(),
+            "iteration {iteration}: offset {offset} of {}",
+            body.len()
+        );
+        for update in updates {
+            for object in [&update.old, &update.new] {
+                assert!(
+                    matches!(object.len(), 40 | 64)
+                        && object.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "iteration {iteration}: object {object:?}"
+                );
+            }
+        }
+    }
+}
+
+/// xorshift64*, seeded, so a failure names an iteration that reproduces.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    fn below(&mut self, bound: usize) -> usize {
+        usize::try_from(self.next() % u64::try_from(bound.max(1)).unwrap()).unwrap()
+    }
+}
+
+fn iterations() -> usize {
+    std::env::var("KEEL_FUZZ_ITERATIONS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(20_000)
+}
+
+/// One or more random edits: a flipped bit, a cut, a copied run, a
+/// truncation, an inserted byte, or an inserted token.
+fn mutate(rng: &mut Rng, seed: &[u8], tokens: &[&[u8]]) -> Vec<u8> {
+    let mut bytes = seed.to_vec();
+    for _ in 0..=rng.below(4) {
+        let at = rng.below(bytes.len() + 1);
+        match rng.below(6) {
+            0 if !bytes.is_empty() => {
+                let index = rng.below(bytes.len());
+                bytes[index] ^= 1 << rng.below(8);
+            }
+            1 if !bytes.is_empty() => {
+                let end = (at + rng.below(8)).min(bytes.len());
+                bytes.drain(at.min(end)..end);
+            }
+            2 if !tokens.is_empty() => {
+                let token = tokens[rng.below(tokens.len())];
+                bytes.splice(at..at, token.iter().copied());
+            }
+            3 if !bytes.is_empty() => {
+                let start = rng.below(bytes.len());
+                let end = (start + rng.below(16)).min(bytes.len());
+                let copy = bytes[start..end].to_vec();
+                bytes.splice(at..at, copy);
+            }
+            4 => bytes.truncate(at),
+            _ => {
+                let byte = u8::try_from(rng.below(256)).unwrap();
+                bytes.insert(at, byte);
+            }
+        }
+    }
+    bytes
+}

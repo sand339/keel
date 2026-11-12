@@ -55,10 +55,12 @@ def scaled(seconds: float) -> float:
 
 def under_script(transcript: Path, command: list[str]) -> list[str]:
     """Runs COMMAND on a pseudo-terminal, recording it to TRANSCRIPT. BSD
-    script(1) takes the command as arguments; util-linux takes one shell line."""
+    script(1) takes the command as arguments; util-linux takes one shell line.
+    Both are told to flush the transcript as it is written: a case that waits
+    for a trusted screen reads it while the run is still going."""
     if sys.platform == "darwin":
-        return ["script", "-q", str(transcript), *command]
-    return ["script", "-q", "-e", "-c", shlex.join(command), str(transcript)]
+        return ["script", "-q", "-F", str(transcript), *command]
+    return ["script", "-q", "-e", "-f", "-c", shlex.join(command), str(transcript)]
 
 
 def clean(raw: bytes) -> str:

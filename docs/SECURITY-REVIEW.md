@@ -37,7 +37,7 @@ full manual pass succeed; D88 records the review and its costs.
 | KSR-037 | P1 | Kernel push derivation falls back to relay-claimed refs and default-branch flag when any ref name in the body fails validation | Fixed and verified |
 | KSR-038 | P1 | is_force (force-push and ref deletion) is never derived by the kernel; it comes only from the relay | Fixed and verified |
 | KSR-039 | P1 | Trailing slash on POST /repos/o/r/pulls/ skips the one-use PR effect permit, but the GitHub credential is still injected | Fixed and verified |
-| KSR-040 | P1 | Trusted approval screen can be spoofed by guest-supplied multi-line target text that scrolls the real header off-screen | Fixed and verified |
+| KSR-040 | P1 | Trusted approval screen can be spoofed by guest-supplied multi-line target text that scrolls the real header off-screen | Fixed and verified; extended 2026-11-12 (D102): a single long line, such as a request path, was not bounded |
 | KSR-041 | P2 | Linux: reinstalling Keel during a live session makes recovery treat the live run as crashed and delete its broker dir, scratch and images | Fixed and verified |
 | KSR-042 | P2 | gitd's protected diff for a new ref covers only the tip commit against its first parent, so the operator gate shows an incomplete or '(none)' diff | Fixed and verified |
 | KSR-043 | P2 | A torn final record aborts the whole recovery pass and the session can never be recovered | Fixed and verified |
@@ -316,7 +316,7 @@ implemented. The full workspace, lint, formatting, and invariant suites pass.
 | KSR-009 | P1 | Trusted-input provenance defaults to trusted | Fixed and verified |
 | KSR-010 | P1 | Repository Git configuration can influence host Git | Fixed and verified |
 | KSR-011 | P1 | A valid audit-chain suffix can be removed undetected | Fixed and verified |
-| KSR-012 | P2 | Structural rejection and pre-execution evidence is missing | Fixed and verified |
+| KSR-012 | P2 | Structural rejection and pre-execution evidence is missing | Fixed and verified; corrected 2026-11-12 (D100): the broker's audit wrapper did not forward the structural-rejection record, so none reached the chain in a real run |
 | KSR-013 | P2 | Approval signatures cross no trust boundary | Fixed and verified |
 | KSR-014 | P2 | GitHub credentials are acquired without declared GitHub intent | Fixed and verified |
 | KSR-015 | P2 | Host runtime can reach every loopback service | Fixed and verified |

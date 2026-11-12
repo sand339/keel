@@ -406,6 +406,20 @@ keel run --isolation vm-v8 v8 docs/examples/v8-smoke.mjs
 
 The entry file must be a .js, .mjs, or .cjs file within the selected workspace.
 
+### A shell script in the microVM
+
+~~~sh
+keel run shell build-and-test.sh     # a script in the workspace
+keel run shell                       # an interactive shell in the guest
+~~~
+
+The `shell` harness runs bash as the workload, with the same confinement and
+the same brokered network, Git, and credential channels as any other harness,
+and calls no model, so it needs no model credential. Use it to run a build or
+a script you do not trust inside the boundary. It is also the attacker the
+security evaluation runs (`python3 ci/eval.py`): a script with everything a
+compromised agent would have.
+
 ### V8 in the host sandbox
 
 The host mode is deliberately lower assurance and is never silently selected. It is macOS-only; Linux refuses it. Grant it explicitly:
@@ -639,7 +653,9 @@ Press Ctrl-] to enter the trusted approval view. In mux sessions, `Ctrl-A`, `/ap
 
 Text that came from the workload, such as a pull-request body or a diff, is
 drawn behind a `│` gutter and cut off at 80 lines of 240 characters, so it
-cannot pass for the trusted screen's own lines. The line beside the prompt,
+cannot pass for the trusted screen's own lines. Every other line of the
+action, a request path for one, is cut at 320 characters and says how much
+it left out; your answer still applies to the whole action. The line beside the prompt,
 `this decides action N (CLASS): …`, restates what your key decides.
 
 - Press A to approve only the exact displayed action once.

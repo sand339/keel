@@ -8,10 +8,10 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-keel-cli = { version = "=0.1.0", path = "../keel-cli", optional = true }
-keel-conn = { version = "=0.1.0", path = "../keel-conn", optional = true }
-keel-gitd = { version = "=0.1.0", path = "../keel-gitd", optional = true }
-keel-mcp = { version = "=0.1.0", path = "../keel-mcp", optional = true }
+keel-cli = { version = "=0.1.1", path = "../keel-cli", optional = true }
+keel-conn = { version = "=0.1.1", path = "../keel-conn", optional = true }
+keel-gitd = { version = "=0.1.1", path = "../keel-gitd", optional = true }
+keel-mcp = { version = "=0.1.1", path = "../keel-mcp", optional = true }
 libc = { workspace = true, optional = true }
 pem = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
@@ -82,8 +82,8 @@ objc2-virtualization = { version = "=0.3.2", features = [
 ], optional = true }
 
 [dev-dependencies]
-keel-kernel = { version = "=0.1.0", path = "../../trusted/keel-kernel" }
-keel-secrets = { version = "=0.1.0", path = "../../trusted/keel-secrets" }
+keel-kernel = { version = "=0.1.1", path = "../../trusted/keel-kernel" }
+keel-secrets = { version = "=0.1.1", path = "../../trusted/keel-secrets" }
 
 [[bin]]
 name = "keel-libkrun-spike"

@@ -1046,7 +1046,7 @@ impl GateRequest<'_> {
             action_id: self.action.id(),
             action_class: self.action.asserted.class.as_str().to_owned(),
             exact_target: {
-                let mut target = render_gate_target(&self.action.asserted.target);
+                let mut target = bounded_lines(&render_gate_target(&self.action.asserted.target));
                 match self.action.stamped.integrity {
                     IntegrityVerdict::Lines { added, unaccounted } if unaccounted > 0 => {
                         let _ = fmt::Write::write_fmt(
@@ -1164,11 +1164,39 @@ fn quoted_block(text: &str) -> String {
     block
 }
 
+/// Characters of one line of an action the trusted screen shows.
+const GATE_LINE_CHARS: usize = 320;
+
+/// Caps every line of a rendered action. A request path, a ref, or a
+/// command line is the guest's to choose, and one long enough fills the
+/// screen with its own characters and scrolls the action's header, and the
+/// host it names, away from the prompt. What is cut is said, with its
+/// length; the approval still binds the whole action (KSR-040).
+fn bounded_lines(text: &str) -> String {
+    let mut bounded = String::new();
+    for line in text.lines() {
+        let mut characters = line.chars();
+        bounded.extend(characters.by_ref().take(GATE_LINE_CHARS));
+        let hidden = characters.count();
+        if hidden > 0 {
+            let _ = fmt::Write::write_fmt(
+                &mut bounded,
+                format_args!(" [{hidden} more characters not shown]"),
+            );
+        }
+        bounded.push('\n');
+    }
+    bounded.pop();
+    bounded
+}
+
 /// One line restating what an action does, painted beside the prompt after
 /// any untrusted text, so a long target cannot leave the operator deciding on
-/// what that text claims instead (KSR-040).
+/// what that text claims instead (KSR-040). It is bounded like any line, and
+/// the facts Keel derived come before the text the guest chose, so a long
+/// ref or recipient cannot push them out of it.
 fn gate_summary(target: &Target) -> String {
-    match target {
+    let summary = match target {
         Target::Git {
             remote,
             refs,
@@ -1177,8 +1205,8 @@ fn gate_summary(target: &Target) -> String {
             touches_manifest,
             ..
         } => format!(
-            "remote {remote:?}, refs {refs:?}, force {is_force}, default branch \
-             {is_default_branch}, manifest or CI {touches_manifest}"
+            "force {is_force}, default branch {is_default_branch}, manifest or CI \
+             {touches_manifest}, remote {remote:?}, refs {refs:?}"
         ),
         Target::External {
             service,
@@ -1187,8 +1215,11 @@ fn gate_summary(target: &Target) -> String {
             ..
         } => format!("{service:?} {operation:?} to {recipient:?}"),
         Target::Command { program, arguments } => format!("{program:?} {arguments:?}"),
-        _ => render_gate_target(target).replace('\n', ", "),
-    }
+        // Each line is bounded before they are joined, so the host of a
+        // request stays in view after a long path.
+        _ => return bounded_lines(&render_gate_target(target)).replace('\n', ", "),
+    };
+    bounded_lines(&summary)
 }
 
 fn render_gate_target(target: &Target) -> String {
@@ -2619,7 +2650,17 @@ impl<P: Policy> Kernel<P> {
             return Err(KernelError::ChannelClassMismatch);
         }
         validate_asserted_target(&asserted)?;
-        self.session.observe_action(&asserted, unix_time_ms())?;
+        // A refusal past the loop limit is still a refusal, and is recorded.
+        if let Err(error) = self.session.observe_action(&asserted, unix_time_ms()) {
+            record_structural_rejection(
+                audit,
+                channel_name,
+                asserted_principal,
+                &asserted,
+                "kernel:loop-detected",
+            )?;
+            return Err(error);
+        }
         let flow = FlowVerdict::NotChecked;
         let intent = intent_verdict(&asserted, &self.session.facts.intent);
         let action = Action {
@@ -3536,7 +3577,9 @@ pub struct ModelReservationEvent {
     pub actual_cost_microusd: Option<u64>,
 }
 
-/// An untrusted caller's claim about what became of an authorized action.
+/// A claim, made outside the kernel, about what became of an authorized
+/// action: an untrusted relay's about a push, or the trusted proxy's that a
+/// request was never sent.
 ///
 /// Recorded separately from the kernel's own `AuditEvent` because the kernel did
 /// not observe it. An authorization is a kernel fact; completion is a report.
@@ -3658,6 +3701,12 @@ pub trait EgressRequestAuthorizer: Send {
     fn commit_request_send(&mut self) -> Result<(), String> {
         Ok(())
     }
+
+    /// Records that the authorized request was refused, or failed, before
+    /// any byte of it was sent upstream. The kernel writes `executed` when it
+    /// authorizes a request; without this report the audit would read as if a
+    /// request the credential layer then refused had been sent.
+    fn record_unsent(&mut self) {}
 
     /// Records that upstream response bytes exist before their first delivery
     /// to the guest. An attempt that fails without response bytes must not
@@ -4950,6 +4999,17 @@ impl AuditSink for CountingAudit {
 
     fn shutdown(&mut self) -> Result<(), String> {
         self.sink.shutdown()
+    }
+
+    // Every record the trait declares is forwarded here; invariant I13 checks
+    // it. One left to the trait's default is silently discarded.
+    fn record_structural_rejection(
+        &mut self,
+        event: StructuralRejectionEvent,
+    ) -> Result<(), String> {
+        self.sink.record_structural_rejection(event)?;
+        self.events += 1;
+        Ok(())
     }
 
     fn record_model_usage(&mut self, event: ModelUsageEvent) -> Result<(), String> {
@@ -6672,6 +6732,19 @@ impl EgressRequestAuthorizer for BrokerRequestAuthorizer {
             return Err("external send has no authorized request".to_owned());
         }
         self.send_handoff.commit()
+    }
+
+    fn record_unsent(&mut self) {
+        let Some(action_id) = self.uncommitted_grant_action else {
+            return;
+        };
+        if let Ok(mut state) = self.state.lock() {
+            let _ = state.audit.record_reported_outcome(ReportedOutcomeEvent {
+                action_id,
+                reporter: "trusted-proxy",
+                outcome: "unsent".to_owned(),
+            });
+        }
     }
 
     fn record_response(&mut self) -> Result<(), String> {

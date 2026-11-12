@@ -82,8 +82,10 @@ An untrusted component can still contain important correctness logic. “Untrust
 
 Keel keeps the hand-written first-party trusted Rust surface small. CI holds each
 trusted crate to a line ratchet: growing a crate past its number fails until the
-number is raised, with the reason in the commit. The trusted total, about 20,200
-lines, is reported rather than capped. The `tokei` count includes inline tests and
+number is raised, with the reason in the commit. The trusted total, about 20,300
+lines, is held under a hard ceiling of 30,000: CI fails when the crates total
+more, or when the ratchets sum to more, so a ratchet cannot be raised past it
+(D98). The `tokei` count includes inline tests and
 trusted binaries as well as production library code.
 
 | Crate | Responsibility |
@@ -568,6 +570,12 @@ cannot be hashed or written does not start. The backend boots the private
 image copies that admission hashed; a same-user process can still race that
 copy, so the digests are strong evidence, not exclusive custody.
 
+An `executed` action means the kernel authorized it, not that it completed.
+What became of it is a separate `kernel.reported-outcome` on the same action:
+a Git relay's claim that a push completed or failed, or the trusted proxy's
+report that a request was `unsent` because the credential layer refused it
+after authorization, as when it carried a sentinel for another host (D97).
+
 The verifier reports a sealed complete stream separately from an authenticated
 but unsealed prefix; a partial final record, as a writer killed mid-record
 leaves, ends the authenticated prefix and is reported as truncated. It names the retired signature format instead of treating
@@ -667,6 +675,7 @@ Repository checks in [`ci/check_invariants.py`](../ci/check_invariants.py) enfor
 | I10 | Policy bundles require matching caller, manifest, and content hashes |
 | I11 | Every protected kernel state is rejected before policy and gate evaluation |
 | I12 | Production Git invocations use hardened, non-interactive configuration |
+| I13 | The broker's audit wrapper forwards every audit record the kernel can write |
 
 Run:
 

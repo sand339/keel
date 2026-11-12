@@ -273,7 +273,7 @@ lower-assurance process starts.
 | Scoped runs refuse everything outside their scope | [`scoped_run.rs`](crates/trusted/keel-input/tests/scoped_run.rs) |
 | Every run records its admission manifest first | [`admission_manifest.rs`](crates/trusted/keel-input/tests/admission_manifest.rs) |
 | The audit log is authenticated, hash-chained, and sealed | [`verification_status.rs`](crates/trusted/keel-audit/tests/verification_status.rs) |
-| The trusted code is about 20,200 lines, each crate held to a line ratchet | [`check_invariants.py`](ci/check_invariants.py) I1 |
+| The trusted code is about 20,300 lines, each crate held to a line ratchet, under a hard 30,000-line ceiling | [`check_invariants.py`](ci/check_invariants.py) I1 |
 
 Out of scope: judging whether an action is harmful, stopping an operator from
 approving an accurately shown action, exfiltration through permitted output,

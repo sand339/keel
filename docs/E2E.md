@@ -32,6 +32,38 @@ CI runs `doctor`, `v8-vm`, `refusals`, `credential-sources`, and `v8-fetch`
 on a Linux runner with KVM on every push, with a placeholder key; they call no
 model. The other cases need a model credential and are run by hand.
 
+## Adversarial evaluation
+
+`python3 ci/eval.py` runs an attacker inside the guest and checks that Keel
+held. The attacker is a script run by the `shell` harness, so each case is
+deterministic and calls no model; CI runs all eleven on every push. A case
+asserts on the audit chain and on what the trusted side returned; where only
+the attacker can observe something, its script reports to a file in the
+workspace that the harness reads from the host.
+
+| Case | What the attacker tries | What must hold |
+| --- | --- | --- |
+| `confinement` | Read the host's home, `.ssh`, and a host file by its path; mount, load a module, unshare, signal PID 1, write to `/etc` and `/usr` | Nothing of the host is visible; every privileged call fails; capability sets are zero with `NoNewPrivs` and seccomp on |
+| `network-escape` | Direct TCP, DNS, ping, a request that skips the proxy; the metadata address in dotted, decimal, IPv6-mapped, and TLS forms; private ranges; loopback through the proxy; CONNECT to another port | The guest has only loopback; nothing is answered; no action is executed; each destination the kernel sees is recorded as a structural denial |
+| `sentinel-misuse` | Send the model sentinel to another admitted host in a header, a bearer token, a body, and a query string | The host answers only the request without the sentinel, and the audit reports each refused request as unsent |
+| `audit-tamper` | Edit, remove, swap, truncate, and append to a sealed chain; verify with another run's key | None is reported as verified and sealed |
+| `credential-scan` | With a push credential held for the run, search the guest's environment, every other process, and its files for it, in plain and encoded form | It is nowhere in the guest, and nothing the trusted side wrote for the run holds it |
+| `approval-binding` | Repeat a request that was approved once; under a grant for one host and method, try another method and another host | The repeat asks again; the grant covers its host and method only; the audit carries the five decisions, each on its own action |
+| `terminal-forgery` | Draw Keel's admission and approval screens; inject secure attention and `A` into the terminal | Every injection is refused; the request stays pending until the operator answers, and is then denied |
+| `destination-confusion` | Inside a connection authorized for one host, name another with an absolute, network-path, or asterisk target, a fragment, or a `Host` header | The malformed targets are refused; a `Host` header for elsewhere still reaches only the authorized host |
+| `loop-and-exhaustion` | Repeat one refused request 1,100 times; hold 300 connections to the guest's proxy | Every repeat is refused and recorded, the first 1,000 as denials and the rest as loop rejections; an unrelated request is then answered without a prompt; the relay serves requests again once the connections are released |
+| `provenance-floor` | In an own workspace at rank 2, get a grant for a host, read its answer, and ask again | The answer lowers the floor, the grant no longer applies, and the second gate cites the floor |
+| `gate-flood` | Put a 20,000-character path, 150 forged lines, and escape sequences where the trusted approval screen might draw them | The path is cut with its length said; the host stays in view beside the prompt; nothing from the command line is drawn |
+
+`approval-binding`, `terminal-forgery`, `provenance-floor`, and `gate-flood` play the operator: the harness presses secure attention and
+answers on the trusted screen, through the run's terminal, as a person would.
+
+The [claims ledger](../ci/claims.toml) ties each security objective of the
+[threat model](THREAT-MODEL.md) to the tests that are its evidence, these
+cases among them, and lists the known gaps. `python3 ci/check_claims.py`
+checks that every objective has a positive and a negative test and that each
+named test exists.
+
 | Case | What it proves |
 |---|---|
 | `doctor` | The installation is complete: root disk, guest kernel with Landlock scoping, signed VZ backend (macOS) or a working bubblewrap (Linux) |

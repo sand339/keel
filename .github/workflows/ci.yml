@@ -47,7 +47,8 @@ jobs:
         run: ./ci/phase0.sh
 
   # Boots the guest under KVM on every push: setup from the checkout, doctor,
-  # the end-to-end cases that call no model, and the lifecycle fault suite.
+  # the end-to-end cases that call no model, the lifecycle fault suite, and
+  # the adversarial evaluation.
   # A change that breaks Linux setup, boot, confinement, or teardown fails here.
   linux-vm:
     runs-on: ubuntu-24.04
@@ -100,10 +101,13 @@ jobs:
           --case credential-sources --case v8-fetch
       - name: Run the lifecycle fault suite
         run: python3 ci/faults.py
+      - name: Run the adversarial evaluation
+        # A scripted attacker in the guest; it calls no model.
+        run: python3 ci/eval.py
       - name: Show the results of a failed run
         if: failure()
         run: |
-          for summary in "$HOME"/.keel/e2e-results/*/summary.md; do
+          for summary in "$HOME"/.keel/e2e-results/*/summary.md "$HOME"/.keel/eval-results/*/summary.md; do
             [ -f "$summary" ] && cat "$summary"
           done
           keel doctor || true

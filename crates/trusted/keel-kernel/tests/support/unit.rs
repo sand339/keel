@@ -3073,6 +3073,65 @@ fn each_provider_admits_only_its_own_message_path() {
 
 /// KSR-040: guest-supplied detail cannot forge the trusted header or scroll
 /// the real one away from the prompt.
+/// KSR-040 again: a single long line fills a screen as well as many lines
+/// do. A 20,000-character request path left the action's header and its host
+/// hundreds of rows above the prompt, and made the line beside the prompt as
+/// long. Every line is bounded now, and says what it cut.
+#[test]
+fn a_long_request_path_cannot_fill_the_trusted_screen() {
+    use super::{bounded_lines, gate_summary};
+    let request = Target::Network {
+        host: "example.org".to_owned(),
+        port: 443,
+        method: "GET".to_owned(),
+        path: format!("/{}/END-OF-PATH", "A".repeat(20_000)),
+    };
+    let screen = bounded_lines(&render_gate_target(&request));
+    assert!(screen.lines().count() <= 4, "{screen}");
+    assert!(
+        screen.lines().all(|line| line.chars().count() < 380),
+        "a line is longer than the bound"
+    );
+    assert!(screen.contains("more characters not shown]"));
+    assert!(!screen.contains("END-OF-PATH"));
+    assert!(screen.contains("host: \"example.org\""));
+
+    let summary = gate_summary(&request);
+    assert!(summary.chars().count() < 500, "{}", summary.chars().count());
+    assert!(
+        summary.ends_with("host: \"example.org\", port: 443"),
+        "the host is in view beside the prompt: {summary}"
+    );
+
+    // What Keel derived about a push leads the line, ahead of a ref the
+    // guest chose, so a long ref cannot cut it off.
+    let push = gate_summary(&Target::Git {
+        remote: "https://github.com/owner/repo.git".to_owned(),
+        refs: vec![format!("refs/heads/{}", "b".repeat(5_000))],
+        is_force: true,
+        is_default_branch: true,
+        touches_manifest: true,
+        manifest_diff: None,
+    });
+    assert!(
+        push.starts_with("force true, default branch true, manifest or CI true, remote "),
+        "{push}"
+    );
+    assert!(push.chars().count() < 380 && push.contains("more characters not shown]"));
+
+    // A short action is shown as it is.
+    let short = Target::Network {
+        host: "example.org".to_owned(),
+        port: 443,
+        method: "GET".to_owned(),
+        path: "/".to_owned(),
+    };
+    assert_eq!(
+        bounded_lines(&render_gate_target(&short)),
+        render_gate_target(&short)
+    );
+}
+
 #[test]
 fn untrusted_gate_text_is_quoted_and_bounded() {
     let forged = format!(

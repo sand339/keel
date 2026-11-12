@@ -6,7 +6,12 @@ priority, not a delivery date.
 
 ## R2 — Security evaluation and reproducible evidence
 
-Turn the test suite into a publishable evaluation of Keel's claims:
+Turn the test suite into a publishable evaluation of Keel's claims.
+
+Built so far: a claims ledger that ties every threat-model objective to a
+positive and a negative test and is checked in CI, and a scripted attacker
+(`keel run shell`) with four adversarial cases that CI runs on every push
+(see [end-to-end acceptance](E2E.md#adversarial-evaluation)). Remaining:
 
 - adversarial scenarios for prompt injection, credential theft, destination
   confusion, replay, parser differentials, terminal forgery, provenance
